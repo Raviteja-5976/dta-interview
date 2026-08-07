@@ -1,26 +1,222 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* foundations - Deep Navy & Warm Cream from main.md */
+  --ink:        #1B1F3B;
+  --paper:      #FFF8F0;
+  --paper-sunk: #F5EBE0;
+  --paper-pure: #FFFFFF;
+
+  /* accents from main.md */
+  --orange: #FF6B35;
+  --cobalt: #4EA8FF;
+  --sky:    #4EA8FF;
+  --mint:   #6EE7B7;
+  --coral:  #FF5C7A;
+  --yellow: #FFC93C;
+  --violet: #FF5C7A;
+  --negative:#FF5C7A;
+
+  /* semantic — primary brand color #FF6B35 from main.md */
+  --brand:             var(--orange);
+  --platform-workshop: var(--orange);
+  --platform-learn:    var(--sky);
+  --accent-data:       var(--yellow);
+  --accent-positive:   var(--mint);
+  --accent-future:     var(--coral);
+
+  /* typography scale */
+  --t-hero:    clamp(3rem, 8.5vw, 7.5rem);
+  --t-display: clamp(2.25rem, 5.5vw, 4.5rem);
+  --t-h2:      clamp(1.75rem, 3.5vw, 3.25rem);
+  --t-h3:      clamp(1.25rem, 2vw, 1.85rem);
+  --t-lead:    clamp(1.125rem, 1.5vw, 1.35rem);
+  --t-body:    clamp(1rem, 1.1vw, 1.125rem);
+  --t-small:   0.875rem;
+  --t-label:   0.75rem;
+  --t-tag:     0.6875rem;
+
+  /* borders + shadows — 4px borders as specified in main.md */
+  --bd-hair:  2px solid var(--ink);
+  --bd:       4px solid var(--ink);
+  --bd-thick: 4px solid var(--ink);
+  --bd-mega:  6px solid var(--ink);
+
+  --sh-sm: 4px 4px 0 var(--ink);
+  --sh:    6px 6px 0 var(--ink);
+  --sh-lg: 10px 10px 0 var(--ink);
+  --sh-xl: 14px 14px 0 var(--ink);
+
+  /* radii — 20-30px rounded corners as specified in main.md */
+  --r-0:    0px;
+  --r-btn:  16px;
+  --r-card: 24px;
+  --r-pill: 999px;
+
+  /* space */
+  --sp-section: clamp(64px, 10vh, 140px);
+  --sp-block:   clamp(36px, 5vh, 80px);
+  --sp-card:    clamp(20px, 2.5vw, 36px);
+  --container:  1320px;
+
+  /* motion */
+  --dur-micro:  150ms;
+  --dur-fast:   240ms;
+  --dur-base:   400ms;
+  --dur-reveal: 640ms;
+  --dur-hero:   900ms;
+
+  --ease-brut:   cubic-bezier(0.16, 1, 0.30, 1);
+  --ease-snap:   cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+@theme {
+  --color-ink: var(--ink);
+  --color-paper: var(--paper);
+  --color-paper-sunk: var(--paper-sunk);
+  --color-paper-pure: var(--paper-pure);
+  --color-brand: var(--brand);
+  --color-orange: var(--orange);
+  --color-sky: var(--sky);
+  --color-cobalt: var(--cobalt);
+  --color-yellow: var(--yellow);
+  --color-mint: var(--mint);
+  --color-coral: var(--coral);
+  --color-violet: var(--violet);
+  --color-negative: var(--negative);
+
+  --font-display: var(--font-display);
+  --font-body: var(--font-body);
+  --font-mono: var(--font-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  scroll-behavior: smooth;
+  background-color: var(--paper);
+  color: var(--ink);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body), system-ui, sans-serif;
+  overflow-x: hidden;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--paper-sunk);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ink);
+  border: 2px solid var(--paper-sunk);
+}
+
+/* Base Tactile Metaphor for Interactive Surfaces */
+.tactile-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-body);
+  font-weight: 600;
+  border: var(--bd);
+  border-radius: var(--r-btn);
+  box-shadow: var(--sh);
+  transform: translate(0, 0);
+  transition: transform var(--dur-micro) var(--ease-brut), box-shadow var(--dur-micro) var(--ease-brut), background-color var(--dur-micro) var(--ease-brut);
+  cursor: pointer;
+  user-select: none;
+}
+
+.tactile-btn:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: var(--sh-lg);
+}
+
+.tactile-btn:active {
+  transform: translate(3px, 3px);
+  box-shadow: 0 0 0 var(--ink);
+}
+
+.tactile-btn:focus-visible {
+  outline: 3px solid var(--orange);
+  outline-offset: 3px;
+}
+
+/* Neo-Brutalist Base Card */
+.card-brut {
+  background-color: var(--paper-pure);
+  border: var(--bd);
+  border-radius: var(--r-card);
+  box-shadow: var(--sh);
+  padding: var(--sp-card);
+  transition: transform var(--dur-base) var(--ease-brut), box-shadow var(--dur-base) var(--ease-brut);
+}
+
+.card-brut:hover {
+  transform: rotate(0deg) translate(-4px, -4px) !important;
+  box-shadow: var(--sh-lg);
+}
+
+/* Tilt variations */
+.tilt-neg-2 { transform: rotate(-2deg); }
+.tilt-neg-1-5 { transform: rotate(-1.5deg); }
+.tilt-neg-1 { transform: rotate(-1deg); }
+.tilt-pos-1 { transform: rotate(1deg); }
+.tilt-pos-1-5 { transform: rotate(1.5deg); }
+.tilt-pos-2 { transform: rotate(2deg); }
+
+/* Signature Marker Highlight */
+.marker {
+  position: relative;
+  display: inline-block;
+  white-space: nowrap;
+  color: #FFFFFF;
+  padding: 0 0.15em;
+  z-index: 1;
+}
+
+.marker::before {
+  content: '';
+  position: absolute;
+  inset: 10% -0.1em 8%;
+  background: var(--brand);
+  transform: skewX(-3deg);
+  z-index: -1;
+  border-radius: 4px;
+  box-shadow: 2px 2px 0 var(--ink);
+}
+
+/* Dark section invert override */
+.section-dark {
+  background-color: #1B1F3B;
+  color: #FFF8F0;
+  --paper: #1B1F3B;
+  --paper-sunk: #24294A;
+  --ink: #FFF8F0;
+}
+
+.section-dark .card-brut {
+  background-color: #24294A;
+  border-color: #FFF8F0;
+  box-shadow: 6px 6px 0 #FFF8F0;
+  color: #FFF8F0;
+}
+
+/* Tabular Nums for stats */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Reduced Motion Override */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }
