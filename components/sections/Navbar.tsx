@@ -87,6 +87,20 @@ export default function Navbar() {
 
           {/* Center Links (Desktop) */}
           <nav className="hidden md:flex items-center gap-6 font-medium text-sm">
+            <Link
+              href="/dashboard"
+              className="relative py-1 text-[#1B1F3B] hover:text-[#FF6B35] font-bold transition-colors group"
+            >
+              Dashboard
+              <span className="absolute bottom-0 left-0 w-0 h-0.5 bg-[#FF6B35] group-hover:w-full transition-all duration-200" />
+            </Link>
+            <Link
+              href="/profile"
+              className="relative py-1 text-[#1B1F3B] hover:text-[#FF6B35] font-bold transition-colors group"
+            >
+              Profile
+              <span className="absolute bottom-0 left-0 w-0 h-0.5 bg-[#FF6B35] group-hover:w-full transition-all duration-200" />
+            </Link>
             <a
               href="#how-it-works"
               className="relative py-1 text-[#1B1F3B] hover:text-[#FF6B35] transition-colors group"
@@ -120,16 +134,25 @@ export default function Navbar() {
           {/* Right CTAs */}
           <div className="flex items-center gap-3">
             {user ? (
-              /* LOGGED IN USER PILL */
+              /* LOGGED IN USER ACTIONS */
               <div className="flex items-center gap-2">
-                <div className="flex items-center gap-2 px-3 py-1.5 bg-[#F5EBE0] border-2 border-[#1B1F3B] rounded-2xl shadow-[2px_2px_0_#1B1F3B]">
+                <Link
+                  href="/dashboard"
+                  className="tactile-btn px-4 py-2 text-xs md:text-sm bg-[#FF6B35] text-white border-2 border-[#1B1F3B] shadow-[3px_3px_0_#1B1F3B] hover:bg-[#e85a27] font-bold"
+                >
+                  Dashboard
+                </Link>
+                <Link
+                  href="/profile"
+                  className="flex items-center gap-2 px-3 py-1.5 bg-[#F5EBE0] border-2 border-[#1B1F3B] rounded-2xl shadow-[2px_2px_0_#1B1F3B] hover:bg-white transition-colors"
+                >
                   <div className="w-7 h-7 rounded-full bg-[#FF6B35] text-white font-[family-name:var(--font-mono)] font-bold text-xs flex items-center justify-center border border-[#1B1F3B]">
                     {getUserInitial()}
                   </div>
                   <span className="font-[family-name:var(--font-body)] text-xs font-bold text-[#1B1F3B] max-w-[120px] truncate hidden sm:inline">
                     {getUserDisplayName()}
                   </span>
-                </div>
+                </Link>
                 <button
                   onClick={() => signOut()}
                   title="Sign Out"
@@ -171,32 +194,46 @@ export default function Navbar() {
       {/* Mobile Navigation Drawer */}
       {mobileMenuOpen && (
         <div className="fixed inset-0 top-16 z-[999] bg-[#1B1F3B] text-[#FFF8F0] p-6 flex flex-col justify-between md:hidden animate-fadeIn">
-          <div className="space-y-6 pt-4">
+          <div className="space-y-4 pt-4">
+            <Link
+              href="/dashboard"
+              onClick={() => setMobileMenuOpen(false)}
+              className="block font-[family-name:var(--font-display)] text-2xl font-extrabold text-[#FF6B35] border-b border-white/20 pb-3"
+            >
+              Dashboard
+            </Link>
+            <Link
+              href="/profile"
+              onClick={() => setMobileMenuOpen(false)}
+              className="block font-[family-name:var(--font-display)] text-2xl font-extrabold text-white border-b border-white/20 pb-3"
+            >
+              Profile
+            </Link>
             <a
               href="#how-it-works"
               onClick={() => setMobileMenuOpen(false)}
-              className="block font-[family-name:var(--font-display)] text-2xl font-bold border-b border-white/20 pb-3"
+              className="block font-[family-name:var(--font-display)] text-xl font-bold border-b border-white/20 pb-3"
             >
               How it works
             </a>
             <a
               href="#what-gets-measured"
               onClick={() => setMobileMenuOpen(false)}
-              className="block font-[family-name:var(--font-display)] text-2xl font-bold border-b border-white/20 pb-3"
+              className="block font-[family-name:var(--font-display)] text-xl font-bold border-b border-white/20 pb-3"
             >
               What you get
             </a>
             <a
               href="#pricing"
               onClick={() => setMobileMenuOpen(false)}
-              className="block font-[family-name:var(--font-display)] text-2xl font-bold border-b border-white/20 pb-3"
+              className="block font-[family-name:var(--font-display)] text-xl font-bold border-b border-white/20 pb-3"
             >
               Pricing
             </a>
             <a
               href="#faq"
               onClick={() => setMobileMenuOpen(false)}
-              className="block font-[family-name:var(--font-display)] text-2xl font-bold border-b border-white/20 pb-3"
+              className="block font-[family-name:var(--font-display)] text-xl font-bold border-b border-white/20 pb-3"
             >
               FAQ
             </a>

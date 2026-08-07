@@ -589,6 +589,7 @@ Preserve the setup selections through the purchase round trip. Losing them is a 
 
 | `projects.status` | Overview behaviour |
 |---|---|
+| `draft` | Wizard created draft prior to submitting preparation pipeline; resume attached |
 | `preparing` | Skeleton + stage progress; `Start interview` disabled with reason |
 | `ready` | Full page |
 | `failed` | Error card + `Retry preparation`; partial results still shown |

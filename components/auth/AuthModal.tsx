@@ -1,10 +1,12 @@
 'use client';
 
 import { useState, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { X, Eye, EyeOff, Lock, Mail, User as UserIcon, CheckCircle2, ArrowLeft, KeyRound } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 
 export default function AuthModal() {
+  const router = useRouter();
   const {
     isAuthModalOpen,
     closeAuthModal,
@@ -104,6 +106,7 @@ export default function AuthModal() {
             setSuccessMsg('Logged in successfully!');
             setTimeout(() => {
               closeAuthModal();
+              router.push('/dashboard');
             }, 800);
           } else {
             setOtpType('email');
@@ -170,6 +173,7 @@ export default function AuthModal() {
         setSuccessMsg('OTP verified successfully! Logging you in...');
         setTimeout(() => {
           closeAuthModal();
+          router.push('/dashboard');
         }, 1000);
       }
     } catch (err: any) {

@@ -43,7 +43,7 @@ function AuthPageContent() {
   // Redirect if logged in
   useEffect(() => {
     if (user) {
-      router.push('/');
+      router.push('/dashboard');
     }
   }, [user, router]);
 
@@ -114,7 +114,7 @@ function AuthPageContent() {
           if (otpErr) {
             setSuccessMsg('Logged in successfully!');
             setTimeout(() => {
-              router.push('/');
+              router.push('/dashboard');
             }, 800);
           } else {
             setOtpType('email');
@@ -177,7 +177,7 @@ function AuthPageContent() {
       } else {
         setSuccessMsg('OTP verified successfully! Redirecting...');
         setTimeout(() => {
-          router.push('/');
+          router.push('/dashboard');
         }, 1000);
       }
     } catch (err: any) {

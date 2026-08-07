@@ -3,8 +3,10 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { Play, Mic, FileText, ArrowRight, CheckCircle, Sparkles } from 'lucide-react';
+import { useAuth } from '@/context/AuthContext';
 
 export default function Hero() {
+  const { user } = useAuth();
   const [transcriptIndex, setTranscriptIndex] = useState(0);
 
   const transcriptLines = [
@@ -48,10 +50,10 @@ export default function Hero() {
           {/* CTAs */}
           <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4 pt-2">
             <Link
-              href="/auth?tab=signup"
+              href={user ? "/dashboard" : "/auth?tab=signup"}
               className="tactile-btn px-6 py-4 bg-[#FF6B35] text-white text-base md:text-lg font-bold border-4 border-[#1B1F3B] rounded-2xl shadow-[6px_6px_0_#1B1F3B] hover:bg-[#e85a27] group inline-flex items-center justify-center"
             >
-              <span>Start a free interview</span>
+              <span>{user ? "Go to Dashboard" : "Start a free interview"}</span>
               <ArrowRight className="w-5 h-5 ml-2 group-hover:translate-x-1 transition-transform" />
             </Link>
 

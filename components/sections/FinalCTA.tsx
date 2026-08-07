@@ -2,8 +2,10 @@
 
 import Link from 'next/link';
 import { ArrowRight, FileText } from 'lucide-react';
+import { useAuth } from '@/context/AuthContext';
 
 export default function FinalCTA() {
+  const { user } = useAuth();
   return (
     <section className="py-16 md:py-24 px-4 md:px-8 max-w-[1320px] mx-auto">
       <div className="bg-[#FF6B35] text-white border-6 border-[#1B1F3B] rounded-3xl p-8 md:p-16 shadow-[16px_16px_0_#1B1F3B] text-center relative overflow-hidden">
@@ -25,10 +27,10 @@ export default function FinalCTA() {
 
           <div className="flex flex-col sm:flex-row items-center justify-center gap-4 pt-4">
             <Link
-              href="/auth?tab=signup"
+              href={user ? "/dashboard" : "/auth?tab=signup"}
               className="tactile-btn px-8 py-4 bg-[#1B1F3B] text-white text-base md:text-lg font-bold border-4 border-white rounded-2xl shadow-[6px_6px_0_#FFFFFF] hover:bg-[#24294A] group w-full sm:w-auto inline-flex items-center justify-center"
             >
-              <span>Start a free interview</span>
+              <span>{user ? "Go to Dashboard" : "Start a free interview"}</span>
               <ArrowRight className="w-5 h-5 ml-2 group-hover:translate-x-1 transition-transform text-[#FFC93C]" />
             </Link>
 
