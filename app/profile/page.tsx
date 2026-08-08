@@ -159,7 +159,42 @@ export default function ProfilePage() {
           </Link>
         </div>
 
-        {/* Hero Profile Card */}
+        {loading ? (
+          /* Profile Skeleton Loading State */
+          <div className="space-y-8 animate-pulse">
+            {/* Hero Card Skeleton */}
+            <div className="bg-white border-4 border-[#1B1F3B] rounded-3xl p-6 md:p-8 shadow-[8px_8px_0_#1B1F3B] flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
+              <div className="flex items-center gap-5">
+                <div className="w-20 h-20 bg-gray-200 border-4 border-[#1B1F3B] rounded-2xl" />
+                <div className="space-y-2">
+                  <div className="h-6 bg-gray-200 rounded w-48" />
+                  <div className="h-4 bg-gray-200 rounded w-36" />
+                </div>
+              </div>
+              <div className="w-48 h-16 bg-gray-200 border-2 border-[#1B1F3B] rounded-2xl" />
+            </div>
+
+            {/* Tab Selector Skeleton */}
+            <div className="flex items-center gap-2 border-b-4 border-[#1B1F3B]/10 pb-2">
+              <div className="w-36 h-10 bg-gray-200 border-2 border-[#1B1F3B] rounded-xl" />
+              <div className="w-44 h-10 bg-gray-200 border-2 border-[#1B1F3B] rounded-xl" />
+              <div className="w-36 h-10 bg-gray-200 border-2 border-[#1B1F3B] rounded-xl" />
+            </div>
+
+            {/* Content Card Skeleton */}
+            <div className="bg-white border-4 border-[#1B1F3B] rounded-3xl p-6 md:p-8 shadow-[8px_8px_0_#1B1F3B] space-y-6">
+              <div className="h-6 bg-gray-200 rounded w-1/3" />
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="h-12 bg-gray-100 border-2 border-[#1B1F3B] rounded-xl" />
+                <div className="h-12 bg-gray-100 border-2 border-[#1B1F3B] rounded-xl" />
+                <div className="h-12 bg-gray-100 border-2 border-[#1B1F3B] rounded-xl" />
+                <div className="h-12 bg-gray-100 border-2 border-[#1B1F3B] rounded-xl" />
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* Hero Profile Card */}
         <div className="bg-white border-4 border-[#1B1F3B] rounded-3xl p-6 md:p-8 shadow-[8px_8px_0_#1B1F3B] flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
           <div className="flex items-center gap-5">
             {/* Avatar Circle */}
@@ -557,7 +592,7 @@ export default function ProfilePage() {
                           {item.balance_after}
                         </td>
                         <td className="py-3 px-4 text-[#1B1F3B]/80 font-mono text-[11px]">
-                          {item.meta?.reason || item.meta?.pack || item.meta?.role || 'Transaction logged'}
+                          {ledgerNote(item.meta)}
                         </td>
                         <td className="py-3 px-4 text-[#1B1F3B]/60 font-mono">
                           {new Date(item.created_at).toLocaleDateString()}
@@ -609,8 +644,31 @@ export default function ProfilePage() {
             </div>
           </div>
         </form>
+        </>
+        )}
 
       </main>
     </div>
   );
+}
+
+/**
+ * Ledger `meta` is deliberately untyped JSONB — its shape depends on the row's
+ * kind. This picks the most useful human label out of whatever is there, and
+ * guarantees a string so it is safe to render.
+ */
+function ledgerNote(meta: Record<string, unknown> | null | undefined): string {
+  if (!meta) return 'Transaction logged';
+
+  if (meta.reason === 'settlement') {
+    const minutes = meta.billed_minutes;
+    return typeof minutes === 'number' ? `Unused time returned · ${minutes} min billed` : 'Unused time returned';
+  }
+
+  for (const key of ['reason', 'pack', 'pack_name', 'role'] as const) {
+    const value = meta[key];
+    if (typeof value === 'string' && value.length > 0) return value.replace(/_/g, ' ');
+  }
+
+  return 'Transaction logged';
 }

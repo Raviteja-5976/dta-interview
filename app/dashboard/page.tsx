@@ -1,36 +1,29 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import Image from 'next/image';
 import Link from 'next/link';
-import { 
-  Plus, 
-  Search, 
-  Filter, 
-  Zap, 
-  Briefcase, 
-  Award, 
-  Clock, 
-  ArrowUpRight, 
-  AlertCircle, 
-  Building, 
-  Trash2, 
-  Sparkles, 
-  ChevronRight, 
+import {
+  Plus,
+  Search,
+  Zap,
+  Briefcase,
+  Award,
+  Clock,
+  ArrowUpRight,
+  AlertCircle,
+  Trash2,
+  Sparkles,
   RotateCw,
-  FileText,
   X,
-  CheckCircle2
 } from 'lucide-react';
 import AppHeader from '@/components/layout/AppHeader';
 import { useAuth } from '@/context/AuthContext';
-import { 
-  fetchUserProfile, 
-  fetchUserProjects, 
-  createProject, 
-  deleteProject, 
-  Profile, 
-  Project 
+import {
+  fetchUserProfile,
+  fetchUserProjects,
+  deleteProject,
+  Profile,
+  Project,
 } from '@/lib/supabase/db';
 
 export default function DashboardPage() {
@@ -42,16 +35,6 @@ export default function DashboardPage() {
   // Filter & Search
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'ready' | 'preparing' | 'draft'>('all');
-
-  // New Project Modal State
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [creating, setCreating] = useState(false);
-  const [companyName, setCompanyName] = useState('');
-  const [roleTitle, setRoleTitle] = useState('');
-  const [seniority, setSeniority] = useState('Senior');
-  const [companyDomain, setCompanyDomain] = useState('');
-  const [jdRaw, setJdRaw] = useState('');
-  const [formError, setFormError] = useState<string | null>(null);
 
   // Delete Confirmation Modal State
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -77,39 +60,9 @@ export default function DashboardPage() {
     loadData();
   }, [user]);
 
-  // Handle New Project Submission
-  const handleCreateProject = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!companyName.trim() || !roleTitle.trim()) {
-      setFormError('Please fill in both Company Name and Target Role Title.');
-      return;
-    }
-    setFormError(null);
-    setCreating(true);
-
-    try {
-      const newProj = await createProject(user?.id || '', {
-        company_name: companyName.trim(),
-        role_title: roleTitle.trim(),
-        seniority,
-        company_domain: companyDomain.trim() || undefined,
-        jd_raw: jdRaw.trim() || undefined,
-      });
-
-      setProjects((prev) => [newProj, ...prev]);
-      setIsModalOpen(false);
-      // Reset form
-      setCompanyName('');
-      setRoleTitle('');
-      setCompanyDomain('');
-      setJdRaw('');
-    } catch (err) {
-      console.error('Error creating project:', err);
-      setFormError('Failed to create project. Please try again.');
-    } finally {
-      setCreating(false);
-    }
-  };
+  // Project creation lives at /projects/new. It needs a resume and a job
+  // description before Phase 1 preparation can run, which is more than a modal
+  // on this page should be collecting.
 
   // Handle Delete Project
   const handleDeleteProject = async (projectId: string) => {
@@ -147,7 +100,7 @@ export default function DashboardPage() {
   return (
     <div className="min-h-screen bg-[#FFF8F0] text-[#1B1F3B] flex flex-col font-[family-name:var(--font-body)]">
       {/* App Header Navigation */}
-      <AppHeader profile={profile} onNewProjectClick={() => setIsModalOpen(true)} />
+      <AppHeader profile={profile} />
 
       <main className="flex-1 max-w-[1320px] w-full mx-auto px-4 md:px-8 py-8 space-y-8">
         
@@ -186,9 +139,13 @@ export default function DashboardPage() {
                 <Zap className="w-4 h-4 text-[#FF6B35]" />
               </div>
             </div>
-            <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
-              {creditsRemaining}
-            </div>
+            {loading ? (
+              <div className="h-9 w-16 bg-gray-200 rounded animate-pulse my-0.5" />
+            ) : (
+              <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
+                {creditsRemaining}
+              </div>
+            )}
             <p className="text-xs text-[#1B1F3B]/60 mt-1 font-medium">Ready to spend</p>
           </div>
 
@@ -200,9 +157,13 @@ export default function DashboardPage() {
                 <Briefcase className="w-4 h-4 text-[#4EA8FF]" />
               </div>
             </div>
-            <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
-              {totalProjects}
-            </div>
+            {loading ? (
+              <div className="h-9 w-16 bg-gray-200 rounded animate-pulse my-0.5" />
+            ) : (
+              <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
+                {totalProjects}
+              </div>
+            )}
             <p className="text-xs text-[#1B1F3B]/60 mt-1 font-medium">Active workspaces</p>
           </div>
 
@@ -214,9 +175,13 @@ export default function DashboardPage() {
                 <Award className="w-4 h-4 text-[#1B1F3B]" />
               </div>
             </div>
-            <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
-              {totalInterviews}
-            </div>
+            {loading ? (
+              <div className="h-9 w-16 bg-gray-200 rounded animate-pulse my-0.5" />
+            ) : (
+              <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
+                {totalInterviews}
+              </div>
+            )}
             <p className="text-xs text-[#1B1F3B]/60 mt-1 font-medium">Total sessions completed</p>
           </div>
 
@@ -228,9 +193,13 @@ export default function DashboardPage() {
                 <Sparkles className="w-4 h-4 text-[#1B1F3B]" />
               </div>
             </div>
-            <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
-              {avgReadiness > 0 ? `${avgReadiness}%` : '—'}
-            </div>
+            {loading ? (
+              <div className="h-9 w-16 bg-gray-200 rounded animate-pulse my-0.5" />
+            ) : (
+              <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
+                {avgReadiness > 0 ? `${avgReadiness}%` : '—'}
+              </div>
+            )}
             <p className="text-xs text-[#1B1F3B]/60 mt-1 font-medium">Across active roles</p>
           </div>
         </section>
@@ -246,13 +215,15 @@ export default function DashboardPage() {
             </p>
           </div>
 
-          <button
-            onClick={() => setIsModalOpen(true)}
+          {/* The real creation path: the wizard collects the resume and job
+              description that Phase 1 preparation cannot run without. */}
+          <Link
+            href="/projects/new"
             className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-sm rounded-xl border-4 border-[#1B1F3B] shadow-[4px_4px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all cursor-pointer"
           >
             <Plus className="w-5 h-5 stroke-[3]" />
             <span>New Interview Project</span>
-          </button>
+          </Link>
         </div>
 
         {/* Search & Filter Controls */}
@@ -494,156 +465,18 @@ export default function DashboardPage() {
             </div>
 
             <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-4">
-              <button
-                onClick={() => setIsModalOpen(true)}
+              <Link
+                href="/projects/new"
                 className="w-full sm:w-auto px-6 py-3.5 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-sm rounded-xl border-4 border-[#1B1F3B] shadow-[4px_4px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all cursor-pointer inline-flex items-center justify-center gap-2"
               >
                 <Plus className="w-5 h-5 stroke-[3]" />
                 <span>Create Your First Project</span>
-              </button>
+              </Link>
             </div>
           </div>
         )}
 
       </main>
-
-      {/* NEW PROJECT MODAL */}
-      {isModalOpen && (
-        <div className="fixed inset-0 z-50 bg-[#1B1F3B]/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto animate-in fade-in duration-200">
-          <div className="bg-[#FFF8F0] border-4 border-[#1B1F3B] rounded-3xl p-6 md:p-8 max-w-xl w-full shadow-[12px_12px_0_#1B1F3B] relative my-8">
-            
-            {/* Modal Close Button */}
-            <button
-              onClick={() => setIsModalOpen(false)}
-              className="absolute right-4 top-4 p-2 bg-white border-2 border-[#1B1F3B] rounded-xl shadow-[2px_2px_0_#1B1F3B] hover:bg-[#F5EBE0] transition-colors"
-            >
-              <X className="w-5 h-5 text-[#1B1F3B]" />
-            </button>
-
-            <div className="flex items-center gap-3 mb-6">
-              <div className="p-2.5 bg-[#FF6B35] text-white border-2 border-[#1B1F3B] rounded-xl shadow-[2px_2px_0_#1B1F3B]">
-                <Briefcase className="w-6 h-6" />
-              </div>
-              <div>
-                <h2 className="font-[family-name:var(--font-display)] font-extrabold text-xl md:text-2xl text-[#1B1F3B]">
-                  New Interview Project
-                </h2>
-                <p className="text-xs text-[#1B1F3B]/70 font-medium">
-                  Set up your target company & role to begin tailoring mock interviews.
-                </p>
-              </div>
-            </div>
-
-            {formError && (
-              <div className="mb-4 p-3 bg-[#FF5C7A]/20 border-2 border-[#FF5C7A] text-[#1B1F3B] rounded-xl text-xs font-bold flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 text-[#FF5C7A]" />
-                <span>{formError}</span>
-              </div>
-            )}
-
-            <form onSubmit={handleCreateProject} className="space-y-4">
-              {/* Company Name & Domain */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-bold font-[family-name:var(--font-mono)] text-[#1B1F3B] uppercase tracking-wider mb-1.5">
-                    Company Name <span className="text-[#FF5C7A]">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. Google, Stripe, Meta"
-                    value={companyName}
-                    onChange={(e) => setCompanyName(e.target.value)}
-                    className="w-full px-3.5 py-2.5 bg-white border-2 border-[#1B1F3B] rounded-xl font-bold text-sm text-[#1B1F3B] focus:outline-none focus:ring-2 focus:ring-[#FF6B35] shadow-[2px_2px_0_#1B1F3B]"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold font-[family-name:var(--font-mono)] text-[#1B1F3B] uppercase tracking-wider mb-1.5">
-                    Company Domain <span className="text-[#1B1F3B]/50 font-normal">(optional)</span>
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. google.com"
-                    value={companyDomain}
-                    onChange={(e) => setCompanyDomain(e.target.value)}
-                    className="w-full px-3.5 py-2.5 bg-white border-2 border-[#1B1F3B] rounded-xl font-medium text-sm text-[#1B1F3B] focus:outline-none focus:ring-2 focus:ring-[#FF6B35] shadow-[2px_2px_0_#1B1F3B]"
-                  />
-                </div>
-              </div>
-
-              {/* Role Title & Seniority */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div className="sm:col-span-2">
-                  <label className="block text-xs font-bold font-[family-name:var(--font-mono)] text-[#1B1F3B] uppercase tracking-wider mb-1.5">
-                    Target Role Title <span className="text-[#FF5C7A]">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. Senior Backend Engineer"
-                    value={roleTitle}
-                    onChange={(e) => setRoleTitle(e.target.value)}
-                    className="w-full px-3.5 py-2.5 bg-white border-2 border-[#1B1F3B] rounded-xl font-bold text-sm text-[#1B1F3B] focus:outline-none focus:ring-2 focus:ring-[#FF6B35] shadow-[2px_2px_0_#1B1F3B]"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold font-[family-name:var(--font-mono)] text-[#1B1F3B] uppercase tracking-wider mb-1.5">
-                    Seniority
-                  </label>
-                  <select
-                    value={seniority}
-                    onChange={(e) => setSeniority(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-white border-2 border-[#1B1F3B] rounded-xl font-bold text-sm text-[#1B1F3B] focus:outline-none focus:ring-2 focus:ring-[#FF6B35] shadow-[2px_2px_0_#1B1F3B]"
-                  >
-                    <option value="Junior">Junior</option>
-                    <option value="Mid-Level">Mid-Level</option>
-                    <option value="Senior">Senior</option>
-                    <option value="Staff">Staff</option>
-                    <option value="Lead">Lead / Manager</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Job Description TextArea */}
-              <div>
-                <label className="block text-xs font-bold font-[family-name:var(--font-mono)] text-[#1B1F3B] uppercase tracking-wider mb-1.5">
-                  Job Description / Key Requirements
-                </label>
-                <textarea
-                  rows={4}
-                  placeholder="Paste the job posting requirements, responsibilities, or tech stack..."
-                  value={jdRaw}
-                  onChange={(e) => setJdRaw(e.target.value)}
-                  className="w-full p-3 bg-white border-2 border-[#1B1F3B] rounded-xl font-medium text-sm text-[#1B1F3B] focus:outline-none focus:ring-2 focus:ring-[#FF6B35] shadow-[2px_2px_0_#1B1F3B]"
-                />
-              </div>
-
-              {/* Form Buttons */}
-              <div className="pt-4 flex items-center justify-end gap-3 border-t-2 border-[#1B1F3B]/10">
-                <button
-                  type="button"
-                  onClick={() => setIsModalOpen(false)}
-                  className="px-5 py-2.5 bg-white text-[#1B1F3B] font-bold text-sm rounded-xl border-2 border-[#1B1F3B] hover:bg-[#F5EBE0] transition-colors"
-                >
-                  Cancel
-                </button>
-
-                <button
-                  type="submit"
-                  disabled={creating}
-                  className="px-6 py-2.5 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-sm rounded-xl border-2 border-[#1B1F3B] shadow-[3px_3px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all disabled:opacity-50 flex items-center gap-2"
-                >
-                  {creating && <RotateCw className="w-4 h-4 animate-spin" />}
-                  <span>{creating ? 'Creating...' : 'Create Project'}</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
       {/* DELETE CONFIRMATION MODAL */}
       {deletingId && (
         <div className="fixed inset-0 z-50 bg-[#1B1F3B]/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-150">

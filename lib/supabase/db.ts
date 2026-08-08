@@ -1,4 +1,19 @@
 import { supabase } from './client';
+import type {
+  CompanyProfile,
+  GapReport,
+  JdProfile,
+  Strategy,
+} from '../agents/schemas';
+
+/** Shape written by lib/pipelines/prep.ts when a preparation stage fails. */
+export interface ProjectPrepError {
+  stage?: string;
+  message?: string;
+  at?: string;
+  recoverable?: boolean;
+  started_at?: string;
+}
 
 export interface Profile {
   id: string;
@@ -19,7 +34,7 @@ export interface Profile {
       system_design?: boolean;
     };
   };
-  onboarding: Record<string, any>;
+  onboarding: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
@@ -35,10 +50,10 @@ export interface Project {
   status: 'draft' | 'preparing' | 'ready' | 'failed' | 'archived';
   active_resume_id: string | null;
   jd_raw: string | null;
-  company_profile?: any;
-  jd_profile?: any;
-  gap_report?: any;
-  strategy?: any;
+  company_profile?: CompanyProfile | null;
+  jd_profile?: JdProfile | null;
+  gap_report?: GapReport | null;
+  strategy?: Strategy | null;
   readiness: {
     overall?: number;
     resume_match?: number;
@@ -61,7 +76,7 @@ export interface Project {
   sessions_count?: number;
   avg_score?: number | null;
   last_session_at: string | null;
-  prep_error?: any;
+  prep_error?: ProjectPrepError | null;
   deleted_at: string | null;
   created_at: string;
   updated_at: string;
@@ -74,7 +89,7 @@ export interface CreditLedgerItem {
   amount: number;
   balance_after: number;
   session_id: string | null;
-  meta: Record<string, any>;
+  meta: Record<string, unknown>;
   created_at: string;
 }
 
@@ -84,14 +99,14 @@ export const isSupabaseConfigured = () => {
   return Boolean(url && !url.includes('placeholder'));
 };
 
-// Initial Mock Data Fallbacks for local demo mode before keys are provided
+// Initial Fallbacks before database connection or for new user
 export const MOCK_PROFILE: Profile = {
-  id: 'usr_demo_123',
-  email: 'candidate@devtrackacademy.com',
-  full_name: 'Alex Chen',
+  id: '',
+  email: '',
+  full_name: '',
   avatar_url: null,
   org_id: null,
-  credits_balance: 4,
+  credits_balance: 100, // signup grant — see migration 014
   prefs: {
     language: 'en-IN',
     voice_id: 'interviewer_warm_professional_en_IN',
@@ -104,183 +119,23 @@ export const MOCK_PROFILE: Profile = {
       system_design: false,
     },
   },
-  onboarding: { completed: true },
-  created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+  onboarding: {},
+  created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
 };
 
-export const MOCK_PROJECTS: Project[] = [
-  {
-    id: 'proj_google_sr_swe',
-    user_id: 'usr_demo_123',
-    company_name: 'Google',
-    company_domain: 'google.com',
-    company_logo_url: 'https://www.google.com/favicon.ico',
-    role_title: 'Senior Software Engineer, Cloud Infra',
-    seniority: 'Senior',
-    status: 'ready',
-    active_resume_id: 'res_1',
-    jd_raw: 'We are seeking a Senior Software Engineer to design distributed systems in Cloud Infrastructure...',
-    readiness: {
-      overall: 82,
-      resume_match: 88,
-      technical: 84,
-      behavioral: 90,
-      coding: 76,
-      system_design: 68,
-      history: [
-        { session_id: 'sess_1', overall: 68, at: '2026-07-20' },
-        { session_id: 'sess_2', overall: 75, at: '2026-07-28' },
-        { session_id: 'sess_3', overall: 82, at: '2026-08-05' },
-      ],
-    },
-    stats: {
-      sessions_count: 3,
-      avg_score: 75.0,
-      best_score: 82,
-      last_score: 82,
-      total_minutes: 45,
-      credits_spent: 9,
-    },
-    readiness_overall: 82,
-    sessions_count: 3,
-    avg_score: 75.0,
-    last_session_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
-    deleted_at: null,
-    created_at: new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString(),
-    updated_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 'proj_stripe_staff_backend',
-    user_id: 'usr_demo_123',
-    company_name: 'Stripe',
-    company_domain: 'stripe.com',
-    company_logo_url: 'https://stripe.com/favicon.ico',
-    role_title: 'Backend Engineer, Payments Core',
-    seniority: 'Mid-Senior',
-    status: 'ready',
-    active_resume_id: 'res_2',
-    jd_raw: 'Join Stripe Payments Core team building reliable distributed payment processing engines...',
-    readiness: {
-      overall: 65,
-      resume_match: 78,
-      technical: 62,
-      behavioral: 85,
-      coding: 60,
-      system_design: 45,
-    },
-    stats: {
-      sessions_count: 2,
-      avg_score: 63.5,
-      best_score: 65,
-      last_score: 65,
-      total_minutes: 30,
-      credits_spent: 6,
-    },
-    readiness_overall: 65,
-    sessions_count: 2,
-    avg_score: 63.5,
-    last_session_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
-    deleted_at: null,
-    created_at: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
-    updated_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 'proj_meta_tech_lead',
-    user_id: 'usr_demo_123',
-    company_name: 'Meta',
-    company_domain: 'meta.com',
-    company_logo_url: 'https://meta.com/favicon.ico',
-    role_title: 'Full Stack Engineer, AI Tools',
-    seniority: 'Senior',
-    status: 'preparing',
-    active_resume_id: 'res_3',
-    jd_raw: 'Building next generation web interfaces for generative AI development...',
-    readiness: {
-      overall: 0,
-      resume_match: 0,
-    },
-    stats: {
-      sessions_count: 0,
-      avg_score: 0,
-      best_score: 0,
-      last_score: 0,
-    },
-    readiness_overall: null,
-    sessions_count: 0,
-    avg_score: null,
-    last_session_at: null,
-    deleted_at: null,
-    created_at: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString(),
-    updated_at: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 'proj_uber_lead_arch',
-    user_id: 'usr_demo_123',
-    company_name: 'Uber',
-    company_domain: 'uber.com',
-    company_logo_url: 'https://uber.com/favicon.ico',
-    role_title: 'Staff Platform Systems Engineer',
-    seniority: 'Staff',
-    status: 'draft',
-    active_resume_id: null,
-    jd_raw: 'Architect high-throughput real-time routing platforms...',
-    readiness: {},
-    stats: { sessions_count: 0 },
-    readiness_overall: null,
-    sessions_count: 0,
-    avg_score: null,
-    last_session_at: null,
-    deleted_at: null,
-    created_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-    updated_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-  },
-];
+export const MOCK_PROJECTS: Project[] = [];
 
-export const MOCK_LEDGER: CreditLedgerItem[] = [
-  {
-    id: 104,
-    user_id: 'usr_demo_123',
-    kind: 'spend',
-    amount: -3,
-    balance_after: 4,
-    session_id: 'sess_3',
-    meta: { breakdown: { voice: 2, coding: 1 }, role: 'Senior Software Engineer' },
-    created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 103,
-    user_id: 'usr_demo_123',
-    kind: 'spend',
-    amount: -3,
-    balance_after: 7,
-    session_id: 'sess_2',
-    meta: { breakdown: { voice: 2, coding: 1 }, role: 'Backend Engineer' },
-    created_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 102,
-    user_id: 'usr_demo_123',
-    kind: 'purchase',
-    amount: 9,
-    balance_after: 10,
-    session_id: null,
-    meta: { pack: 'Placement Season Pack', provider: 'Stripe' },
-    created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 101,
-    user_id: 'usr_demo_123',
-    kind: 'grant',
-    amount: 1,
-    balance_after: 1,
-    session_id: null,
-    meta: { reason: 'Welcome bonus credit on signup' },
-    created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
-  },
-];
+export const MOCK_LEDGER: CreditLedgerItem[] = [];
 
 // --- DB API Functions ---
+
+/**
+ * The dashboard tile projection. Must stay a single string literal — supabase-js
+ * parses it at the type level, and concatenation degrades the result to `string`.
+ */
+const PROJECT_TILE_COLUMNS =
+  'id, user_id, company_name, company_domain, company_logo_url, role_title, seniority, status, active_resume_id, readiness, stats, readiness_overall, sessions_count, avg_score, last_session_at, prep_error, deleted_at, created_at, updated_at';
 
 export async function fetchUserProfile(userId?: string): Promise<Profile> {
   if (isSupabaseConfigured() && userId) {
@@ -302,7 +157,7 @@ export async function fetchUserProfile(userId?: string): Promise<Profile> {
   if (typeof window !== 'undefined') {
     const saved = localStorage.getItem('dta_user_profile');
     if (saved) {
-      try { return JSON.parse(saved); } catch (_) {}
+      try { return JSON.parse(saved); } catch {}
     }
   }
   return MOCK_PROFILE;
@@ -341,9 +196,15 @@ export async function updateUserProfile(userId: string, updates: Partial<Profile
 export async function fetchUserProjects(userId?: string): Promise<Project[]> {
   if (isSupabaseConfigured() && userId) {
     try {
+      // Explicit column list, never `select *`. A projects row carries
+      // company_profile, jd_profile, gap_report and strategy — tens of KB of
+      // TOASTed JSONB that a dashboard tile never reads. Naming the columns is
+      // what keeps this query touching only the ~200-byte main tuple
+      // (db-design.md §1.2), and it is the single discipline the whole
+      // JSONB-heavy design depends on.
       const { data, error } = await supabase
         .from('projects')
-        .select('*')
+        .select(PROJECT_TILE_COLUMNS)
         .eq('user_id', userId)
         .is('deleted_at', null)
         .order('updated_at', { ascending: false });
@@ -359,7 +220,7 @@ export async function fetchUserProjects(userId?: string): Promise<Project[]> {
   if (typeof window !== 'undefined') {
     const saved = localStorage.getItem('dta_user_projects');
     if (saved) {
-      try { return JSON.parse(saved); } catch (_) {}
+      try { return JSON.parse(saved); } catch {}
     }
   }
   return MOCK_PROJECTS;

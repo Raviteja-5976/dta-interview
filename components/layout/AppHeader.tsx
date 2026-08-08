@@ -21,10 +21,9 @@ import { Profile } from '@/lib/supabase/db';
 
 interface AppHeaderProps {
   profile?: Profile | null;
-  onNewProjectClick?: () => void;
 }
 
-export default function AppHeader({ profile, onNewProjectClick }: AppHeaderProps) {
+export default function AppHeader({ profile }: AppHeaderProps) {
   const pathname = usePathname();
   const router = useRouter();
   const { user, signOut, openAuthModal } = useAuth();
@@ -124,16 +123,14 @@ export default function AppHeader({ profile, onNewProjectClick }: AppHeaderProps
             <span>{creditsBalance} {creditsBalance === 1 ? 'Credit' : 'Credits'}</span>
           </div>
 
-          {/* New Project Quick Button (if provided) */}
-          {onNewProjectClick && (
-            <button
-              onClick={onNewProjectClick}
-              className="hidden sm:inline-flex items-center gap-2 px-4 py-2 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-bold text-xs md:text-sm rounded-xl border-2 border-[#1B1F3B] shadow-[3px_3px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all"
-            >
-              <Plus className="w-4 h-4" />
-              <span>New Project</span>
-            </button>
-          )}
+          {/* New Project — always the wizard, never an inline modal */}
+          <Link
+            href="/projects/new"
+            className="hidden sm:inline-flex items-center gap-2 px-4 py-2 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-bold text-xs md:text-sm rounded-xl border-2 border-[#1B1F3B] shadow-[3px_3px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all"
+          >
+            <Plus className="w-4 h-4" />
+            <span>New Project</span>
+          </Link>
 
           {/* User Profile Dropdown */}
           <div className="relative" ref={dropdownRef}>
@@ -249,18 +246,14 @@ export default function AppHeader({ profile, onNewProjectClick }: AppHeaderProps
             <span>Profile</span>
           </Link>
 
-          {onNewProjectClick && (
-            <button
-              onClick={() => {
-                setMobileMenuOpen(false);
-                onNewProjectClick();
-              }}
-              className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-[#FF6B35] text-white font-bold rounded-xl border-2 border-[#1B1F3B]"
-            >
-              <Plus className="w-5 h-5" />
-              <span>Create New Project</span>
-            </button>
-          )}
+          <Link
+            href="/projects/new"
+            onClick={() => setMobileMenuOpen(false)}
+            className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-[#FF6B35] text-white font-bold rounded-xl border-2 border-[#1B1F3B]"
+          >
+            <Plus className="w-5 h-5" />
+            <span>Create New Project</span>
+          </Link>
         </div>
       )}
     </header>
