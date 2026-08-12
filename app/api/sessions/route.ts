@@ -13,13 +13,20 @@
  */
 
 import { createSupabaseServerClient, requireUser } from '@/lib/supabase/server';
-import { codingQuestionCount, designQuestionCount, quoteSession } from '@/lib/credits';
+import {
+  CODING_MODULE_CREDITS,
+  CREDITS_PER_MINUTE,
+  SYSTEM_DESIGN_MODULE_CREDITS,
+  codingQuestionCount,
+  designQuestionCount,
+  planSession,
+  type Difficulty,
+} from '@/lib/credits';
 import { created, failure, handleRouteError, notFound } from '@/lib/api/respond';
 
 interface CreateSessionBody {
   projectId: string;
-  difficulty?: 'easy' | 'medium' | 'hard';
-  durationMin?: number;
+  difficulty?: Difficulty;
   coding?: boolean;
   systemDesign?: boolean;
   focusSkills?: string[];
@@ -53,41 +60,55 @@ export async function POST(request: Request) {
     const prefs = (profile?.prefs ?? {}) as {
       language?: string;
       persona?: string;
-      defaults?: { difficulty?: 'easy' | 'medium' | 'hard'; duration_min?: number };
+      defaults?: { difficulty?: Difficulty };
     };
 
-    const config = {
-      difficulty: body.difficulty ?? prefs.defaults?.difficulty ?? 'medium',
-      duration_min: body.durationMin ?? prefs.defaults?.duration_min ?? 15,
-      language: prefs.language ?? 'en-IN',
-      persona: prefs.persona ?? 'warm_professional',
-      modules: {
-        coding: body.coding ?? false,
-        system_design: body.systemDesign ?? false,
-        behavioral: true,
-      },
-      focus_skills: body.focusSkills ?? [],
+    const difficulty: Difficulty = body.difficulty ?? prefs.defaults?.difficulty ?? 'medium';
+    const modules = {
+      coding: body.coding ?? false,
+      system_design: body.systemDesign ?? false,
+      behavioral: true,
     };
 
-    // The HOLD: the most this session could cost, at the full planned duration
-    // with every enabled module. Settlement at the end returns whatever went
-    // unused, so this is a ceiling, not a price.
-    const hold = quoteSession(config.duration_min, config.modules);
-
-    // Checked here for a clear message; `spend_credits` is still the real gate.
-    // Never let a user reach a live interview screen and then fail (§8).
     const balance = profile?.credits_balance ?? 0;
-    if (balance < hold.total) {
+
+    // Duration is derived from difficulty, then capped by what the balance can
+    // actually pay for. There is no duration picker — see lib/credits.ts.
+    const plan = planSession(difficulty, modules, balance);
+
+    // The gate. Voice is post-paid, so nothing stops a running interview from
+    // outspending the balance except this check plus the ceiling it produces.
+    // Never let a user reach a live interview screen and then fail (§8).
+    if (!plan.canStart) {
       return failure(
         402,
-        `This interview needs up to ${hold.total} credits and you have ${balance}.`,
+        `An ${difficulty} interview needs ${plan.requiredToStart} credits to start ` +
+          `(${plan.minimumVoiceCredits} for its first ${plan.band.min} minutes` +
+          `${plan.upfrontCredits > 0 ? `, ${plan.upfrontCredits} for the modules` : ''}) ` +
+          `and you have ${balance}.`,
         {
-          shortfall: hold.total - balance,
-          required: hold.total,
+          shortfall: plan.shortfall,
+          required: plan.requiredToStart,
           balance,
+          difficulty,
+          minimumMinutes: plan.band.min,
         },
       );
     }
+
+    const config = {
+      difficulty,
+      language: prefs.language ?? 'en-IN',
+      persona: prefs.persona ?? 'warm_professional',
+      modules,
+      focus_skills: body.focusSkills ?? [],
+      // The hard stop the orchestrator enforces, and the cap that settlement
+      // bills against. Stored so both read the same number.
+      duration_min: plan.ceilingMinutes,
+      // What the interview is planned to fill. P5 targets this range.
+      target_min_minutes: plan.band.min,
+      target_max_minutes: plan.ceilingMinutes,
+    };
 
     const { data: lastSession } = await supabase
       .from('sessions')
@@ -116,51 +137,62 @@ export async function POST(request: Request) {
       return failure(500, 'Could not create the session. No credits were spent.');
     }
 
+    // Modules only. They are generated during preparation, so the spend is
+    // incurred before a word is spoken and there is nothing to pro-rate.
+    // Voice time is charged afterwards, from the real elapsed duration.
+    //
     // The conditional UPDATE inside spend_credits is the whole concurrency
     // story: two simultaneous taps cannot both succeed on the last credit.
-    const { error: spendError } = await supabase.rpc('spend_credits', {
-      p_amount: hold.total,
-      p_session: session.id,
-      p_meta: {
-        kind: 'hold',
-        breakdown: { voice: hold.voice, coding: hold.coding, system_design: hold.system_design },
-        rate_per_minute: 5,
-        planned_minutes: hold.minutes,
-        difficulty: config.difficulty,
-      },
-    });
+    if (plan.upfrontCredits > 0) {
+      const { error: spendError } = await supabase.rpc('spend_credits', {
+        p_amount: plan.upfrontCredits,
+        p_session: session.id,
+        p_meta: {
+          reason: 'modules',
+          breakdown: {
+            coding: modules.coding ? CODING_MODULE_CREDITS : 0,
+            system_design: modules.system_design ? SYSTEM_DESIGN_MODULE_CREDITS : 0,
+          },
+          difficulty,
+        },
+      });
 
-    if (spendError) {
-      // Fail closed: remove the session so an unpaid one never reaches the
-      // interview screen.
-      await supabase.from('sessions').delete().eq('id', session.id);
+      if (spendError) {
+        // Fail closed: remove the session so an unpaid one never reaches the
+        // interview screen.
+        await supabase.from('sessions').delete().eq('id', session.id);
 
-      const insufficient = spendError.message.includes('insufficient_credits');
-      return failure(
-        insufficient ? 402 : 500,
-        insufficient
-          ? 'You do not have enough credits for this interview.'
-          : 'Could not charge credits. Nothing was spent.',
-      );
+        const insufficient = spendError.message.includes('insufficient_credits');
+        return failure(
+          insufficient ? 402 : 500,
+          insufficient
+            ? 'You do not have enough credits for this interview.'
+            : 'Could not charge credits. Nothing was spent.',
+        );
+      }
     }
 
     await supabase
       .from('sessions')
-      .update({ credits_charged: hold.total, status: 'preparing' })
+      .update({ credits_charged: plan.upfrontCredits, status: 'preparing' })
       .eq('id', session.id);
 
     return created({
       sessionId: session.id,
       seq,
-      creditsHeld: hold.total,
-      plannedMinutes: hold.minutes,
+      chargedNow: plan.upfrontCredits,
+      ratePerMinute: CREDITS_PER_MINUTE,
+      minMinutes: plan.band.min,
+      maxMinutes: plan.ceilingMinutes,
+      maxTotalCredits: plan.maxTotalCredits,
+      ceilingLimitedByCredits: plan.ceilingLimitedByCredits,
       // How many challenges each enabled module will contain, so the interview
       // screen can say so before the candidate is surprised by a third problem.
-      codingQuestions: config.modules.coding
-        ? codingQuestionCount(config.difficulty, config.duration_min)
+      codingQuestions: modules.coding
+        ? codingQuestionCount(difficulty, plan.ceilingMinutes)
         : 0,
-      designQuestions: config.modules.system_design
-        ? designQuestionCount(config.difficulty, config.duration_min)
+      designQuestions: modules.system_design
+        ? designQuestionCount(difficulty, plan.ceilingMinutes)
         : 0,
     });
   } catch (err) {

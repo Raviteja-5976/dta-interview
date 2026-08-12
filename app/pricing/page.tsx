@@ -21,27 +21,35 @@ import {
   CODING_MODULE_CREDITS,
   CREDITS_PER_MINUTE,
   CREDIT_PACKS,
+  DIFFICULTY_BANDS,
   SYSTEM_DESIGN_MODULE_CREDITS,
-  quoteSession,
+  planSession,
+  type Difficulty,
 } from '@/lib/credits';
 import { paymentsEnabled } from '@/components/app/useRazorpayCheckout';
 import { supabase } from '@/lib/supabase/client';
 
-/** Worked examples, straight from the pricing functions the API charges with. */
-const EXAMPLES = [
-  { label: '15-minute interview', duration: 15, coding: false, design: false },
-  { label: '30 minutes + coding round', duration: 30, coding: true, design: false },
-  { label: '45 minutes + coding + system design', duration: 45, coding: true, design: true },
+/**
+ * Worked examples, computed by the same function the API charges with. A large
+ * balance is passed so the numbers show the difficulty band rather than what
+ * some hypothetical wallet could afford.
+ */
+const RICH = 10_000;
+
+const EXAMPLES: Array<{ label: string; difficulty: Difficulty; coding: boolean; design: boolean }> = [
+  { label: 'Easy interview', difficulty: 'easy', coding: false, design: false },
+  { label: 'Medium + coding round', difficulty: 'medium', coding: true, design: false },
+  { label: 'Hard + coding + system design', difficulty: 'hard', coding: true, design: true },
 ];
 
 const FAQ = [
   {
     q: 'How are credits actually charged?',
-    a: `Interviews are billed by the minute — ${CREDITS_PER_MINUTE} credits for each minute you're actually in the interview. When you start, we hold the maximum your session could cost, and the moment it ends we give back whatever you didn't use. You are never charged more than the number you saw before you clicked start.`,
+    a: `Talking time is billed by the minute, afterwards — ${CREDITS_PER_MINUTE} credits for each minute you were actually in the interview. Nothing is held upfront for it. Coding rounds and system design are the exception: those are charged when you start, because we build the problems before you arrive.`,
   },
   {
     q: 'What if I finish early?',
-    a: 'You pay for the minutes you used. A 30-minute interview you wrapped up in 18 minutes costs 18 minutes, and the rest is back in your balance before the report finishes generating.',
+    a: 'You pay for the minutes you used and nothing else. Walk out after four minutes and it costs four minutes — there is no held amount to give back, because we never took one.',
   },
   {
     q: 'What does the coding round cost?',
@@ -50,6 +58,14 @@ const FAQ = [
   {
     q: 'And system design?',
     a: `${SYSTEM_DESIGN_MODULE_CREDITS} credits, flat, on the same basis — up to three scenarios depending on length and difficulty.`,
+  },
+  {
+    q: 'How long is an interview?',
+    a: `Difficulty decides it. Easy runs ${DIFFICULTY_BANDS.easy.min}-${DIFFICULTY_BANDS.easy.max} minutes, medium ${DIFFICULTY_BANDS.medium.min}-${DIFFICULTY_BANDS.medium.max}, hard ${DIFFICULTY_BANDS.hard.min}-${DIFFICULTY_BANDS.hard.max}. There is no duration picker: a hard interview needs the room to go deep, and an easy one stretched to half an hour just repeats itself.`,
+  },
+  {
+    q: 'How many credits do I need to start?',
+    a: `Enough for the interview's shortest length — ${DIFFICULTY_BANDS.easy.min * CREDITS_PER_MINUTE} credits for easy, ${DIFFICULTY_BANDS.medium.min * CREDITS_PER_MINUTE} for medium, ${DIFFICULTY_BANDS.hard.min * CREDITS_PER_MINUTE} for hard, plus any modules. If your balance covers less than the full length, the interview simply ends when your credits run out rather than running up a debt.`,
   },
   {
     q: 'What happens if an interview fails?',
@@ -80,8 +96,8 @@ export default function PricingPage() {
             Pay for the minutes you actually talk.
           </h1>
           <p className="mt-4 text-base md:text-lg text-[#1B1F3B]/75">
-            No subscription. No expiry. {CREDITS_PER_MINUTE} credits a minute, and whatever you
-            don&apos;t use comes straight back.
+            No subscription. No expiry. {CREDITS_PER_MINUTE} credits a minute, billed after you
+            finish — so stopping early simply costs less.
           </p>
         </div>
 
@@ -138,15 +154,13 @@ export default function PricingPage() {
             What an interview actually costs
           </h2>
           <p className="text-sm text-[#1B1F3B]/70 mb-6">
-            These are the real numbers, from the same code that charges your account.
+            Difficulty sets the length. These come from the same code that charges your account.
           </p>
 
           <div className="space-y-3">
             {EXAMPLES.map((ex) => {
-              const quote = quoteSession(ex.duration, {
-                coding: ex.coding,
-                system_design: ex.design,
-              });
+              const plan = planSession(ex.difficulty, { coding: ex.coding, system_design: ex.design }, RICH);
+              const low = plan.upfrontCredits + plan.band.min * CREDITS_PER_MINUTE;
               return (
                 <div
                   key={ex.label}
@@ -157,12 +171,12 @@ export default function PricingPage() {
                   </span>
                   <div className="flex items-center gap-3">
                     <span className="font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/60 tabular-nums">
-                      {quote.minutes}×{CREDITS_PER_MINUTE}
+                      {plan.band.min}-{plan.band.max} min × {CREDITS_PER_MINUTE}
                       {ex.coding ? ` +${CODING_MODULE_CREDITS}` : ''}
                       {ex.design ? ` +${SYSTEM_DESIGN_MODULE_CREDITS}` : ''}
                     </span>
                     <span className="font-[family-name:var(--font-display)] text-xl font-extrabold tabular-nums">
-                      {quote.total}
+                      {low}-{plan.maxTotalCredits}
                     </span>
                   </div>
                 </div>
@@ -171,16 +185,20 @@ export default function PricingPage() {
           </div>
 
           <div className="grid sm:grid-cols-3 gap-4 mt-6 pt-6 border-t-2 border-[#1B1F3B]/15">
-            <Rate label="Interview" value={`${CREDITS_PER_MINUTE} credits`} unit="per minute" />
+            <Rate
+              label="Talking time"
+              value={`${CREDITS_PER_MINUTE} credits`}
+              unit="per minute · billed afterwards"
+            />
             <Rate
               label="Coding round"
               value={`${CODING_MODULE_CREDITS} credits`}
-              unit="flat · up to 3 problems"
+              unit="flat · upfront · up to 3 problems"
             />
             <Rate
               label="System design"
               value={`${SYSTEM_DESIGN_MODULE_CREDITS} credits`}
-              unit="flat · up to 3 scenarios"
+              unit="flat · upfront · up to 3 scenarios"
             />
           </div>
         </Card>
@@ -194,7 +212,7 @@ export default function PricingPage() {
                 100 credits when you sign up.
               </h2>
               <p className="text-sm text-[#1B1F3B]/75 mt-1">
-                That is one full 20-minute interview and its report. No card.
+                That is a full easy interview and its report. No card.
               </p>
             </div>
             <Link

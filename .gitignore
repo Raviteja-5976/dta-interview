@@ -40,3 +40,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Monaco's AMD bundle, copied out of node_modules by scripts/copy-monaco.mjs
+# on predev/prebuild. Build output, not source.
+/public/monaco
+
+
+auth.txt

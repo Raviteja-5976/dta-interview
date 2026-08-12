@@ -6,12 +6,15 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "predev": "node scripts/copy-monaco.mjs",
+    "prebuild": "node scripts/copy-monaco.mjs"
   },
   "dependencies": {
     "@ai-sdk/google": "^4.0.39",
     "@ai-sdk/openai": "^4.0.36",
     "@ai-sdk/xai": "^4.0.33",
+    "@monaco-editor/react": "^4.7.0",
     "@supabase/ssr": "^0.12.4",
     "@supabase/supabase-js": "^2.112.1",
     "@types/canvas-confetti": "^1.9.0",
@@ -19,6 +22,7 @@
     "canvas-confetti": "^1.9.4",
     "clsx": "^2.1.1",
     "lucide-react": "^1.28.0",
+    "monaco-editor": "^0.56.0",
     "next": "16.3.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",

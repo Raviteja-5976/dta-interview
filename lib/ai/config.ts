@@ -69,7 +69,7 @@ export const AGENT_POLICY: Record<AgentId, AgentPolicy> = {
     timeoutMs: 30_000,
     maxRetries: 1,
     temperature: 0,
-    reasoningEffort: 'minimal',
+    reasoningEffort: 'low',
     textVerbosity: 'low',
     maxOutputTokens: 4_000,
     rationale:
@@ -101,24 +101,29 @@ export const AGENT_POLICY: Record<AgentId, AgentPolicy> = {
   P6: {
     tier: 'deep',
     phase: 'prep',
-    timeoutMs: 120_000,
+    // High reasoning on a large structured output genuinely takes a minute or
+    // two. A timeout here is NOT retried (see isTransient in run.ts), so this
+    // ceiling is also the worst case for the whole prep route.
+    timeoutMs: 180_000,
     maxRetries: 1,
     temperature: 0.4,
     reasoningEffort: 'high',
-    textVerbosity: 'medium',
+    // Visible-output budget only — run.ts adds the reasoning headroom on top.
     maxOutputTokens: 16_000,
+    textVerbosity: 'medium',
     rationale:
       'One call per session produces every goal, question and rubric. Its output is what all ~25 live turns navigate and what the entire evaluation phase grades against, so quality here compounds further than anywhere else in the system. Worth 10x the unit cost of the cheap tier; not worth 25x for the frontier one.',
   },
   P7: {
     tier: 'deep',
     phase: 'prep',
-    timeoutMs: 90_000,
+    timeoutMs: 120_000,
     maxRetries: 1,
     temperature: 0.4,
     reasoningEffort: 'high',
+    // Three languages of starter code, hidden tests and a reference solution.
+    maxOutputTokens: 10_000,
     textVerbosity: 'medium',
-    maxOutputTokens: 6_000,
     rationale:
       'On `deep` for one specific reason: it has to write hidden test cases whose expected values are arithmetically correct for its own reference solution. A wrong expected value fails a candidate whose code was right — the worst defect this system can ship, and exactly the kind of careless arithmetic a cheap model produces. Only runs when a module is enabled.',
   },
@@ -156,10 +161,25 @@ export const AGENT_POLICY: Record<AgentId, AgentPolicy> = {
     timeoutMs: 8_000,
     maxRetries: 1,
     temperature: 0,
-    reasoningEffort: 'minimal',
+    reasoningEffort: 'low',
     textVerbosity: 'low',
     maxOutputTokens: 1_500,
     rationale: 'Async and off the critical path by design. Never blocks a turn, so it gets the cheapest tier and a generous timeout.',
+  },
+  L3: {
+    tier: 'nano',
+    phase: 'live',
+    // Launched BEFORE L1 and awaited AFTER L4, so its budget is the two of them
+    // back to back. At 2s it lands inside that window and adds no wall clock to
+    // the turn; past it, the turn proceeds on the lexical marks alone.
+    timeoutMs: 2_000,
+    maxRetries: 0,
+    temperature: 0,
+    reasoningEffort: 'none',
+    textVerbosity: 'low',
+    maxOutputTokens: 600,
+    rationale:
+      'Decides which evidence items an answer actually established — the number the whole report is built from, and the input that decides whether a goal stays open. Runs concurrently with L1 so it is free in wall-clock terms, and on the cheapest tier because the task is bounded: it rules on at most 8 ids it was handed, against one answer, with no reasoning budget.',
   },
   L4: {
     tier: 'fast',
@@ -177,6 +197,21 @@ export const AGENT_POLICY: Record<AgentId, AgentPolicy> = {
     maxOutputTokens: 500,
     rationale:
       'Blocking, ~25 calls per interview. Wraps a question in words — it never decides substance, so it needs speed, not depth. reasoningEffort none for the same reason: there is no decision left to make by the time it runs.',
+  },
+
+  L6: {
+    tier: 'nano',
+    phase: 'live',
+    // Longer than L1/L4 because this one is allowed to be slow: the candidate
+    // just asked a question and a beat before the reply is what a person does.
+    timeoutMs: 4_000,
+    maxRetries: 0,
+    temperature: 0.3,
+    reasoningEffort: 'none',
+    textVerbosity: 'low',
+    maxOutputTokens: 500,
+    rationale:
+      'Fires at most once or twice per interview, when the candidate asks something back. The JD and company material are supplied, so this is summarising a source rather than reasoning about one — the cheapest tier is right, and the fallback is simply not answering.',
   },
 
   // ── Phase 3 · Evaluation ──────────────────────────────────────────────────

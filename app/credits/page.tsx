@@ -2,9 +2,11 @@
  * /credits — balance, packs, checkout, and the ledger (sitemap-workflow.md §12).
  *
  * Refunds are shown explicitly, because a visible refund builds more trust than
- * a silent one. That matters more under metered billing than it did before:
- * every finished interview produces a refund row for the unused hold, and a user
- * who does not understand why would assume they were double-charged.
+ * a silent one.
+ *
+ * One interview can produce two ledger rows — modules charged upfront, talking
+ * time charged afterwards — so `ledgerLabel` names each one. Left as a bare
+ * "Interview" twice, a single session reads as a double charge.
  */
 
 'use client';
@@ -31,7 +33,12 @@ interface LedgerRow {
   amount: number;
   balance_after: number;
   session_id: string | null;
-  meta: { reason?: string; breakdown?: Record<string, number>; charged?: number } | null;
+  meta: {
+    reason?: string;
+    minutes?: number;
+    breakdown?: Record<string, number>;
+    charged?: number;
+  } | null;
   created_at: string;
 }
 
@@ -43,6 +50,28 @@ interface PaymentRow {
   status: string;
   failure_reason: string | null;
   created_at: string;
+}
+
+/**
+ * Ledger rows carry a `reason` that says more than the enum does — an interview
+ * produces a `modules` charge upfront and a `voice_time` charge afterwards, and
+ * showing both as a bare "Interview" makes a single session look like a double
+ * charge.
+ */
+function ledgerLabel(row: LedgerRow): string {
+  switch (row.meta?.reason) {
+    case 'voice_time':
+      return typeof row.meta.minutes === 'number'
+        ? `Interview · ${row.meta.minutes} min`
+        : 'Interview time';
+    case 'modules':
+      return 'Coding / design round';
+    // Sessions that started under the old hold-and-refund model.
+    case 'settlement':
+      return 'Unused time';
+    default:
+      return KIND_LABEL[row.kind];
+  }
 }
 
 const KIND_LABEL: Record<LedgerRow['kind'], string> = {
@@ -184,7 +213,7 @@ function CreditsContent() {
             )}
 
             {/* Packs */}
-            <SectionTitle sub={`${CREDITS_PER_MINUTE} credits per minute · coding round ${CODING_MODULE_CREDITS} · system design ${SYSTEM_DESIGN_MODULE_CREDITS}`}>
+            <SectionTitle sub={`${CREDITS_PER_MINUTE} credits per minute, billed after the interview · coding round ${CODING_MODULE_CREDITS} upfront · system design ${SYSTEM_DESIGN_MODULE_CREDITS} upfront`}>
               Buy credits
             </SectionTitle>
 
@@ -311,7 +340,7 @@ function CreditsContent() {
                                   : 'yellow'
                           }
                         >
-                          {row.meta?.reason === 'settlement' ? 'Unused time' : KIND_LABEL[row.kind]}
+                          {ledgerLabel(row)}
                         </Chip>
                         <span className="font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/60 truncate">
                           {new Date(row.created_at).toLocaleString(undefined, {

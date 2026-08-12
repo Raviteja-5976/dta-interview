@@ -6,11 +6,12 @@
  * the project/session split.
  *
  * P5 re-runs here rather than being reused from the project. Time allocation and
- * the difficulty ramp depend on the duration, difficulty and modules the user
- * picked on the setup screen, and those are session choices — a strategy built
- * for a 15-minute no-coding default is the wrong envelope for a 45-minute
- * session with a coding round. It is a small `balanced` call, and getting the
- * section budgets right is worth more than saving it.
+ * the difficulty ramp depend on the difficulty and modules chosen on the setup
+ * screen, and on the ceiling the candidate's balance affords — all session
+ * facts, none of them known at project creation. A strategy built for the
+ * medium band is the wrong envelope for a 30-minute hard interview with a
+ * coding round. It is a small `balanced` call, and getting the section budgets
+ * right is worth more than saving it.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -31,10 +32,15 @@ import { ACKNOWLEDGEMENT_POOL } from '../engine/rules';
 import { seedCoverage } from '../engine/l3-evidence';
 import { emptyMemory } from '../engine/l2-memory-store';
 import { initialRuntime } from '../engine/types';
+import { SESSION_PREP_STAGES, type SessionPrepStage } from './prep-stages';
 
 export interface SessionConfig {
   difficulty: 'easy' | 'medium' | 'hard';
+  /** Hard stop, and the cap settlement bills against. */
   duration_min: number;
+  /** The band the interview is planned to fill. */
+  target_min_minutes: number;
+  target_max_minutes: number;
   language: string;
   persona: string;
   modules: { coding: boolean; system_design: boolean; behavioral: boolean };
@@ -45,6 +51,54 @@ export interface SessionPrepResult {
   status: 'ready' | 'failed';
   error?: string;
   voiceAssetsCached: number;
+}
+
+
+/**
+ * Publishes progress to `sessions.progress`, which the interview screen watches
+ * over realtime.
+ *
+ * P6 alone can take a minute of genuine work. Without this the screen has
+ * nothing to show and a slow-but-healthy prep is indistinguishable from a hang —
+ * which is exactly how a working system gets reported as broken.
+ *
+ * Never allowed to fail the pipeline: a missed progress write costs a UI update,
+ * not a session.
+ */
+async function publishProgress(
+  supabase: SupabaseClient,
+  sessionId: string,
+  stage: SessionPrepStage,
+  detail?: string,
+  clock?: { startedAt: number; lastAt: number },
+): Promise<void> {
+  const index = SESSION_PREP_STAGES.findIndex((s) => s.key === stage);
+
+  // Per-stage timings. Prep is a single long request, so without these the only
+  // observable fact is the total — and "it took four minutes" does not tell you
+  // whether P6 is slow or P8 is synthesising forty clips for nothing.
+  let timing = '';
+  if (clock) {
+    const now = Date.now();
+    timing = ` [+${((now - clock.lastAt) / 1000).toFixed(1)}s, ${((now - clock.startedAt) / 1000).toFixed(1)}s total]`;
+    clock.lastAt = now;
+  }
+
+  console.info(`[session-prep] ${sessionId} → ${stage}${detail ? ` (${detail})` : ''}${timing}`);
+
+  await supabase
+    .from('sessions')
+    .update({
+      progress: {
+        stage,
+        index,
+        total: SESSION_PREP_STAGES.length,
+        detail: detail ?? null,
+        at: new Date().toISOString(),
+      },
+    })
+    .eq('id', sessionId)
+    .then(undefined, () => null);
 }
 
 export async function runSessionPrep(
@@ -84,9 +138,11 @@ export async function runSessionPrep(
 
   const config = session.config as SessionConfig;
   const context = { userId: session.user_id, projectId: session.project_id, sessionId };
+  const clock = { startedAt: Date.now(), lastAt: Date.now() };
 
   try {
     await supabase.from('sessions').update({ status: 'preparing' }).eq('id', sessionId);
+    await publishProgress(supabase, sessionId, 'strategy', undefined, clock);
 
     // ── P5' ──────────────────────────────────────────────────────────────────
     const strategy = await runStrategy(
@@ -94,7 +150,8 @@ export async function runSessionPrep(
         gap: project.gap_report as GapReport,
         jd: project.jd_profile as JdProfile,
         config: {
-          durationMin: config.duration_min,
+          minMinutes: config.target_min_minutes ?? config.duration_min,
+          maxMinutes: config.target_max_minutes ?? config.duration_min,
           difficulty: config.difficulty,
           coding: config.modules.coding,
           systemDesign: config.modules.system_design,
@@ -105,6 +162,7 @@ export async function runSessionPrep(
     );
 
     // ── P6 ───────────────────────────────────────────────────────────────────
+    await publishProgress(supabase, sessionId, 'blueprint', undefined, clock);
     const blueprint = await runBlueprint(
       {
         strategy,
@@ -138,6 +196,17 @@ export async function runSessionPrep(
       ? designQuestionCount(config.difficulty, config.duration_min)
       : 0;
 
+
+    if (codingCount > 0 || designCount > 0) {
+      await publishProgress(
+        supabase,
+        sessionId,
+        'challenges',
+        `${codingCount} coding, ${designCount} design`,
+        clock,
+      );
+    }
+
     const [codingChallenge, designChallenge] = await Promise.all([
       codingCount > 0
         ? runCodingChallengeSet(challengeInput, codingCount, context)
@@ -148,6 +217,7 @@ export async function runSessionPrep(
     ]);
 
     // ── P8 ───────────────────────────────────────────────────────────────────
+    await publishProgress(supabase, sessionId, 'voice', undefined, clock);
     const voiceAssets = await presynthesizeVoice(supabase, {
       sessionId,
       userId: session.user_id,
@@ -183,6 +253,11 @@ export async function runSessionPrep(
         error: null,
       })
       .eq('id', sessionId);
+
+    console.info(
+      `[session-prep] ${sessionId} → ready [${((Date.now() - clock.startedAt) / 1000).toFixed(1)}s total, ` +
+        `${voiceAssets.assets.length} clips cached]`,
+    );
 
     return { status: 'ready', voiceAssetsCached: voiceAssets.assets.length };
   } catch (err) {

@@ -41,6 +41,24 @@ Filler words, false starts, and self-corrections are speech, not error. Ignore t
 - behavioral: about working with people. Fill in the STAR fields. Never mark wrong.
 - coding: reasoning about their own code. Judge the reasoning, not the syntax.
 
+## Grading against the resume
+
+For experiential and behavioral answers you are given the candidate's resume. Use it, because these questions have no factually correct answer and the resume is the only thing their account can be checked against. "Why did you build Hyrzo?" cannot be marked right or wrong — but it can be measured against what they wrote down.
+
+What the resume lets you observe:
+- CONSISTENCY — does the account match the claim? A resume saying "led a team of four" against an answer describing solo work is a real observation. Record it in observations, plainly and without accusation. People compress and misremember; the report notes the gap, it does not allege anything.
+- SPECIFICITY BEYOND THE PAGE — someone who lived the work supplies detail the resume does not contain: the thing that broke, the number they measured, the approach they rejected. An answer that only restates the bullet point is thin, however fluent it sounds. This is the single strongest signal you have on an experiential question, so weigh it in \`specificity\` and \`depth_reached\`.
+- SCOPE — the resume says what they claim to have owned. \`ownership\` should reflect what the ANSWER establishes, and where the two disagree, note it.
+
+Never mark an experiential answer wrong for diverging from the resume. A resume is a summary written months earlier, not ground truth. The divergence is the observation; the judgement is not yours to make.
+
+## coding — fill this in for coding answers only, otherwise null
+
+You are given the submitted source and the test results. The pass rate is already measured and is NOT yours to judge — assess the three things a test runner cannot:
+- complexity_match: how close the solution is to the stated target complexity. A correct brute force where the target was O(n log n) scores low here even at 100% passing.
+- code_quality: naming, structure, edge-case handling. Not formatting, not style preferences.
+- verbal_reasoning: did they explain the approach as they worked? Judge from the transcript around the submission. Silence while typing scores low even for perfect code — thinking out loud is what a coding interview is actually testing.
+
 ## incorrect_claims
 
 severity major means it would mislead them if left standing — a wrong mental model, not a slip. severity minor is a detail. Most answers have none; an empty array is the common case. Always give the correction, briefly and plainly.
@@ -61,6 +79,16 @@ export interface GradingInput {
   /** Set when the candidate barged in and did not hear the full question. */
   partiallyHeard?: boolean;
   asrConfidence?: number;
+  /**
+   * What the candidate claimed on paper, for experiential and behavioral modes.
+   *
+   * Trimmed to the projects and probe-worthy claims — the parts an answer can
+   * actually be checked against. Omitted for factual questions, where the resume
+   * is irrelevant and would only be prompt weight.
+   */
+  resumeContext?: string;
+  /** Sandbox results for a coding submission. Measured, never judged (§9.5). */
+  codingContext?: { passed: number; total: number; language: string; source: string };
 }
 
 export async function runGrading(
@@ -89,7 +117,20 @@ export async function runGrading(
       '',
       `<question>\n${input.question.text}\n</question>`,
       `<rubric>\n${JSON.stringify(input.rubric)}\n</rubric>`,
+      input.resumeContext
+        ? `<resume_claims>\n${input.resumeContext}\n</resume_claims>`
+        : '',
       `<answer_transcript>\n${input.transcript}\n</answer_transcript>`,
+      input.codingContext
+        ? [
+            '',
+            `<submission language="${input.codingContext.language}">`,
+            input.codingContext.source.slice(0, 4000),
+            '</submission>',
+            `Sandbox result: ${input.codingContext.passed} of ${input.codingContext.total} tests passed. ` +
+              'This is measured fact — do not re-judge it. Fill in the `coding` block.',
+          ].join('\n')
+        : '',
       '',
       'Grade this answer. Observations only — no scores.',
     ]

@@ -24,6 +24,7 @@ import { runResumeParser, runAtsScore } from '../agents/p2-resume';
 import { runJdParser } from '../agents/p3-jd';
 import { runGapAnalysis } from '../agents/p4-gap';
 import { runStrategy } from '../agents/p5-strategy';
+import { DIFFICULTY_BANDS } from '../credits';
 import type { CompanyProfile } from '../agents/schemas';
 import { AgentError } from '../ai/run';
 
@@ -112,13 +113,18 @@ export async function runProjectPrep(
     );
 
     // ── P5 ───────────────────────────────────────────────────────────────────
+    // A project-level placeholder strategy at the medium band. The real one is
+    // regenerated per session in session-prep.ts, where the difficulty, modules
+    // and credit-capped ceiling are actually known. This exists so the Overview
+    // page has something to show before the first interview.
     stage = 'strategy';
     const strategy = await runStrategy(
       {
         gap: gapReport,
         jd: jdProfile,
         config: {
-          durationMin: 15,
+          minMinutes: DIFFICULTY_BANDS.medium.min,
+          maxMinutes: DIFFICULTY_BANDS.medium.max,
           difficulty: 'medium',
           coding: false,
           systemDesign: false,

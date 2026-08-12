@@ -39,6 +39,30 @@ export interface StylerInput {
   intent: ConversationalIntent;
   /** Verbatim text from the blueprint, when the intent selected a bank question. */
   questionText?: string;
+  /**
+   * The answer just given, and what the interviewer still needs from it.
+   *
+   * Supplied ONLY when no bank text exists and L4 has to write the question
+   * itself. This is the narrowest possible breach of "L4 never sees the
+   * transcript", and it is the difference between a probe that digs and one that
+   * says "could you tell me a bit more about that?" — a follow-up cannot be
+   * specific to an answer it has not read.
+   *
+   * Bounded on purpose: last answer only, truncated. §10 names unbounded context
+   * growth in the live agents as the thing that kills them by turn twenty, and
+   * this stays constant-size however deep the interview runs.
+   */
+  lastAnswer?: string;
+  /** Human descriptions of the evidence still missing, for a targeted probe. */
+  missingEvidence?: string[];
+  /**
+   * Set when this question will be asked one or two turns from now, after
+   * something else has been discussed.
+   *
+   * It changes what the sentence has to do: the topic is no longer in the air,
+   * so the question has to reopen it by name before asking anything.
+   */
+  deferred?: { originalQuestion: string };
   /** Blueprint-supplied transitions, for section changes (R10). */
   exitTransition?: string;
   entryTransition?: string;
@@ -84,7 +108,45 @@ function buildPrompt(input: StylerInput): string {
   if (input.questionText) {
     lines.push('', `QUESTION TEXT (reproduce exactly, word for word):\n"${input.questionText}"`);
   } else {
-    lines.push('', `No question text supplied — write one that serves this intent. Target skill: ${intent.target_skill ?? 'n/a'}. Still needed: ${intent.missing_evidence.join(', ') || 'n/a'}.`);
+    /*
+     * The generative branch. Everything below exists so this produces a probe
+     * into what they actually said, rather than a generic nudge — the follow-up
+     * has to quote their own material back at them to be worth asking.
+     */
+    lines.push(
+      '',
+      'No question text supplied — YOU write the question.',
+      `Target skill: ${intent.target_skill ?? 'n/a'}.`,
+    );
+
+    if (input.missingEvidence?.length) {
+      lines.push(
+        'It must extract ONE of these specifically:',
+        ...input.missingEvidence.map((e) => `  - ${e}`),
+      );
+    }
+
+    if (input.lastAnswer) {
+      lines.push(
+        '',
+        `<their last answer>\n${truncate(input.lastAnswer, 900)}\n</their last answer>`,
+        '',
+        'Build the question out of THEIR material. Name the specific system, number, tool or decision they mentioned and ask for the layer underneath it — the mechanism, the trade-off, the measurement, or the thing that went wrong.',
+        'Forbidden: "tell me more about that", "can you elaborate", "go deeper on that", or any question that would make sense after a different answer. If it does not name something they said, it is the wrong question.',
+      );
+    }
+
+    if (input.deferred) {
+      lines.push(
+        '',
+        'IMPORTANT — this will not be asked next. One or two other questions come first, so by the time they hear it the topic has moved on.',
+        `They were originally answering: "${input.deferred.originalQuestion}"`,
+        'So OPEN by reopening the topic by name, then ask. Put both in the `utterance` as one natural line, and leave `transition` empty.',
+        '  "Coming back to the ingestion pipeline for a second — how did you decide on the chunk size?"',
+        '  "Actually, one more on Hyrzo — what did you measure to know retrieval had improved?"',
+        'A bare question here lands with no subject and gets answered at the wrong scope.',
+      );
+    }
   }
 
   if (intent.action === 'TRANSITION_SECTION') {
@@ -131,13 +193,27 @@ function normalise(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-/** Safe default on timeout — plain, correct, and never silent. */
+function truncate(text: string, max: number): string {
+  const clean = text.trim();
+  return clean.length <= max ? clean : `${clean.slice(0, max)}…`;
+}
+
+/**
+ * Safe default on timeout — plain, correct, and never silent.
+ *
+ * The fallback probe is built from the missing evidence rather than being a
+ * fixed string. "Could you tell me a bit more about that?" was what a candidate
+ * heard after most questions, because L4 timing out and the rule layer picking a
+ * text-less action both land here — and a generic nudge teaches the candidate
+ * that the interviewer is not listening. Naming the thing we still need is no
+ * harder to produce and is an actual question.
+ */
 export function neutralPlan(input: StylerInput): UtterancePlan {
   const utterance =
     input.questionText ??
     (input.intent.action === 'TRANSITION_SECTION'
       ? input.entryTransition ?? "Let's move on to the next part."
-      : 'Could you tell me a bit more about that?');
+      : fallbackProbe(input));
 
   return {
     acknowledgement: input.isFirstQuestion || !input.intent.acknowledge_answer
@@ -159,4 +235,24 @@ export function neutralPlan(input: StylerInput): UtterancePlan {
     expected_duration_sec: Math.max(2, Math.round(utterance.split(' ').length / 2.6)),
     allow_barge_in_after_ms: 800,
   };
+}
+
+/**
+ * A concrete probe with no model call, built from what the tracker says is still
+ * missing. Not as good as a question grounded in their answer — but it names a
+ * real thing, which is the bar a follow-up has to clear.
+ */
+function fallbackProbe(input: StylerInput): string {
+  const want = input.missingEvidence?.[0]?.trim();
+  if (!want) {
+    return input.intent.response_strategy === 'scaffold'
+      ? 'Take it from the start — what was the first thing you actually did?'
+      : 'Walk me through how you did that, step by step.';
+  }
+
+  // Descriptions are written as third-person statements of what the candidate
+  // should supply ("Names the evaluation metric they used"), so they read
+  // naturally after "walk me through" once the leading verb is lowercased.
+  const phrased = want.charAt(0).toLowerCase() + want.slice(1);
+  return `Staying on that — ${phrased.replace(/\.$/, '')}?`;
 }

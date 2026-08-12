@@ -18,6 +18,7 @@ import { runReportComposer } from '../agents/e6-report';
 import type { Blueprint, Grading, SkillOutcome } from '../agents/schemas';
 import {
   computeSpeechMetrics,
+  computeSpeechMetricsFromText,
   fillerTrend,
   summariseSpeech,
   type SpeechMetrics,
@@ -53,7 +54,7 @@ export async function runEvaluation(
 
   const { data: project } = await supabase
     .from('projects')
-    .select('id, company_name, role_title, readiness')
+    .select('id, company_name, role_title, readiness, active_resume_id')
     .eq('id', session.project_id)
     .single();
 
@@ -83,16 +84,42 @@ export async function runEvaluation(
 
     const wordsBySeq = await loadWordTimings(supabase, session.user_id, sessionId, answered);
 
+    // What the candidate claimed on paper, for grading experiential answers
+    // against something. Loaded once and shared across all ~15 E4 calls.
+    const resumeContext = await loadResumeContext(supabase, project?.active_resume_id ?? null);
+
+    // Sandbox results, keyed to the question the submission was recorded against.
+    const codingBySeq = mapCodingSubmissions(state, answered);
+
     // ── E2 · Speech metrics · deterministic, parallel-free ───────────────────
     const metricsBySeq = new Map<number, SpeechMetrics>();
     for (const q of answered) {
-      const words = wordsBySeq.get(q.seq) ?? synthesizeWordTimings(q);
+      const words = wordsBySeq.get(q.seq);
+
+      /*
+       * Two paths, because the transcriber no longer returns per-word timing.
+       *
+       * With words: the full metric set including the pause profile. Kept for
+       * sessions recorded under whisper-1, and for whenever a word-timing STT
+       * comes back.
+       *
+       * Without: transcript plus the speech window the client measured from the
+       * microphone. Pace, fillers and repetition are all real; pause metrics are
+       * reported as unavailable and S1 renormalises around them.
+       */
       metricsBySeq.set(
         q.seq,
-        computeSpeechMetrics(words, {
-          silenceBeforeMs: q.answer.silence_before_answer_ms,
-          asrConfidenceAvg: q.answer.asr_confidence_avg,
-        }),
+        words?.length
+          ? computeSpeechMetrics(words, {
+              silenceBeforeMs: q.answer.silence_before_answer_ms,
+              asrConfidenceAvg: q.answer.asr_confidence_avg,
+            })
+          : computeSpeechMetricsFromText(
+              q.answer.transcript,
+              // The client-measured window, in seconds.
+              Math.max(0, q.answer.end_ms - q.answer.start_ms) / 1000,
+              { silenceBeforeMs: q.answer.silence_before_answer_ms },
+            ),
       );
     }
 
@@ -106,6 +133,14 @@ export async function runEvaluation(
           transcript: q.answer.transcript,
           partiallyHeard: q.partially_heard,
           asrConfidence: q.answer.asr_confidence_avg,
+          // Only where it can change the reading. A factual question has a
+          // correct answer; the resume is irrelevant to it and would be prompt
+          // weight on every one of these calls.
+          resumeContext:
+            q.grading_mode === 'experiential' || q.grading_mode === 'behavioral'
+              ? resumeContext
+              : undefined,
+          codingContext: codingBySeq.get(q.seq),
         },
         context,
       ),
@@ -117,6 +152,8 @@ export async function runEvaluation(
       const metrics = metricsBySeq.get(q.seq)!;
       const signals = extractSignals(q);
 
+      const submission = codingBySeq.get(q.seq);
+
       const scores = scoreQuestion({
         mode: q.grading_mode,
         grading,
@@ -124,6 +161,22 @@ export async function runEvaluation(
         metrics,
         language,
         partiallyHeard: q.partially_heard,
+        /*
+         * §9.5: the pass rate is measured, the other three are judged. Without
+         * this the coding branch fell through to `scoreDepth`, so the Judge0
+         * run — the entire point of the sandbox — contributed nothing to the
+         * score, and a candidate whose code passed every test scored the same as
+         * one whose code did not compile.
+         */
+        coding:
+          submission && grading.coding
+            ? {
+                testPassRate: submission.total > 0 ? submission.passed / submission.total : 0,
+                complexityMatch: grading.coding.complexity_match,
+                codeQuality: grading.coding.code_quality,
+                verbalReasoning: grading.coding.verbal_reasoning,
+              }
+            : undefined,
       });
 
       return {
@@ -245,6 +298,73 @@ export async function runEvaluation(
 
 // ── Internals ────────────────────────────────────────────────────────────────
 
+/**
+ * The parts of the resume an answer can actually be checked against.
+ *
+ * Projects and probe-worthy claims only. The full parsed resume is several
+ * thousand tokens of contact details, dates and skill lists that say nothing
+ * about whether someone's account of their own work holds up, and this rides on
+ * every experiential grading call.
+ */
+async function loadResumeContext(
+  supabase: SupabaseClient,
+  resumeId: string | null,
+): Promise<string | undefined> {
+  if (!resumeId) return undefined;
+
+  const { data } = await supabase.from('resumes').select('parsed').eq('id', resumeId).maybeSingle();
+  const parsed = data?.parsed as
+    | { projects?: unknown[]; claims_worth_probing?: unknown[]; headline?: string }
+    | null;
+
+  if (!parsed) return undefined;
+
+  const digest = {
+    headline: parsed.headline,
+    projects: parsed.projects,
+    claims_worth_probing: parsed.claims_worth_probing,
+  };
+
+  const json = JSON.stringify(digest);
+  return json.length > 6000 ? `${json.slice(0, 6000)}…` : json;
+}
+
+/**
+ * Joins each coding submission to the question it was recorded against.
+ *
+ * The client sends a submission as the ANSWER to whichever question was live
+ * when the editor opened, and submissions land in `live_state` in the order they
+ * were made. Pairing them with the coding-mode questions in sequence order is
+ * what reconnects the sandbox result to the thing being graded.
+ */
+function mapCodingSubmissions(
+  state: LiveState,
+  answered: QuestionRecord[],
+): Map<number, { passed: number; total: number; language: string; source: string }> {
+  const raw = (state as unknown as { coding_submissions?: unknown[] }).coding_submissions;
+  const out = new Map<number, { passed: number; total: number; language: string; source: string }>();
+  if (!Array.isArray(raw) || raw.length === 0) return out;
+
+  const codingQuestions = answered
+    .filter((q) => q.grading_mode === 'coding')
+    .sort((a, b) => a.seq - b.seq);
+
+  raw.forEach((entry, i) => {
+    const s = entry as { passed?: number; total?: number; language?: string; source?: string };
+    const question = codingQuestions[i];
+    if (!question || typeof s.passed !== 'number' || typeof s.total !== 'number') return;
+
+    out.set(question.seq, {
+      passed: s.passed,
+      total: s.total,
+      language: s.language ?? 'python',
+      source: s.source ?? '',
+    });
+  });
+
+  return out;
+}
+
 function extractSignals(question: QuestionRecord): RubricSignal[] {
   const rubric = question.rubric as { expected_signals?: RubricSignal[] } | undefined;
   return rubric?.expected_signals ?? [];
@@ -280,28 +400,6 @@ async function loadWordTimings(
   );
 
   return out;
-}
-
-/**
- * Last resort when word timings are unavailable. Produces evenly-spaced timings
- * so pace is roughly right but pause and repetition detection are meaningless —
- * which is why every question built this way is marked low-reliability and drops
- * out of the aggregates rather than quietly polluting them.
- */
-function synthesizeWordTimings(
-  question: QuestionRecord & { answer: NonNullable<QuestionRecord['answer']> },
-): WordTiming[] {
-  const words = question.answer.transcript.split(/\s+/).filter(Boolean);
-  const span = Math.max(1, question.answer.end_ms - question.answer.start_ms);
-  const per = span / Math.max(1, words.length);
-
-  return words.map((w, i) => ({
-    w,
-    s: Math.round(question.answer.start_ms + i * per),
-    e: Math.round(question.answer.start_ms + (i + 1) * per),
-    // Marks the whole answer unreliable in E2, which is the honest outcome.
-    conf: 0.5,
-  }));
 }
 
 async function loadPreviousOverall(

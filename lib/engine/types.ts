@@ -97,8 +97,45 @@ export interface SessionRuntime {
   /** Per-goal count of "I don't know"-shaped answers, for R9's two-strike rule. */
   dont_know_by_goal: Record<string, number>;
   sections_completed: string[];
+  /**
+   * Questions asked since entering the current section — R12's counter.
+   *
+   * Goal satisfaction alone was never enough to end a section: a goal only
+   * closes when its evidence is verified or it runs out of turns, and L1 is free
+   * to rotate between the goals of a section indefinitely, resetting nothing.
+   * A section with three goals could therefore ask twelve questions and still
+   * not be "complete". This is the ceiling that makes sections finite.
+   */
+  questions_in_section: number;
+  /** Interview elapsed seconds when the current section was entered. */
+  section_started_sec: number;
+  /** Grading modes of recent questions, so the mix stays varied (R13). */
+  recent_grading_modes: GradingMode[];
   finished: boolean;
 }
+
+/**
+ * R12 · How many questions a section gets, by interview difficulty.
+ *
+ * The floor matters as much as the ceiling. Without it a section whose goals
+ * happen to verify on the first answer would be left after one question, which
+ * is how the interview used to feel — it never settled anywhere. The ceiling is
+ * what stops the opposite failure.
+ */
+export const SECTION_QUESTION_BUDGET: Record<'easy' | 'medium' | 'hard', { min: number; max: number }> = {
+  easy: { min: 2, max: 4 },
+  medium: { min: 4, max: 6 },
+  hard: { min: 5, max: 8 },
+};
+
+/**
+ * Sections exempt from the FLOOR (never from the ceiling).
+ *
+ * The warm-up exists to let someone settle in and should close as soon as they
+ * are talking; holding it open for four questions turns a courtesy into an
+ * interrogation about themselves. The close is a goodbye.
+ */
+export const NO_FLOOR_SECTIONS = new Set(['intro', 'closing']);
 
 export function initialRuntime(firstSectionId: string, startDifficulty: number): SessionRuntime {
   return {
@@ -119,7 +156,27 @@ export function initialRuntime(firstSectionId: string, startDifficulty: number):
     turns_since_difficulty_drop: 99,
     dont_know_by_goal: {},
     sections_completed: [],
+    questions_in_section: 0,
+    section_started_sec: 0,
+    recent_grading_modes: [],
     finished: false,
+  };
+}
+
+/**
+ * Backfills fields added after a session's `live_state` was first written.
+ *
+ * A live interview checkpoints its runtime every turn, so a deploy lands
+ * mid-session for anyone currently talking. Reading a missing counter as
+ * `undefined` would make every comparison against it false and silently disable
+ * the rule it belongs to.
+ */
+export function withRuntimeDefaults(runtime: SessionRuntime): SessionRuntime {
+  return {
+    ...runtime,
+    questions_in_section: runtime.questions_in_section ?? 0,
+    section_started_sec: runtime.section_started_sec ?? 0,
+    recent_grading_modes: runtime.recent_grading_modes ?? [],
   };
 }
 

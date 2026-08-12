@@ -28,6 +28,14 @@ import {
 const VERIFIED_AT = 0.7;
 const PARTIAL_AT = 0.35;
 
+/**
+ * Below this many words an answer is thin enough to call weak on its own terms.
+ *
+ * Roughly ten seconds of speech. Anything longer is a candidate making a real
+ * attempt, whatever our matcher managed to extract from it.
+ */
+const WEAK_ANSWER_WORDS = 25;
+
 // ── Seeding ──────────────────────────────────────────────────────────────────
 
 /**
@@ -98,6 +106,7 @@ export function ingestAnswer(
 
   const normalized = normalize(answerText);
   const disclaimed = isDisclaimer(normalized);
+  const wordCount = normalized.split(' ').filter(Boolean).length;
   const newlyVerified: string[] = [];
 
   const goal = question.goal_id
@@ -105,7 +114,7 @@ export function ingestAnswer(
     : undefined;
 
   if (!goal) {
-    return { coverage: next, newlyVerified, disclaimed, weak: disclaimed };
+    return { coverage: next, newlyVerified, disclaimed, weak: disclaimed || wordCount === 0 };
   }
 
   const bpGoal = findGoal(blueprint, goal.goal_id);
@@ -158,8 +167,90 @@ export function ingestAnswer(
   recomputeSections(next, blueprint);
   next.by_skill = recomputeSkills(next, blueprint);
 
-  const weak = disclaimed || (newlyVerified.length === 0 && goal.confidence < PARTIAL_AT);
+  /*
+   * ── What "weak" must and must not mean ───────────────────────────────────
+   *
+   * This flag is load-bearing far beyond its size. R9 forces a section change
+   * after two consecutive weak answers, checkGoalExit treats two as distress,
+   * and the rule layer boosts REASSURE_AND_RETRY — which carries no question
+   * text, so L4 improvises a generic "could you tell me a bit more about that".
+   *
+   * It used to be `no new evidence && low confidence`. But the lexical matcher
+   * below verifies conservatively by design, so a detailed, articulate,
+   * ninety-second answer that simply did not contain two of the blueprint's
+   * literal accept phrases was marked weak. Two of those in a row ended the
+   * section. That is why every section got exactly one question and the report
+   * read "0 of 4 evidence items verified" throughout.
+   *
+   * Weak now means the ANSWER was thin, which is a property of the answer and
+   * not of how well our matcher happened to read it. Whether the evidence
+   * actually landed is decided by the model verifier, off this path.
+   */
+  const thin = wordCount < WEAK_ANSWER_WORDS;
+  const weak =
+    disclaimed || wordCount === 0 || (thin && newlyVerified.length === 0 && goal.confidence < PARTIAL_AT);
+
   return { coverage: next, newlyVerified, disclaimed, weak };
+}
+
+/**
+ * Merges the model verifier's judgement into coverage.
+ *
+ * This is the refinement seam §12 asks for, used in the direction that actually
+ * matters here: lexical matching produces far more false NEGATIVES than false
+ * positives, because candidates paraphrase. A verdict may only raise an
+ * evidence item's confidence, never lower it — the fast path already committed
+ * to its marks for this turn's decision, and retracting them afterwards would
+ * make the transcript disagree with the interview that was conducted.
+ */
+export function applyEvidenceVerdicts(
+  coverage: Coverage,
+  blueprint: Blueprint,
+  args: {
+    goalId: string;
+    questionId: string;
+    turn: number;
+    verdicts: Array<{ evidence_id: string; confidence: number; span: string | null }>;
+  },
+): { coverage: Coverage; newlyVerified: string[] } {
+  const next: Coverage = structuredClone(coverage);
+  const goal = next.goals.find((g) => g.goal_id === args.goalId);
+  const newlyVerified: string[] = [];
+
+  if (!goal) return { coverage: next, newlyVerified };
+
+  for (const verdict of args.verdicts) {
+    const state = goal.evidence.find((e) => e.evidence_id === verdict.evidence_id);
+    if (!state || state.status === 'verified') continue;
+    if (verdict.confidence <= state.confidence) continue;
+
+    state.confidence = Math.min(1, verdict.confidence);
+    if (verdict.span) state.span = verdict.span;
+    if (!state.source_question_ids.includes(args.questionId)) {
+      state.source_question_ids.push(args.questionId);
+    }
+
+    if (state.confidence >= VERIFIED_AT) {
+      state.status = 'verified';
+      state.verified_at_turn = args.turn;
+      newlyVerified.push(state.evidence_id);
+    } else if (state.confidence >= PARTIAL_AT) {
+      state.status = 'partial';
+      state.note = 'Touched on but not established.';
+    }
+  }
+
+  goal.outstanding = goal.evidence.filter((e) => e.status !== 'verified').map((e) => e.evidence_id);
+  goal.confidence = averageConfidence(goal.evidence);
+  if (newlyVerified.length > 0) goal.turns_without_new_evidence = 0;
+
+  const bpGoal = findGoal(blueprint, goal.goal_id);
+  if (bpGoal && isGoalSatisfied(goal, bpGoal)) goal.status = 'satisfied';
+
+  recomputeSections(next, blueprint);
+  next.by_skill = recomputeSkills(next, blueprint);
+
+  return { coverage: next, newlyVerified };
 }
 
 // ── Completion & exit checks ─────────────────────────────────────────────────
@@ -298,33 +389,51 @@ function scoreEvidence(
   acceptPhrases: string[],
   description: string,
 ): EvidenceMatch {
-  let phraseScore = 0;
-  let span: string | undefined;
+  const answerTokens = contentTokens(normalizedAnswer);
 
-  for (const phrase of acceptPhrases) {
+  /*
+   * Substring containment alone was the weak link. P6 writes accept phrases as
+   * idealised spoken forms — "I trained the model", "we measured precision and
+   * recall" — and nobody says them back verbatim. Scoring each phrase by how
+   * much of its CONTENT survives in the answer credits the paraphrase, which is
+   * what people actually produce, while an exact hit still scores full marks.
+   */
+  const scores = acceptPhrases.map((phrase) => {
     const needle = normalize(phrase);
-    if (needle.length < 3) continue;
-    if (normalizedAnswer.includes(needle)) {
-      phraseScore = Math.max(phraseScore, 0.55);
-      span ??= extractSpan(rawAnswer, phrase);
-    }
-  }
-  // Two independent phrase hits is much stronger evidence than one.
-  const hits = acceptPhrases.filter((p) => {
-    const n = normalize(p);
-    return n.length >= 3 && normalizedAnswer.includes(n);
-  }).length;
-  if (hits >= 2) phraseScore = 0.8;
-  if (hits >= 3) phraseScore = 0.9;
+    if (needle.length < 3) return 0;
+    if (normalizedAnswer.includes(needle)) return 1;
+
+    const tokens = [...contentTokens(phrase)];
+    if (tokens.length === 0) return 0;
+    return tokens.filter((t) => answerTokens.has(t)).length / tokens.length;
+  });
+
+  const best = scores.length ? Math.max(...scores) : 0;
+  const strong = scores.filter((s) => s >= 0.6).length;
+
+  // One phrase gets you to partial; agreement across two or three is what
+  // verifies. A single lexical coincidence should never close an evidence item.
+  let phraseScore = best * 0.6;
+  if (strong >= 2) phraseScore = Math.max(phraseScore, 0.75);
+  if (strong >= 3) phraseScore = Math.max(phraseScore, 0.9);
 
   const descTokens = contentTokens(description);
-  const answerTokens = contentTokens(normalizedAnswer);
   let overlap = 0;
   for (const t of descTokens) if (answerTokens.has(t)) overlap += 1;
-  const overlapScore = descTokens.size > 0 ? (overlap / descTokens.size) * 0.6 : 0;
+  const overlapScore = descTokens.size > 0 ? (overlap / descTokens.size) * 0.7 : 0;
 
-  const confidence = Math.min(1, Math.max(phraseScore, overlapScore));
-  return { confidence, span: span ?? (confidence >= PARTIAL_AT ? firstSentence(rawAnswer) : undefined) };
+  // Two weak independent signals agreeing are worth more than either alone.
+  let confidence = Math.max(phraseScore, overlapScore);
+  if (phraseScore >= 0.5 && overlapScore >= 0.4) confidence = Math.min(1, confidence + 0.15);
+
+  const hitPhrase = scores.findIndex((s) => s === 1);
+  const span =
+    hitPhrase >= 0 ? extractSpan(rawAnswer, acceptPhrases[hitPhrase]) : undefined;
+
+  return {
+    confidence: Math.min(1, confidence),
+    span: span ?? (confidence >= PARTIAL_AT ? firstSentence(rawAnswer) : undefined),
+  };
 }
 
 function extractSpan(raw: string, phrase: string): string | undefined {

@@ -41,7 +41,9 @@ export type AgentId =
   | 'P7' // Coding Challenge
   | 'L1' // Conversation Manager
   | 'L2' // Structured Interview Memory
+  | 'L3' // Live evidence verification (runs concurrently with L1)
   | 'L4' // Dialogue Styler
+  | 'L6' // Answers the candidate's own question
   | 'E3' // Evidence & Knowledge Router
   | 'E4' // Answer Grading
   | 'E5' // Rewrite Coach
@@ -72,6 +74,25 @@ export interface ModelPricing {
  */
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
+/**
+ * The effort ladder, cheapest and fastest first.
+ *
+ * Not every model accepts every rung — `gpt-5.6-luna` rejects `minimal` outright
+ * with a 400, even though the provider documents it as a valid value. The
+ * documented list is the union across a family; per-model support is narrower.
+ * `ModelSpec.reasoningEfforts` records what a given model actually takes, and
+ * `resolveReasoningEffort` maps a request onto it.
+ */
+export const REASONING_LADDER: ReasoningEffort[] = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+];
+
 export interface ModelSpec {
   /** The provider's own model id, passed through verbatim. */
   id: string;
@@ -91,6 +112,11 @@ export interface ModelSpec {
   supportsTemperature: boolean;
   /** Whether `reasoningEffort` is the lever instead. */
   supportsReasoningEffort: boolean;
+  /**
+   * The effort values this specific model accepts. Anything else is a 400, so a
+   * requested value outside this list is mapped to the nearest one that works.
+   */
+  reasoningEfforts?: ReasoningEffort[];
 }
 
 /** Per-agent execution policy. See config.ts. */

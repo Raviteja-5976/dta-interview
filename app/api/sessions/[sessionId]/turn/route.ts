@@ -16,14 +16,22 @@ import type { NextRequest } from 'next/server';
 
 import { createSupabaseServerClient, requireUser } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { runTurn, type LiveState } from '@/lib/pipelines/turn';
-import { settleSession } from '@/lib/credits';
-import { prosodyToInstructions, synthesizeUtterance } from '@/lib/ai/voice';
-import type { Blueprint } from '@/lib/agents/schemas';
+import {
+  looksLikeCandidateQuestion,
+  runTurn,
+  type LiveState,
+  type PendingFollowup,
+} from '@/lib/pipelines/turn';
+import { CREDITS_PER_MINUTE, billableMinutes, voiceCredits } from '@/lib/credits';
+import type { Blueprint, CodingChallenge } from '@/lib/agents/schemas';
+import type { ChallengeSet } from '@/lib/agents/p7-challenge';
 import type { VoiceAssetIndex } from '@/lib/pipelines/session-prep';
 import { failure, handleRouteError, notFound, ok } from '@/lib/api/respond';
 
 export const maxDuration = 60;
+
+/** Upper bound on reported editor time — see where it is applied. */
+const MAX_CODING_SEC = 45 * 60;
 
 interface TurnBody {
   answer?: {
@@ -37,6 +45,14 @@ interface TurnBody {
     words?: Array<{ w: string; s: number; e: number; conf?: number }>;
   };
   elapsedSec: number;
+  /**
+   * Seconds spent inside the code editor, accumulated by the client.
+   *
+   * Excluded from per-minute billing: the coding round is already paid for by
+   * its flat module fee, and charging voice credits for time nobody is talking
+   * would bill the same minutes twice.
+   */
+  codingSec?: number;
   /**
    * The candidate pressed "End interview". Kept separate from `elapsedSec`
    * rather than faking a huge elapsed value — that would land in `duration_sec`
@@ -53,7 +69,7 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
     const supabase = await createSupabaseServerClient();
     const { data: session } = await supabase
       .from('sessions')
-      .select('id, user_id, project_id, status, config, blueprint, live_state, voice_assets, started_at')
+      .select('id, user_id, project_id, status, config, blueprint, live_state, voice_assets, coding_challenge, started_at, pending_followup')
       .eq('id', sessionId)
       .maybeSingle();
 
@@ -67,7 +83,12 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
     if (!blueprint || !state) return failure(409, 'This interview has not finished preparing.');
 
     const body = (await request.json()) as TurnBody;
-    const config = session.config as { duration_min: number; persona: string; language: string };
+    const config = session.config as {
+      duration_min: number;
+      persona: string;
+      language: string;
+      difficulty?: 'easy' | 'medium' | 'hard';
+    };
 
     const admin = createAdminClient();
 
@@ -86,11 +107,44 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
     }
 
     const plannedMinutes = config.duration_min ?? 15;
-    const maxDurationSec = plannedMinutes * 60;
+
+    /*
+     * Capped because it is a client-supplied number that now extends the
+     * interview's ceiling. Billing already clamps it against the real duration,
+     * so an inflated value could never win free credits — but without a bound
+     * independent of elapsed time, a client reporting "all of it was coding"
+     * would push the ceiling out as fast as the clock advanced and the interview
+     * would never reach its hard stop.
+     *
+     * Three challenges at fifteen minutes each is already far past any real
+     * coding round.
+     */
+    const codingSec = Math.min(Math.max(0, body.codingSec ?? 0), MAX_CODING_SEC);
+
+    /*
+     * The duration budget is in CONVERSATION minutes, so time in the editor
+     * extends the wall clock rather than consuming it.
+     *
+     * This matters now that the coding round runs at the end: a twelve-minute
+     * coding round against a fifteen-minute ceiling would trip the hard stop the
+     * moment the candidate submitted, ending the interview before the closing
+     * section and cutting short a round they paid a flat module fee for.
+     *
+     * Billing is unaffected — `chargeVoiceTime` subtracts the same coding
+     * seconds from the metered duration, so nobody is charged for them.
+     */
+    const maxDurationSec = plannedMinutes * 60 + codingSec;
 
     // Real elapsed time, never the sentinel. `endNow` short-circuits the loop
     // without inflating the clock the candidate is billed against.
     const elapsedSec = Math.max(0, Math.min(body.elapsedSec, maxDurationSec));
+
+    // Loaded only when the candidate appears to have asked something back, so a
+    // normal turn pays neither this query nor the L6 call behind it.
+    const employer =
+      body.answer && looksLikeCandidateQuestion(body.answer.transcript, state.questions.at(-1)?.text ?? '')
+        ? await loadEmployerContext(supabase, session.project_id)
+        : undefined;
 
     const result = await runTurn({
       sessionId,
@@ -102,6 +156,12 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
       answer: body.answer,
       elapsedSec: body.endNow ? maxDurationSec : elapsedSec,
       maxDurationSec,
+      // Sets how many questions each section gets (R12).
+      difficulty: config.difficulty ?? 'medium',
+      employer,
+      // Prepared by /reflect from an earlier answer while the interviewer was
+      // speaking. Consumed here and cleared below.
+      pendingFollowup: session.pending_followup as PendingFollowup | null,
     });
 
     // The interview is over — settle the credits, then hand off to evaluation.
@@ -118,19 +178,18 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
         })
         .eq('id', sessionId);
 
-      const settlement = await settleSessionBilling({
+      const billing = await chargeVoiceTime({
         admin,
         sessionId,
         durationSec,
-        plannedMinutes,
-        questions: result.state.questions,
-        blueprint,
+        codingSec: Math.min(codingSec, durationSec),
+        ceilingMinutes: plannedMinutes,
       });
 
       return ok({
         finished: true,
         redirectTo: `/sessions/${sessionId}/processing`,
-        billing: settlement,
+        billing,
       });
     }
 
@@ -149,6 +208,9 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
         status: 'live',
         live_state: result.state,
         started_at: session.started_at ?? new Date().toISOString(),
+        // Cleared unconditionally: a follow-up that was too stale to use is one
+        // that must not resurface two turns later.
+        pending_followup: null,
       })
       .eq('id', sessionId);
 
@@ -170,6 +232,20 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
         id: result.state.runtime.current_section_id,
         title: blueprint.sections.find((s) => s.section_id === result.state.runtime.current_section_id)?.title,
       },
+      /*
+       * Coding mode. The section TYPE decides it, not the question text — the
+       * blueprint assigns type at plan time, so this cannot drift.
+       *
+       * The client switches to the editor layout, pauses the voice loop, and
+       * stops the billing clock for as long as the candidate is writing code.
+       */
+      mode: currentSectionType(blueprint, result.state.runtime.current_section_id),
+      challenge: codingPayload(
+        blueprint,
+        result.state.runtime.current_section_id,
+        session.coding_challenge as ChallengeSet<CodingChallenge> | null,
+        result.state,
+      ),
       progress: {
         sectionsTotal: blueprint.sections.length,
         sectionsCompleted: result.state.runtime.sections_completed.length,
@@ -185,57 +261,159 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
 }
 
 /**
- * Settles the hold taken at session start.
+ * What the interviewer can honestly say about the role, when the candidate asks.
  *
- * Modules are charged only if they were actually delivered — a candidate who
- * ended the interview before the coding round never got a coding round, and
- * billing 20 credits for it would be indefensible.
+ * Trimmed hard: L6 needs the responsibilities, the skills the posting asks for,
+ * and what the company does — not the full parsed artifacts, which run to
+ * thousands of tokens of provenance and confidence scores that would only make
+ * the reply vaguer.
  */
-async function settleSessionBilling(args: {
+async function loadEmployerContext(
+  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
+  projectId: string,
+): Promise<{ roleTitle: string; companyName: string; jdContext?: string; companyContext?: string } | undefined> {
+  const { data } = await supabase
+    .from('projects')
+    .select('role_title, company_name, jd_profile, company_profile')
+    .eq('id', projectId)
+    .maybeSingle();
+
+  if (!data) return undefined;
+
+  const jd = data.jd_profile as {
+    responsibilities?: string[];
+    required_skills?: Array<{ skill: string }>;
+    seniority?: string;
+  } | null;
+
+  const company = data.company_profile as {
+    one_liner?: string;
+    products?: string[];
+    tech_stack?: Array<{ technology: string }>;
+    engineering_culture?: Array<{ signal: string }>;
+    values?: string[];
+  } | null;
+
+  return {
+    roleTitle: data.role_title ?? 'this role',
+    companyName: data.company_name ?? 'the company',
+    jdContext: jd
+      ? JSON.stringify({
+          seniority: jd.seniority,
+          responsibilities: jd.responsibilities?.slice(0, 10),
+          required_skills: jd.required_skills?.slice(0, 12).map((s) => s.skill),
+        })
+      : undefined,
+    companyContext: company
+      ? JSON.stringify({
+          one_liner: company.one_liner,
+          products: company.products?.slice(0, 6),
+          tech_stack: company.tech_stack?.slice(0, 12).map((t) => t.technology),
+          engineering_culture: company.engineering_culture?.slice(0, 5).map((c) => c.signal),
+          values: company.values?.slice(0, 6),
+        })
+      : undefined,
+  };
+}
+
+/** The blueprint's type for the section currently being asked. */
+function currentSectionType(blueprint: Blueprint, sectionId: string): string {
+  return blueprint.sections.find((s) => s.section_id === sectionId)?.type ?? 'resume_skills';
+}
+
+/**
+ * The challenge the editor should open, when the interview has reached a coding
+ * section.
+ *
+ * Hidden tests are deliberately absent from this payload. They are only ever
+ * evaluated server-side by the code route — putting them in a response the
+ * browser can read would defeat the point of hiding them.
+ */
+function codingPayload(
+  blueprint: Blueprint,
+  sectionId: string,
+  set: ChallengeSet<CodingChallenge> | null,
+  state: LiveState,
+): unknown {
+  if (currentSectionType(blueprint, sectionId) !== 'coding') return null;
+  if (!set?.challenges?.length) return null;
+
+  const submitted = Array.isArray((state as unknown as { coding_submissions?: unknown[] }).coding_submissions)
+    ? (state as unknown as { coding_submissions: unknown[] }).coding_submissions.length
+    : 0;
+
+  /*
+   * Null once every problem has been submitted, even though the section is
+   * still `coding`.
+   *
+   * This used to clamp the index to the last challenge, which meant the editor
+   * reopened on a problem the candidate had already solved every time the
+   * coding section took another turn — and the client parks its voice loop
+   * whenever a challenge comes back, so the interviewer could never get to
+   * "talk me through what you wrote". Returning null hands the floor back to
+   * the conversation, which is the point of the turns that follow a submission.
+   */
+  if (submitted >= set.challenges.length) return null;
+
+  const index = submitted;
+  const challenge = set.challenges[index];
+
+  return {
+    index,
+    total: set.challenges.length,
+    title: challenge.title,
+    problem_statement: challenge.problem_statement,
+    input_format: challenge.input_format,
+    output_format: challenge.output_format,
+    examples: challenge.examples,
+    starter_code: challenge.starter_code,
+    visible_tests: challenge.visible_tests,
+    target_complexity: challenge.target_complexity,
+    hidden_test_count: challenge.hidden_tests.length,
+  };
+}
+
+/**
+ * Charges voice time, once the interview is over and the duration is known.
+ *
+ * Nothing was held for this. Someone who ended after four minutes is billed for
+ * four minutes — that is the whole point of post-paid time — but it also means
+ * this is the only chance to collect, so a failure here is lost revenue and gets
+ * logged accordingly. `unbilled_sessions` (migration 015) is the backstop.
+ *
+ * Modules are not touched: they were charged at session creation because their
+ * generation cost was incurred during preparation.
+ */
+async function chargeVoiceTime(args: {
   admin: ReturnType<typeof createAdminClient>;
   sessionId: string;
   durationSec: number;
-  plannedMinutes: number;
-  questions: LiveState['questions'];
-  blueprint: Blueprint;
-}): Promise<{ charged: number; billedMinutes: number } | null> {
-  // `grading_mode` is assigned at plan time and never changes (invariant 9), so
-  // it is the reliable signal that a coding question was actually asked.
-  const codingDelivered = args.questions.some((q) => q.grading_mode === 'coding');
+  codingSec: number;
+  ceilingMinutes: number;
+}): Promise<{ minutes: number; credits: number } | null> {
+  // Only conversation time is metered. The coding round is paid for by its flat
+  // module fee, so billing its minutes again would charge for them twice.
+  const spokenSec = Math.max(0, args.durationSec - args.codingSec);
+  const minutes = billableMinutes(spokenSec, args.ceilingMinutes);
 
-  // System design has no grading mode of its own, so it resolves through the
-  // section TYPE in the blueprint. Matching on section_id would not work —
-  // those are opaque ids like "sec_4", not labels.
-  const designSectionIds = new Set(
-    args.blueprint.sections.filter((s) => s.type === 'system_design').map((s) => s.section_id),
-  );
-  const designDelivered = args.questions.some((q) => designSectionIds.has(q.section_id));
-
-  const settlement = settleSession({
-    actualSeconds: args.durationSec,
-    plannedMinutes: args.plannedMinutes,
-    codingDelivered,
-    designDelivered,
-  });
-
-  const { error } = await args.admin.rpc('settle_session_credits', {
+  const { error } = await args.admin.rpc('charge_interview_time', {
     p_session_id: args.sessionId,
-    p_final: settlement.total,
+    p_minutes: minutes,
     p_meta: {
-      billed_minutes: settlement.billedMinutes,
       duration_sec: args.durationSec,
-      coding_delivered: codingDelivered,
-      design_delivered: designDelivered,
+      coding_sec: Math.round(args.codingSec),
+      billed_sec: Math.round(spokenSec),
+      ceiling_minutes: args.ceilingMinutes,
+      rate_per_minute: CREDITS_PER_MINUTE,
     },
   });
 
   if (error) {
-    // The hold stands until this succeeds. Log loudly — this is money.
-    console.error('[billing] settlement failed', args.sessionId, error.message);
+    console.error('[billing] voice charge failed', args.sessionId, error.message);
     return null;
   }
 
-  return { charged: settlement.total, billedMinutes: settlement.billedMinutes };
+  return { minutes, credits: voiceCredits(minutes) };
 }
 
 /**
@@ -250,39 +428,85 @@ async function resolveAudio(args: {
   sessionId: string;
   assets: VoiceAssetIndex | null;
   utterance: { plan: { utterance: string; acknowledgement: string; transition: string; prosody: { emotion: string; rate: number; emphasis: string[] } }; cacheText: string; questionId: string };
-}): Promise<{ url: string | null; source: 'cache' | 'live_tts' | 'none' }> {
-  const spoken = [
-    args.utterance.plan.acknowledgement,
-    args.utterance.plan.transition,
-    args.utterance.plan.utterance,
-  ]
-    .filter(Boolean)
-    .join(' ');
+}): Promise<{ segments: AudioSegment[]; source: 'cache' | 'live_tts' | 'mixed' | 'none' }> {
+  /*
+   * ── Why nothing is synthesized here any more ─────────────────────────────
+   *
+   * This used to call the TTS model, wait for the whole MP3, upload it to
+   * Storage, and mint a signed URL — all inside the turn, before the response
+   * was sent, for every segment that missed the cache. The candidate's "thinking"
+   * gap was L1 + L4 + all of that, serially, and none of it could start until
+   * the words existed.
+   *
+   * A cache miss now returns a URL the browser streams from instead. The turn
+   * returns as soon as L4 has the words, and audio starts playing as the first
+   * bytes arrive rather than after the last one is written to a bucket. The
+   * round trip to Storage bought nothing: these clips are unique to one turn and
+   * are never read again.
+   */
+  /*
+   * Resolved PER SEGMENT, not as one concatenated line.
+   *
+   * P8 renders each acknowledgement, transition and bank question as its own
+   * clip. Looking up the joined string could therefore only ever hit when both
+   * the acknowledgement and the transition happened to be empty — so in
+   * practice the cache never hit, every turn paid live TTS, and the ~40 clips
+   * P8 generated during preparation were thrown away. That is most of what made
+   * prep slow AND turns slow, from one line of matching logic.
+   *
+   * Matching each part separately is what D7 actually describes, and it keeps
+   * invariant 17 intact: a clip is played only when its text matches exactly.
+   */
+  const parts = [
+    { kind: 'acknowledgement' as const, text: args.utterance.plan.acknowledgement },
+    { kind: 'transition' as const, text: args.utterance.plan.transition },
+    { kind: 'utterance' as const, text: args.utterance.plan.utterance },
+  ].filter((p) => p.text.trim().length > 0);
 
-  // A cache hit needs the FULL spoken line to match, not just the question —
-  // otherwise the acknowledgement and transition would be silently dropped.
-  const hit = args.assets?.assets.find((a) => a.text === spoken);
+  const segments: AudioSegment[] = [];
 
-  if (hit) {
-    const { data } = await args.admin.storage.from('voice').createSignedUrl(hit.path, 900);
-    if (data?.signedUrl) return { url: data.signedUrl, source: 'cache' };
-  }
+  const prosody = args.utterance.plan.prosody;
 
-  try {
-    const { audio, mediaType } = await synthesizeUtterance(spoken, {
-      voice: args.assets?.voice,
-      speed: args.utterance.plan.prosody.rate,
-      instructions: prosodyToInstructions(args.utterance.plan.prosody),
-      context: { userId: args.userId, projectId: args.projectId, sessionId: args.sessionId },
+  for (const part of parts) {
+    const hit = args.assets?.assets.find((a) => a.text === part.text);
+
+    if (hit) {
+      const { data } = await args.admin.storage.from('voice').createSignedUrl(hit.path, 900);
+      if (data?.signedUrl) {
+        segments.push({ url: data.signedUrl, kind: part.kind, source: 'cache' });
+        continue;
+      }
+    }
+
+    // Same-origin, so the browser sends its session cookie and the Web Audio
+    // graph is never tainted — which is the other thing that used to silence
+    // playback when a cross-origin clip lost its CORS headers.
+    const query = new URLSearchParams({
+      text: part.text,
+      emotion: prosody.emotion,
+      rate: String(prosody.rate),
     });
+    if (prosody.emphasis.length) query.set('emphasis', prosody.emphasis.join('|'));
+    if (args.assets?.voice) query.set('voice', args.assets.voice);
 
-    const path = `${args.userId}/${args.sessionId}/live_${args.utterance.questionId}.mp3`;
-    await args.admin.storage.from('voice').upload(path, audio, { contentType: mediaType, upsert: true });
-
-    const { data } = await args.admin.storage.from('voice').createSignedUrl(path, 900);
-    return { url: data?.signedUrl ?? null, source: 'live_tts' };
-  } catch {
-    // Text still renders on screen — invariant 12, degrade texture, not the run.
-    return { url: null, source: 'none' };
+    segments.push({
+      url: `/api/sessions/${args.sessionId}/speak?${query.toString()}`,
+      kind: part.kind,
+      source: 'stream',
+    });
   }
+
+  if (segments.length === 0) return { segments: [], source: 'none' };
+
+  const cached = segments.filter((s) => s.source === 'cache').length;
+  const source = cached === segments.length ? 'cache' : cached === 0 ? 'live_tts' : 'mixed';
+
+  return { segments, source };
+}
+
+interface AudioSegment {
+  url: string;
+  kind: 'acknowledgement' | 'transition' | 'utterance';
+  /** `stream` is synthesized on demand by the speak route as the browser plays it. */
+  source: 'cache' | 'stream';
 }

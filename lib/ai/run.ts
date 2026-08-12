@@ -15,8 +15,8 @@
 import { generateObject, NoObjectGeneratedError } from 'ai';
 import type { z } from 'zod';
 
-import type { AgentId, AgentRunResult, RunContext } from './types';
-import { computeCostUsd } from './catalog';
+import type { AgentId, AgentRunResult, ReasoningEffort, RunContext } from './types';
+import { computeCostUsd, resolveReasoningEffort } from './catalog';
 import { getPolicy } from './config';
 import { resolveModelForAgent, MissingProviderKeyError } from './registry';
 import { recordAgentRun } from './telemetry';
@@ -120,7 +120,7 @@ export async function runAgent<T>(opts: RunAgentOptions<T>): Promise<AgentRunRes
         // it outright — sending it anyway earns a warning and the value is
         // discarded, which silently disables anything that depended on it.
         temperature: resolved.spec.supportsTemperature ? policy.temperature : undefined,
-        maxOutputTokens: policy.maxOutputTokens,
+        maxOutputTokens: effectiveMaxOutputTokens(resolved, policy),
         // Retries are handled here, not inside the SDK, so each attempt gets its
         // own clean timeout and every attempt is counted in telemetry.
         maxRetries: 0,
@@ -217,6 +217,44 @@ export async function runAgent<T>(opts: RunAgentOptions<T>): Promise<AgentRunRes
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /**
+ * Extra output budget to reserve for thinking, per effort level.
+ *
+ * Reasoning tokens count against `max_output_tokens` and are generated BEFORE
+ * the visible answer. Set the cap to the size of the JSON you expect and the
+ * model can spend the entire budget reasoning and return nothing — OpenAI's
+ * docs are blunt about it: "you might get costs for input and reasoning tokens
+ * without receiving a visible response."
+ *
+ * That failure looks exactly like a hang: an empty response fails schema
+ * validation, the attempt burns its full timeout, retries, and burns it again.
+ *
+ * So `maxOutputTokens` in config.ts means "how much VISIBLE output this agent
+ * produces", and this table adds the thinking room on top. The 25k at `high`
+ * is OpenAI's own recommended starting reserve.
+ */
+const REASONING_HEADROOM: Record<ReasoningEffort, number> = {
+  none: 0,
+  minimal: 2_000,
+  low: 8_000,
+  medium: 16_000,
+  high: 25_000,
+  xhigh: 40_000,
+  max: 60_000,
+};
+
+/** Visible-output budget plus thinking room, for models that reason. */
+function effectiveMaxOutputTokens(
+  resolved: ReturnType<typeof resolveModelForAgent>,
+  policy: ReturnType<typeof getPolicy>,
+): number | undefined {
+  if (policy.maxOutputTokens === undefined) return undefined;
+  if (!resolved.spec.supportsReasoningEffort) return policy.maxOutputTokens;
+
+  const effort = resolveReasoningEffort(resolved.spec, policy.reasoningEffort);
+  return policy.maxOutputTokens + REASONING_HEADROOM[effort ?? 'none'];
+}
+
+/**
  * Provider-specific knobs.
  *
  * On OpenAI's reasoning family, `reasoningEffort` replaces `temperature` as the
@@ -235,7 +273,12 @@ function buildProviderOptions(
   if (!resolved.spec.supportsReasoningEffort) return extra;
 
   const openai: Record<string, unknown> = {};
-  if (policy.reasoningEffort) openai.reasoningEffort = policy.reasoningEffort;
+
+  // Resolved against what THIS model accepts, not just what the provider
+  // documents. gpt-5.6-luna rejects `minimal` with a 400 despite it being a
+  // documented value, so an unmapped effort is a runtime failure.
+  const effort = resolveReasoningEffort(resolved.spec, policy.reasoningEffort);
+  if (effort) openai.reasoningEffort = effort;
   if (policy.textVerbosity) openai.textVerbosity = policy.textVerbosity;
 
   if (Object.keys(openai).length === 0) return extra;

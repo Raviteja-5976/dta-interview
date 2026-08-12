@@ -1,26 +1,28 @@
 /**
- * Credit pricing and session billing.
+ * Credit pricing, interview length, and session billing.
  *
- * One place, because the number quoted on the setup screen, the number held when
- * the interview starts, and the number finally charged must never be able to
+ * One place, because the number quoted on the setup screen, the gate that lets
+ * an interview start, and the amount finally charged must never be able to
  * drift apart.
  *
- * ── The model ────────────────────────────────────────────────────────────────
- * Interviews are metered: 5 credits per minute, for however long the interview
- * actually runs. Modules are flat add-ons.
+ * ── How an interview is paid for ─────────────────────────────────────────────
+ * Two different things, billed two different ways:
  *
- * That means the final cost is not knowable at the start, so billing runs in two
- * steps:
+ *   Modules (coding, system design)  — charged UPFRONT, flat.
+ *     They are generated during preparation, before a word is spoken. The AI
+ *     spend is already incurred by the time the interview starts, so there is
+ *     nothing to pro-rate.
  *
- *   1. HOLD  — at session start we charge the maximum the session could cost
- *              (the full planned duration plus every enabled module). This is a
- *              real debit, so a user can never start an interview they cannot
- *              pay for.
- *   2. SETTLE — when the interview ends we compute what it actually cost and
- *              refund the difference.
+ *   Voice time                       — charged AFTERWARDS, per minute.
+ *     Nothing is held. Someone who ends after four minutes pays for four
+ *     minutes. This is the friendlier model, but it means the balance is not
+ *     protected during the interview — so `planSession` computes a hard ceiling
+ *     from what the user can actually afford, and the interview stops there.
  *
- * The settled amount can never exceed the hold, so the number on the setup
- * screen is a ceiling the user agreed to, never a surprise.
+ * ── How long an interview runs ───────────────────────────────────────────────
+ * There is no duration picker. Length follows difficulty, because the two are
+ * not independent: a hard interview needs room to go deep, and an easy one
+ * padded to thirty minutes just repeats itself.
  */
 
 export const CREDITS_PER_MINUTE = 5;
@@ -30,122 +32,149 @@ export const SYSTEM_DESIGN_MODULE_CREDITS = 30;
 /** No interview may carry more than three of either challenge type. */
 export const MAX_MODULE_QUESTIONS = 3;
 
+export type Difficulty = 'easy' | 'medium' | 'hard';
+
+export interface DurationBand {
+  /** The interview is planned to run at least this long. Also the credit gate. */
+  min: number;
+  /** Hard stop. The orchestrator ends the interview here regardless. */
+  max: number;
+}
+
+export const DIFFICULTY_BANDS: Record<Difficulty, DurationBand> = {
+  easy: { min: 10, max: 15 },
+  medium: { min: 15, max: 20 },
+  hard: { min: 20, max: 30 },
+};
+
 export interface SessionModules {
   coding: boolean;
   system_design: boolean;
 }
 
-export interface CreditQuote {
-  /** Minutes used for the quote. */
-  minutes: number;
-  voice: number;
-  coding: number;
-  system_design: number;
-  total: number;
-  lines: Array<{ label: string; credits: number; note?: string }>;
+// ── Planning a session ───────────────────────────────────────────────────────
+
+export function moduleCredits(modules: SessionModules): number {
+  return (
+    (modules.coding ? CODING_MODULE_CREDITS : 0) +
+    (modules.system_design ? SYSTEM_DESIGN_MODULE_CREDITS : 0)
+  );
 }
 
 /**
- * The hold: the most this session can possibly cost. Quoted on the setup screen
- * and debited at start.
- */
-export function quoteSession(durationMin: number, modules: SessionModules): CreditQuote {
-  const minutes = Math.max(1, Math.round(durationMin));
-  const voice = minutes * CREDITS_PER_MINUTE;
-  const coding = modules.coding ? CODING_MODULE_CREDITS : 0;
-  const systemDesign = modules.system_design ? SYSTEM_DESIGN_MODULE_CREDITS : 0;
-
-  return {
-    minutes,
-    voice,
-    coding,
-    system_design: systemDesign,
-    total: voice + coding + systemDesign,
-    lines: [
-      {
-        label: `Interview · up to ${minutes} min`,
-        credits: voice,
-        note: `${CREDITS_PER_MINUTE} credits per minute`,
-      },
-      {
-        label: 'Coding round',
-        credits: coding,
-        note: modules.coding ? `${codingQuestionCount('medium', durationMin)}-question round` : undefined,
-      },
-      { label: 'System design', credits: systemDesign },
-    ],
-  };
-}
-
-export interface SettlementInput {
-  /** How long the interview actually ran. */
-  actualSeconds: number;
-  /** The duration the hold was quoted against. The settlement cannot exceed it. */
-  plannedMinutes: number;
-  /** Whether a coding question was actually asked. */
-  codingDelivered: boolean;
-  /** Whether a system design question was actually asked. */
-  designDelivered: boolean;
-}
-
-export interface Settlement {
-  billedMinutes: number;
-  voice: number;
-  coding: number;
-  system_design: number;
-  total: number;
-}
-
-/**
- * What the session actually cost.
+ * The voice credits a difficulty requires before it may start: the band's floor
+ * at the per-minute rate. 50 for easy, 75 for medium, 100 for hard.
  *
- * Two deliberate choices:
- *   · Part-minutes round up — "per minute" billing that rounded down would let a
- *     59-second interview run free.
- *   · Modules are only charged if they were actually delivered. Someone who
- *     ended the interview before the coding round never got a coding round, and
- *     charging 20 credits for it would be indefensible.
+ * This is a floor, not a charge. Someone who ends after three minutes still
+ * pays for three — but they must be able to afford the full planned interview
+ * before starting one, or the interview would be cut short by their balance
+ * rather than by the plan.
  */
-export function settleSession(input: SettlementInput): Settlement {
-  const rawMinutes = Math.ceil(Math.max(0, input.actualSeconds) / 60);
-  const billedMinutes = Math.min(Math.max(1, rawMinutes), Math.max(1, input.plannedMinutes));
+export function minimumVoiceCredits(difficulty: Difficulty): number {
+  return DIFFICULTY_BANDS[difficulty].min * CREDITS_PER_MINUTE;
+}
 
-  const voice = billedMinutes * CREDITS_PER_MINUTE;
-  const coding = input.codingDelivered ? CODING_MODULE_CREDITS : 0;
-  const systemDesign = input.designDelivered ? SYSTEM_DESIGN_MODULE_CREDITS : 0;
+export interface SessionPlan {
+  difficulty: Difficulty;
+  /** The band this difficulty targets. */
+  band: DurationBand;
+  /**
+   * How long this interview may actually run. The band's max, unless the
+   * balance affords less — in which case the interview hard-stops earlier
+   * rather than running up a debt.
+   */
+  ceilingMinutes: number;
+  /** True when the balance, not the difficulty, set the ceiling. */
+  ceilingLimitedByCredits: boolean;
+
+  /** Charged before the interview starts. */
+  upfrontCredits: number;
+  /** Voice credits needed on top of the upfront charge to be allowed to start. */
+  minimumVoiceCredits: number;
+  /** upfront + minimum voice. The number the balance is checked against. */
+  requiredToStart: number;
+
+  /** Whole minutes of voice the remaining balance can pay for. */
+  affordableMinutes: number;
+  /** The most this session can cost, if it runs to its ceiling. */
+  maxTotalCredits: number;
+
+  canStart: boolean;
+  shortfall: number;
+}
+
+export function planSession(
+  difficulty: Difficulty,
+  modules: SessionModules,
+  balance: number,
+): SessionPlan {
+  const band = DIFFICULTY_BANDS[difficulty];
+  const upfront = moduleCredits(modules);
+  const minVoice = minimumVoiceCredits(difficulty);
+  const requiredToStart = upfront + minVoice;
+
+  // Modules are paid first, so only what is left funds the conversation.
+  const forVoice = Math.max(0, balance - upfront);
+  const affordableMinutes = Math.floor(forVoice / CREDITS_PER_MINUTE);
+
+  const ceilingMinutes = Math.min(band.max, Math.max(band.min, affordableMinutes));
+  const canStart = balance >= requiredToStart;
 
   return {
-    billedMinutes,
-    voice,
-    coding,
-    system_design: systemDesign,
-    total: voice + coding + systemDesign,
+    difficulty,
+    band,
+    ceilingMinutes,
+    ceilingLimitedByCredits: canStart && affordableMinutes < band.max,
+    upfrontCredits: upfront,
+    minimumVoiceCredits: minVoice,
+    requiredToStart,
+    affordableMinutes,
+    maxTotalCredits: upfront + ceilingMinutes * CREDITS_PER_MINUTE,
+    canStart,
+    shortfall: Math.max(0, requiredToStart - balance),
   };
+}
+
+// ── Settling voice time ──────────────────────────────────────────────────────
+
+/**
+ * Whole minutes to bill for.
+ *
+ * Part-minutes round up — "five credits a minute" that rounded down would make
+ * a 59-second interview free. Capped at the session's ceiling so the charge can
+ * never exceed the maximum shown on the setup screen, and floored at one so a
+ * connection that dropped instantly is not billed as nothing when the prep
+ * spend already happened.
+ */
+export function billableMinutes(actualSeconds: number, ceilingMinutes: number): number {
+  const raw = Math.ceil(Math.max(0, actualSeconds) / 60);
+  return Math.min(Math.max(1, raw), Math.max(1, ceilingMinutes));
+}
+
+export function voiceCredits(minutes: number): number {
+  return minutes * CREDITS_PER_MINUTE;
 }
 
 // ── Module question counts ───────────────────────────────────────────────────
-
-type Difficulty = 'easy' | 'medium' | 'hard';
 
 /**
  * How many challenges a module contains. Flat fee, variable count — the price is
  * for the round, not per question.
  *
- * Two ceilings apply and the lower wins. Difficulty sets the ambition; duration
- * sets what physically fits. A 15-minute interview cannot hold three coding
- * problems no matter how hard the setting is, and shipping one the candidate
- * cannot finish produces no signal.
+ * Difficulty sets the ambition; the interview's ceiling sets what physically
+ * fits, and the lower of the two wins. Shipping three problems into an interview
+ * that cannot reach them produces no signal and wastes the generation.
  */
-export function codingQuestionCount(difficulty: Difficulty, durationMin: number): number {
+export function codingQuestionCount(difficulty: Difficulty, ceilingMinutes: number): number {
   const byDifficulty = { easy: 1, medium: 2, hard: 3 }[difficulty];
-  const byDuration = durationMin < 20 ? 1 : durationMin < 45 ? 2 : 3;
+  const byDuration = ceilingMinutes < 20 ? 1 : ceilingMinutes < 28 ? 2 : 3;
   return clampCount(Math.min(byDifficulty, byDuration));
 }
 
-/** System design questions are slower to work through, so they need more room. */
-export function designQuestionCount(difficulty: Difficulty, durationMin: number): number {
+/** System design scenarios are slower to work through, so they need more room. */
+export function designQuestionCount(difficulty: Difficulty, ceilingMinutes: number): number {
   const byDifficulty = { easy: 1, medium: 1, hard: 2 }[difficulty];
-  const byDuration = durationMin < 30 ? 1 : durationMin < 60 ? 2 : 3;
+  const byDuration = ceilingMinutes < 20 ? 1 : ceilingMinutes < 30 ? 2 : 3;
   return clampCount(Math.min(byDifficulty, byDuration));
 }
 
@@ -171,14 +200,14 @@ export const CREDIT_PACKS: CreditPack[] = [
     name: 'Starter',
     credits: 100,
     priceInr: 119,
-    tagline: 'About one 20-minute interview.',
+    tagline: 'One easy interview, with room to spare.',
   },
   {
     id: 'placement',
     name: 'Placement pack',
     credits: 250,
     priceInr: 249,
-    tagline: 'Three interviews with coding rounds.',
+    tagline: 'Three interviews, or two with coding rounds.',
     popular: true,
   },
   {
@@ -197,18 +226,4 @@ export function findPack(id: string): CreditPack | undefined {
 /** Razorpay works in paise. This is the only place the conversion happens. */
 export function toPaise(rupees: number): number {
   return Math.round(rupees * 100);
-}
-
-/** For the "₹X per interview" line on the pricing page. */
-export function creditsToRupees(pack: CreditPack): number {
-  return pack.priceInr / pack.credits;
-}
-
-/** A worked example, so "5 credits a minute" means something concrete. */
-export function describeExample(durationMin: number, modules: SessionModules): string {
-  const q = quoteSession(durationMin, modules);
-  const parts = [`${durationMin} min`];
-  if (modules.coding) parts.push('coding');
-  if (modules.system_design) parts.push('system design');
-  return `${parts.join(' + ')} = ${q.total} credits`;
 }

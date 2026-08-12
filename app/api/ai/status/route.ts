@@ -10,6 +10,7 @@ import { describeRouting } from '@/lib/ai/registry';
 import { AGENT_POLICY } from '@/lib/ai/config';
 import { CATALOG, PROVIDER_ENV_KEY, VOICE_CATALOG } from '@/lib/ai/catalog';
 import { resolveVoiceProvider } from '@/lib/ai/voice';
+import { checkCodeRunner } from '@/lib/execution/health';
 import { requireUser } from '@/lib/supabase/server';
 import { handleRouteError, ok } from '@/lib/api/respond';
 import type { AgentId } from '@/lib/ai/types';
@@ -42,6 +43,10 @@ export async function GET() {
     const voiceProvider = resolveVoiceProvider();
     const voice = VOICE_CATALOG[voiceProvider];
 
+    // Live ping, not a env-var read. This is the endpoint you hit after moving
+    // Judge0 to a new host, so it has to fail the same way the interview would.
+    const codeRunner = await checkCodeRunner();
+
     return ok({
       defaultProvider: process.env.AI_PROVIDER ?? 'openai',
       agents: routing,
@@ -60,6 +65,14 @@ export async function GET() {
          */
         wordTimestampsAvailable: Boolean(voice.stt.wordTimestamps),
       },
+
+      /*
+       * `reachable: false` means the coding round will still run but produce no
+       * test_pass_rate — half the coding score, reported as unavailable. A
+       * language whose `resolvesTo` is null or names the wrong runtime is worse:
+       * the round runs and grades against the wrong compiler.
+       */
+      codeRunner,
     });
   } catch (err) {
     return handleRouteError(err);

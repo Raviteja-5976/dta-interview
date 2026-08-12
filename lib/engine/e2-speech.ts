@@ -77,7 +77,7 @@ export interface SpeechMetrics {
   filler_breakdown: Array<{ word: string; count: number }>;
   pause_count: number;
   long_pause_count: number;
-  long_pauses_per_min: number;
+  long_pauses_per_min: number | null;
   longest_pause_ms: number;
   repetition_rate: number;
   time_to_first_word_ms: number | null;
@@ -85,6 +85,96 @@ export interface SpeechMetrics {
   /** 'low' excludes this answer from every aggregate. */
   reliability: 'ok' | 'low';
   reliability_reason?: string;
+  /**
+   * False when the transcriber gave no per-word timing, so pause metrics are
+   * genuinely unavailable rather than zero. S1 reweights fluency accordingly.
+   */
+  has_pause_data: boolean;
+}
+
+/**
+ * Metrics from a transcript plus the speech window, with no per-word timing.
+ *
+ * This is the path the live pipeline takes now: gpt-4o-mini-transcribe returns
+ * text, and the client measures when speech started and stopped from the
+ * microphone's own amplitude. That window is arguably a better answer duration
+ * than a transcript-derived one — it excludes the thinking pause before the
+ * candidate began, which would otherwise drag their pace down for having
+ * considered the question.
+ *
+ * What genuinely cannot be recovered without inter-word gaps: the pause profile,
+ * and articulation rate as distinct from gross rate. Those are returned as null
+ * rather than approximated, and S1 renormalises the fluency weights over
+ * whatever is actually present.
+ */
+export function computeSpeechMetricsFromText(
+  transcript: string,
+  speechDurationSec: number,
+  opts: { silenceBeforeMs?: number } = {},
+): SpeechMetrics {
+  const tokens = transcript.trim().split(/\s+/).filter(Boolean);
+  const wordCount = tokens.length;
+
+  if (wordCount === 0 || speechDurationSec <= 0) {
+    return emptyMetrics(null, wordCount === 0 ? 'no words transcribed' : 'no measurable speech');
+  }
+
+  const breakdown = new Map<string, number>();
+  let fillerCount = 0;
+
+  tokens.forEach((raw, i) => {
+    const w = raw.toLowerCase().replace(/[^a-z]/g, '');
+    if (!FILLERS.has(w)) return;
+    // Without timing there is no pause to mark a clause boundary, so a
+    // contextual filler only counts when it is genuinely mid-sentence.
+    if (CONTEXTUAL_FILLERS.has(w) && i === 0) return;
+    fillerCount += 1;
+    breakdown.set(w, (breakdown.get(w) ?? 0) + 1);
+  });
+
+  const wpm = wordCount / (speechDurationSec / 60);
+
+  return {
+    word_count: wordCount,
+    answer_duration_sec: round1(speechDurationSec),
+    speaking_time_sec: round1(speechDurationSec),
+    // Gross and articulation rate are the same number when pauses are unknown.
+    // Only `wpm_gross` is populated; leaving articulation null is what stops S1
+    // scoring pace twice off one measurement.
+    wpm_articulation: null,
+    wpm_gross: round1(wpm),
+    filler_count: fillerCount,
+    filler_rate: round3(fillerCount / wordCount),
+    filler_breakdown: [...breakdown.entries()]
+      .map(([word, count]) => ({ word, count }))
+      .sort((a, b) => b.count - a.count),
+    pause_count: 0,
+    long_pause_count: 0,
+    long_pauses_per_min: null,
+    longest_pause_ms: 0,
+    repetition_rate: round3(textRepetitionRate(tokens)),
+    time_to_first_word_ms: opts.silenceBeforeMs ?? null,
+    asr_confidence_avg: null,
+    reliability: wordCount < MIN_WORDS_FOR_RELIABILITY ? 'low' : 'ok',
+    reliability_reason:
+      wordCount < MIN_WORDS_FOR_RELIABILITY ? `only ${wordCount} words` : undefined,
+    has_pause_data: false,
+  };
+}
+
+/** Immediate word and bigram repeats, from tokens alone. */
+function textRepetitionRate(tokens: string[]): number {
+  if (tokens.length < 2) return 0;
+  const norm = tokens.map((t) => t.toLowerCase().replace(/[^a-z]/g, ''));
+
+  let repeats = 0;
+  for (let i = 1; i < norm.length; i += 1) {
+    if (norm[i] && norm[i] === norm[i - 1]) repeats += 1;
+  }
+  for (let i = 3; i < norm.length; i += 1) {
+    if (norm[i] === norm[i - 2] && norm[i - 1] === norm[i - 3]) repeats += 1;
+  }
+  return repeats / norm.length;
 }
 
 export function computeSpeechMetrics(
@@ -171,6 +261,7 @@ export function computeSpeechMetrics(
     asr_confidence_avg: asrConfidenceAvg !== null ? round3(asrConfidenceAvg) : null,
     reliability,
     reliability_reason: reliabilityReason,
+    has_pause_data: true,
   };
 }
 
@@ -236,14 +327,22 @@ export function summariseSpeech(
 
   return {
     wpm: totalSpeaking > 0 ? round1(totalWords / (totalSpeaking / 60)) : null,
-    wpm_by_question: perQuestion.map((q) => ({ seq: q.seq, wpm: q.metrics.wpm_articulation })),
+    wpm_by_question: perQuestion.map((q) => ({
+      seq: q.seq,
+      wpm: q.metrics.wpm_articulation ?? q.metrics.wpm_gross,
+    })),
     filler_rate: totalWords > 0 ? round3(totalFillers / totalWords) : null,
     filler_breakdown: [...breakdown.entries()]
       .map(([word, count]) => ({ word, count }))
       .sort((a, b) => b.count - a.count),
-    long_pauses_per_min: reliable.length
-      ? round1(avg(reliable.map((q) => q.metrics.long_pauses_per_min)))
-      : null,
+    // Averaged only over answers that actually have pause data, so a session
+    // transcribed without word timing reports "unavailable" rather than zero.
+    long_pauses_per_min: (() => {
+      const withPauses = reliable
+        .map((q) => q.metrics.long_pauses_per_min)
+        .filter((v): v is number => v !== null);
+      return withPauses.length ? round1(avg(withPauses)) : null;
+    })(),
     repetition_rate: reliable.length ? round3(avg(reliable.map((q) => q.metrics.repetition_rate))) : null,
     avg_time_to_first_word_ms: ttfw.length ? Math.round(avg(ttfw)) : null,
     total_speaking_sec: round1(totalSpeaking),
@@ -292,6 +391,7 @@ function emptyMetrics(asr: number | null, reason: string): SpeechMetrics {
     asr_confidence_avg: asr,
     reliability: 'low',
     reliability_reason: reason,
+    has_pause_data: false,
   };
 }
 

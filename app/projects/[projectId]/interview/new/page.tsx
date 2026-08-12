@@ -4,8 +4,8 @@
  * The last screen before a credit is spent. It must be unambiguous.
  *
  * Two rules drive the design:
- *   1. The cost panel is always visible and updates live. The number here and
- *      the number debited both come from `priceSession`.
+ *   1. The cost panel is always visible and updates live. Every number on it
+ *      comes from `planSession`, the same function the API charges with.
  *   2. Microphone permission is requested HERE, not on the interview screen. A
  *      permission prompt in a live interview costs the first thirty seconds.
  */
@@ -20,15 +20,15 @@ import AppHeader from '@/components/layout/AppHeader';
 import { Button, Card, Chip, ErrorCard, Eyebrow, SectionTitle, Skeleton } from '@/components/app/ui';
 import {
   CODING_MODULE_CREDITS,
+  DIFFICULTY_BANDS,
   CREDITS_PER_MINUTE,
   SYSTEM_DESIGN_MODULE_CREDITS,
   codingQuestionCount,
   designQuestionCount,
-  quoteSession,
+  planSession,
+  type Difficulty,
 } from '@/lib/credits';
 import { supabase } from '@/lib/supabase/client';
-
-type Difficulty = 'easy' | 'medium' | 'hard';
 
 /** `?focus=` is read with useSearchParams, which needs a Suspense boundary. */
 export default function InterviewSetupPage() {
@@ -58,20 +58,19 @@ function InterviewSetupContent() {
   const [error, setError] = useState<string | null>(null);
 
   const [difficulty, setDifficulty] = useState<Difficulty>('medium');
-  const [durationMin, setDurationMin] = useState(15);
   const [coding, setCoding] = useState(false);
   const [systemDesign, setSystemDesign] = useState(false);
   const [focusSkills, setFocusSkills] = useState<string[]>(
     search.get('focus')?.split(',').filter(Boolean) ?? [],
   );
 
-  // A ceiling, not a price: this is the hold. Unused minutes come back the
-  // moment the interview ends.
-  const quote = quoteSession(durationMin, { coding, system_design: systemDesign });
-  const canAfford = balance >= quote.total;
+  // Length follows difficulty, then gets capped by what the balance affords.
+  // There is no duration picker — see lib/credits.ts for why.
+  const plan = planSession(difficulty, { coding, system_design: systemDesign }, balance);
+  const canAfford = plan.canStart;
 
-  const codingQs = codingQuestionCount(difficulty, durationMin);
-  const designQs = designQuestionCount(difficulty, durationMin);
+  const codingQs = codingQuestionCount(difficulty, plan.ceilingMinutes);
+  const designQs = designQuestionCount(difficulty, plan.ceilingMinutes);
 
   // ── Mic pre-flight ─────────────────────────────────────────────────────────
   const [micState, setMicState] = useState<'idle' | 'granted' | 'denied'>('idle');
@@ -135,7 +134,6 @@ function InterviewSetupContent() {
         defaults?: { difficulty?: Difficulty; duration_min?: number; coding?: boolean; system_design?: boolean };
       };
       if (prefs.defaults?.difficulty) setDifficulty(prefs.defaults.difficulty);
-      if (prefs.defaults?.duration_min) setDurationMin(prefs.defaults.duration_min);
       if (prefs.defaults?.coding !== undefined) setCoding(prefs.defaults.coding);
 
       // System design defaults off below mid seniority (§8).
@@ -154,7 +152,7 @@ function InterviewSetupContent() {
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId, difficulty, durationMin, coding, systemDesign, focusSkills }),
+        body: JSON.stringify({ projectId, difficulty, coding, systemDesign, focusSkills }),
       });
       const data = await res.json();
 
@@ -191,21 +189,29 @@ function InterviewSetupContent() {
           <Card className="p-6">
             <SectionTitle>Shape of the interview</SectionTitle>
 
+            {/* Difficulty sets the length too. There is no duration picker:
+                a hard interview needs room to go deep, and an easy one padded
+                out just repeats itself. */}
             <Choice label="Difficulty">
               {(['easy', 'medium', 'hard'] as Difficulty[]).map((d) => (
                 <Pill key={d} active={difficulty === d} onClick={() => setDifficulty(d)}>
-                  {d}
+                  {d} · {DIFFICULTY_BANDS[d].min}-{DIFFICULTY_BANDS[d].max} min
                 </Pill>
               ))}
             </Choice>
 
-            <Choice label="Duration">
-              {[15, 30, 45, 60].map((m) => (
-                <Pill key={m} active={durationMin === m} onClick={() => setDurationMin(m)}>
-                  {m} min
-                </Pill>
-              ))}
-            </Choice>
+            <p className="-mt-2 mb-5 text-sm text-[#1B1F3B]/70">
+              {difficulty === 'easy'
+                ? 'A warm-up. Fundamentals and your own projects, at a comfortable pace.'
+                : difficulty === 'medium'
+                  ? 'A realistic screen. Follow-ups get pointed and claims get tested.'
+                  : 'A senior bar. Trade-offs, edge cases, and pressure on anything vague.'}{' '}
+              {plan.ceilingLimitedByCredits && (
+                <span className="text-[#1B1F3B]">
+                  Your balance covers {plan.ceilingMinutes} minutes of it — it will end there.
+                </span>
+              )}
+            </p>
 
             <Choice label="Modules">
               <Pill active={coding} onClick={() => setCoding(!coding)}>
@@ -291,68 +297,85 @@ function InterviewSetupContent() {
           <Card className="p-6" accent={canAfford ? 'orange' : 'coral'}>
             <Eyebrow>What this costs</Eyebrow>
 
-            <div className="mt-4 space-y-2 font-[family-name:var(--font-mono)] text-sm">
-              <div className="flex justify-between">
-                <span className="text-[#1B1F3B]/70">
-                  Interview · {durationMin} min
-                  <span className="block text-[11px] text-[#1B1F3B]/45">
-                    {CREDITS_PER_MINUTE} credits per minute
+            {/* Two billing models, shown separately, because conflating them is
+                what makes a bill feel like a surprise. */}
+            <div className="mt-4">
+              <p className="font-[family-name:var(--font-mono)] text-[10px] font-bold uppercase tracking-widest text-[#1B1F3B]/55 mb-2">
+                Charged now
+              </p>
+
+              <div className="space-y-2 font-[family-name:var(--font-mono)] text-sm">
+                <div className="flex justify-between">
+                  <span className="text-[#1B1F3B]/70">
+                    Coding round
+                    {coding && (
+                      <span className="block text-[11px] text-[#1B1F3B]/45">
+                        {codingQs} problem{codingQs === 1 ? '' : 's'}
+                      </span>
+                    )}
                   </span>
-                </span>
-                <span className="tabular-nums font-bold">{quote.voice}</span>
-              </div>
+                  <span className="tabular-nums font-bold">
+                    {coding ? CODING_MODULE_CREDITS : '—'}
+                  </span>
+                </div>
 
-              <div className="flex justify-between">
-                <span className="text-[#1B1F3B]/70">
-                  Coding round
-                  {coding && (
-                    <span className="block text-[11px] text-[#1B1F3B]/45">
-                      {codingQs} problem{codingQs === 1 ? '' : 's'}
-                    </span>
-                  )}
-                </span>
-                <span className="tabular-nums font-bold">
-                  {coding ? `+${CODING_MODULE_CREDITS}` : '—'}
-                </span>
-              </div>
+                <div className="flex justify-between">
+                  <span className="text-[#1B1F3B]/70">
+                    System design
+                    {systemDesign && (
+                      <span className="block text-[11px] text-[#1B1F3B]/45">
+                        {designQs} scenario{designQs === 1 ? '' : 's'}
+                      </span>
+                    )}
+                  </span>
+                  <span className="tabular-nums font-bold">
+                    {systemDesign ? SYSTEM_DESIGN_MODULE_CREDITS : '—'}
+                  </span>
+                </div>
 
-              <div className="flex justify-between">
-                <span className="text-[#1B1F3B]/70">
-                  System design
-                  {systemDesign && (
-                    <span className="block text-[11px] text-[#1B1F3B]/45">
-                      {designQs} scenario{designQs === 1 ? '' : 's'}
-                    </span>
-                  )}
-                </span>
-                <span className="tabular-nums font-bold">
-                  {systemDesign ? `+${SYSTEM_DESIGN_MODULE_CREDITS}` : '—'}
-                </span>
-              </div>
-
-              <div className="border-t-2 border-[#1B1F3B] pt-2 mt-2 flex justify-between font-bold">
-                <span>Most it can cost</span>
-                <span className="tabular-nums">{quote.total} credits</span>
-              </div>
-              <div className="flex justify-between text-[#1B1F3B]/70">
-                <span>Your balance</span>
-                <span className="tabular-nums">{balance}</span>
-              </div>
-              <div className="flex justify-between text-[#1B1F3B]/70">
-                <span>Held while you interview</span>
-                <span className="tabular-nums">{Math.max(0, balance - quote.total)}</span>
+                <div className="flex justify-between font-bold border-t-2 border-[#1B1F3B]/20 pt-2">
+                  <span>{plan.upfrontCredits > 0 ? 'Upfront' : 'Nothing upfront'}</span>
+                  <span className="tabular-nums">{plan.upfrontCredits}</span>
+                </div>
               </div>
             </div>
 
-            {/* The single most important thing on this panel: the number above
-                is a ceiling, not a price. */}
-            <p className="mt-3 p-3 bg-[#6EE7B7]/25 border-2 border-[#1B1F3B] rounded-2xl text-xs text-[#1B1F3B]">
-              You&apos;re only charged for the minutes you actually use. Finish in{' '}
-              {Math.max(1, Math.round(durationMin * 0.6))} minutes and roughly{' '}
+            <div className="mt-5">
+              <p className="font-[family-name:var(--font-mono)] text-[10px] font-bold uppercase tracking-widest text-[#1B1F3B]/55 mb-2">
+                Charged as you talk
+              </p>
+
+              <div className="space-y-2 font-[family-name:var(--font-mono)] text-sm">
+                <div className="flex justify-between">
+                  <span className="text-[#1B1F3B]/70">
+                    {CREDITS_PER_MINUTE} credits per minute
+                    <span className="block text-[11px] text-[#1B1F3B]/45">
+                      runs {plan.band.min}-{plan.ceilingMinutes} min, then stops
+                    </span>
+                  </span>
+                  <span className="tabular-nums font-bold">
+                    {plan.band.min * CREDITS_PER_MINUTE}-{plan.ceilingMinutes * CREDITS_PER_MINUTE}
+                  </span>
+                </div>
+
+                <div className="flex justify-between border-t-2 border-[#1B1F3B] pt-2 font-bold">
+                  <span>Most it can cost</span>
+                  <span className="tabular-nums">{plan.maxTotalCredits}</span>
+                </div>
+                <div className="flex justify-between text-[#1B1F3B]/70">
+                  <span>Your balance</span>
+                  <span className="tabular-nums">{balance}</span>
+                </div>
+              </div>
+            </div>
+
+            <p className="mt-4 p-3 bg-[#6EE7B7]/25 border-2 border-[#1B1F3B] rounded-2xl text-xs text-[#1B1F3B]">
+              Nothing is held. Stop after{' '}
+              {Math.max(1, Math.round(plan.ceilingMinutes * 0.4))} minutes and you pay{' '}
               <strong className="tabular-nums">
-                {quote.voice - Math.max(1, Math.round(durationMin * 0.6)) * CREDITS_PER_MINUTE}
+                {Math.max(1, Math.round(plan.ceilingMinutes * 0.4)) * CREDITS_PER_MINUTE}
               </strong>{' '}
-              credits come straight back.
+              credits for the time — not a credit more.
             </p>
 
             {error && (
@@ -380,7 +403,7 @@ function InterviewSetupContent() {
                   className="w-full"
                 >
                   <ShoppingCart className="w-4 h-4" />
-                  Buy {quote.total - balance} more credit{quote.total - balance === 1 ? '' : 's'}
+                  Buy {plan.shortfall} more credit{plan.shortfall === 1 ? '' : 's'}
                 </Button>
               )}
             </div>
@@ -392,9 +415,10 @@ function InterviewSetupContent() {
             )}
 
             <div className="mt-4 pt-4 border-t-2 border-[#1B1F3B]/15">
-              <Chip>Held now · settled when you finish</Chip>
+              <Chip>Modules upfront · time afterwards</Chip>
               <p className="mt-2 text-xs text-[#1B1F3B]/60">
-                If the interview or its report fails, every credit comes straight back.
+                An {difficulty} interview needs {plan.requiredToStart} credits to start. If the
+                interview or its report fails, every credit comes straight back.
               </p>
             </div>
           </Card>

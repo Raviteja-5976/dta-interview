@@ -53,6 +53,8 @@ export interface ConversationManagerInput {
   callbacks: MemoryItem[];
   sectionTitle: string;
   goalStatements: Record<string, string>;
+  /** R12's budget for the current section, so pacing is visible rather than guessed. */
+  sectionBudget: { asked: number; min: number; max: number };
   /** A short, bounded characterisation of the last answer. NOT the transcript. */
   lastAnswerSignal: {
     wordCount: number;
@@ -61,6 +63,23 @@ export interface ConversationManagerInput {
     disclaimed: boolean;
     weak: boolean;
   };
+}
+
+/**
+ * Tells L1 where it is in the section's budget.
+ *
+ * The rule layer enforces the budget regardless — an over-budget section is
+ * handed a shortlist containing only TRANSITION_SECTION. This exists so L1 is
+ * choosing to leave rather than being made to, which produces a better-aimed
+ * last question and a transition that does not arrive mid-thought.
+ */
+function budgetGuidance(budget: { asked: number; min: number; max: number }): string {
+  if (budget.asked >= budget.max) return 'This section is done — move on.';
+  if (budget.asked >= budget.max - 1) {
+    return 'One question left here. Spend it on the biggest remaining gap, then transition.';
+  }
+  if (budget.asked < budget.min) return 'Too early to leave this section.';
+  return 'You may transition once this section has yielded what it is going to.';
 }
 
 /**
@@ -105,6 +124,7 @@ function buildPrompt(input: ConversationManagerInput): string {
     '',
     `LAST ANSWER: ${a.wordCount} words over ${Math.round(a.durationSec)}s · ${a.newEvidenceCount} new evidence item(s)${a.disclaimed ? ' · candidate disclaimed knowledge' : ''}${a.weak ? ' · weak' : ''}`,
     `RHYTHM: turn ${input.runtime.turn} · ${input.runtime.turns_on_active_goal} turns on this goal · ${input.runtime.consecutive_weak_answers} consecutive weak · difficulty ${input.runtime.current_difficulty} · corrections used ${input.runtime.corrections_used}/2`,
+    `SECTION BUDGET: ${input.sectionBudget.asked} of ${input.sectionBudget.max} questions used (this section gets ${input.sectionBudget.min}-${input.sectionBudget.max}). ${budgetGuidance(input.sectionBudget)}`,
     '',
     'MEMORY AVAILABLE FOR CALLBACK:',
     callbacks,

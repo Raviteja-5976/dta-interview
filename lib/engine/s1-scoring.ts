@@ -121,14 +121,36 @@ export function scoreBehavioral(grading: Grading): number {
  * scoring it as zero.
  */
 export function scoreFluency(metrics: SpeechMetrics, language: string): number | null {
-  if (metrics.reliability === 'low' || metrics.wpm_articulation === null) return null;
+  if (metrics.reliability === 'low') return null;
 
-  const pace = scorePace(metrics.wpm_articulation, bandsFor(language));
-  const filler = scoreFillerRate(metrics.filler_rate);
-  const pause = scoreLongPauses(metrics.long_pauses_per_min);
-  const repetition = scoreRepetition(metrics.repetition_rate);
+  // Articulation rate needs inter-word gaps; gross rate does not. Whichever the
+  // transcriber gave us is the pace measurement.
+  const wpm = metrics.wpm_articulation ?? metrics.wpm_gross;
+  if (wpm === null) return null;
 
-  return round1(0.35 * pace + 0.3 * filler + 0.2 * pause + 0.15 * repetition);
+  /*
+   * Weights are renormalised over the components actually present.
+   *
+   * Without per-word timing the pause profile is unknown. Scoring the missing
+   * 0.20 as zero would quietly cap everyone at 8.0; scoring it as ten would
+   * hand out marks for something never measured. Dropping it and rescaling the
+   * rest is the only honest option, and it keeps the relative weighting of pace,
+   * fillers and repetition exactly as §9.4 specifies.
+   */
+  const parts: Array<{ weight: number; score: number }> = [
+    { weight: 0.35, score: scorePace(wpm, bandsFor(language)) },
+    { weight: 0.3, score: scoreFillerRate(metrics.filler_rate) },
+    { weight: 0.15, score: scoreRepetition(metrics.repetition_rate) },
+  ];
+
+  if (metrics.has_pause_data && metrics.long_pauses_per_min !== null) {
+    parts.push({ weight: 0.2, score: scoreLongPauses(metrics.long_pauses_per_min) });
+  }
+
+  const totalWeight = parts.reduce((acc, p) => acc + p.weight, 0);
+  const weighted = parts.reduce((acc, p) => acc + p.weight * p.score, 0);
+
+  return round1(weighted / totalWeight);
 }
 
 function scorePace(wpm: number, bands: WpmBands): number {
@@ -397,13 +419,36 @@ export interface Readiness {
   coding: number;
   system_design: number;
   computed_at: string;
-  history: Array<{ session_id: string; overall: number; at: string }>;
+  /**
+   * One entry per completed session, newest last.
+   *
+   * Per-dimension values are recorded, not just `overall`, because the rollup is
+   * now a mean over these rather than a running blend — so the history has to
+   * carry everything the mean is taken of.
+   */
+  history: Array<{
+    session_id: string;
+    overall: number;
+    at: string;
+    technical?: number | null;
+    behavioral?: number | null;
+    coding?: number | null;
+  }>;
 }
 
 /**
- * Project-level readiness, 0-100. Blends this session into the running history.
- * db-design.md §3.3 caps `history` at 20 entries on write — it drives a sparkline,
- * not an archive.
+ * Project-level readiness, 0-100 — the AVERAGE across every session on the
+ * project, not a reading of the latest one.
+ *
+ * It used to be an exponentially-weighted blend (`0.4 × before + 0.6 × next`),
+ * which made the number impossible to interpret: it was neither this interview's
+ * result nor a fair average, and a single strong session could carry a weak
+ * history for weeks. The per-session score lives on `sessions.scores` and is
+ * what the report shows; this is the trend line, and a trend line should be the
+ * mean of its points.
+ *
+ * db-design.md §3.3 caps `history` at 20 entries on write — it drives a
+ * sparkline, not an archive — so the mean is over the last 20 sessions.
  */
 export function computeReadiness(args: {
   scores: SessionScores;
@@ -414,27 +459,57 @@ export function computeReadiness(args: {
   const toPct = (n: number | null | undefined) => (n == null ? null : Math.round(n * 10));
   const prev = args.previous;
 
-  // A new reading moves the number but does not erase what came before —
-  // readiness is a trend, and a single bad session should not zero it.
-  const blend = (next: number | null, before: number | undefined) => {
-    if (next === null) return before ?? 0;
-    if (before === undefined) return next;
-    return Math.round(before * 0.4 + next * 0.6);
-  };
+  // This session's own numbers, untouched by anything that came before.
+  const sessionTechnical = toPct(args.scores.accuracy);
+  const sessionBehavioral = toPct(args.scores.behavioral);
+  const sessionCoding = toPct(args.scores.coding);
 
-  const technical = blend(toPct(args.scores.accuracy), prev?.technical);
-  const behavioral = blend(toPct(args.scores.behavioral), prev?.behavioral);
-  const coding = blend(toPct(args.scores.coding), prev?.coding);
-  const systemDesign = prev?.system_design ?? 0;
-  const resumeMatch = args.resumeMatch ?? prev?.resume_match ?? 0;
-
-  const parts = [technical, behavioral, coding, resumeMatch].filter((p) => p > 0);
-  const overall = parts.length ? Math.round(parts.reduce((a, b) => a + b, 0) / parts.length) : 0;
+  const sessionParts = [sessionTechnical, sessionBehavioral, sessionCoding].filter(
+    (p): p is number => p !== null,
+  );
+  const sessionOverall = sessionParts.length
+    ? Math.round(sessionParts.reduce((a, b) => a + b, 0) / sessionParts.length)
+    : 0;
 
   const history = [
     ...(prev?.history ?? []),
-    { session_id: args.sessionId, overall, at: new Date().toISOString() },
+    {
+      session_id: args.sessionId,
+      overall: sessionOverall,
+      at: new Date().toISOString(),
+      technical: sessionTechnical,
+      behavioral: sessionBehavioral,
+      coding: sessionCoding,
+    },
   ].slice(-20);
+
+  /*
+   * Each dimension is the mean of the sessions that actually measured it.
+   *
+   * Sessions without a coding module contribute nothing to the coding mean
+   * rather than a zero — otherwise every conversation-only interview would drag
+   * down a coding score it never attempted (§9.6's rule for abandoned goals,
+   * applied at the project level).
+   */
+  const meanOverHistory = (pick: (h: Readiness['history'][number]) => number | null | undefined) => {
+    const values = history
+      .map(pick)
+      .filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+    return values.length ? Math.round(values.reduce((a, b) => a + b, 0) / values.length) : 0;
+  };
+
+  const technical = meanOverHistory((h) => h.technical);
+  const behavioral = meanOverHistory((h) => h.behavioral);
+  const coding = meanOverHistory((h) => h.coding);
+  const systemDesign = prev?.system_design ?? 0;
+  const resumeMatch = args.resumeMatch ?? prev?.resume_match ?? 0;
+
+  // Entries written before per-dimension history existed carry only `overall`;
+  // averaging that keeps older projects meaningful instead of resetting them.
+  const dimensions = [technical, behavioral, coding, resumeMatch].filter((p) => p > 0);
+  const overall = dimensions.length
+    ? Math.round(dimensions.reduce((a, b) => a + b, 0) / dimensions.length)
+    : meanOverHistory((h) => h.overall);
 
   return {
     overall,

@@ -16,9 +16,23 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import type { ModelSpec, ModelTier, ProviderId } from './types';
+import { REASONING_LADDER, type ModelSpec, type ModelTier, type ProviderId, type ReasoningEffort } from './types';
 
 type Catalog = Record<ProviderId, Record<ModelTier, ModelSpec>>;
+
+/**
+ * What the gpt-5.6 family actually accepts.
+ *
+ * Note the absence of `minimal`, which the provider documents as a valid
+ * reasoning-effort value. The model rejects it with a 400:
+ *
+ *   Unsupported value: 'minimal' is not supported with the 'gpt-5.6-luna' model.
+ *   Supported values are: 'none', 'low', 'medium', 'high', 'xhigh', and 'max'.
+ *
+ * The documented list is the union across the whole product line; per-model
+ * support is narrower. This is the observed truth for this family.
+ */
+const GPT_56_EFFORTS: ReasoningEffort[] = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
  * ── Why the ladder sits where it does ────────────────────────────────────────
@@ -54,6 +68,7 @@ export const CATALOG: Catalog = {
       structuredOutputs: true,
       supportsTemperature: false,
       supportsReasoningEffort: true,
+      reasoningEfforts: GPT_56_EFFORTS,
     },
     fast: {
       id: 'gpt-5.6-luna',
@@ -62,6 +77,7 @@ export const CATALOG: Catalog = {
       structuredOutputs: true,
       supportsTemperature: false,
       supportsReasoningEffort: true,
+      reasoningEfforts: GPT_56_EFFORTS,
     },
     balanced: {
       id: 'gpt-5.6-luna',
@@ -70,6 +86,7 @@ export const CATALOG: Catalog = {
       structuredOutputs: true,
       supportsTemperature: false,
       supportsReasoningEffort: true,
+      reasoningEfforts: GPT_56_EFFORTS,
     },
     // Reserved for generative work whose quality compounds: the blueprint, and
     // coding problems whose hidden tests have to be arithmetically correct.
@@ -80,6 +97,7 @@ export const CATALOG: Catalog = {
       structuredOutputs: true,
       supportsTemperature: false,
       supportsReasoningEffort: true,
+      reasoningEfforts: GPT_56_EFFORTS,
     },
   },
 
@@ -187,9 +205,13 @@ export interface VoiceModelSpec {
   pricePerMinute?: number;
   pricePer1MChars?: number;
   /**
-   * Whether the model returns WORD-level timestamps. E2's entire speech-metrics
-   * layer is arithmetic over per-word timing, so `false` here means fluency
-   * cannot be scored at all — not that it is scored slightly worse.
+   * Whether the model returns WORD-level timestamps.
+   *
+   * `false` does not mean fluency is unscorable — pace, fillers and repetition
+   * all come from the transcript plus the client-measured speech window. It
+   * means the metrics that need INTER-WORD gaps (pause profile, articulation
+   * rate as distinct from gross rate) are genuinely unavailable, and E2 reports
+   * them as such rather than guessing.
    */
   wordTimestamps?: boolean;
   /** Whether the model accepts free-text delivery direction (L4's prosody). */
@@ -198,32 +220,33 @@ export interface VoiceModelSpec {
 }
 
 /**
- * ── The whisper-1 decision ───────────────────────────────────────────────────
- * OpenAI's docs are explicit: "The timestamp_granularities[] parameter is only
- * supported for whisper-1." Not gpt-transcribe, not gpt-live-transcribe, not
- * gpt-4o-transcribe-diarize (which gives segment timing only).
+ * ── The STT decision ─────────────────────────────────────────────────────────
+ * gpt-4o-mini-transcribe. It is faster and cheaper than whisper-1, and it is
+ * accurate on accented English, which matters for this user base.
  *
- * agentdesign.md D7 chose a cascaded pipeline precisely so that word-level
- * timestamps come from the live STT rather than a second transcription pass, and
- * §12 lists "STT without word-level timestamps" as a build-stopping risk. So the
- * model that supports them is the only candidate.
+ * What it does NOT return is per-word timestamps — `timestamp_granularities` is
+ * a whisper-1-only parameter. That is a deliberate trade, not an oversight:
  *
- * It is also 2.8× cheaper than gpt-live-transcribe ($0.006 vs $0.017/min), so
- * this costs nothing to get right.
+ *   Kept:  words per minute, filler rate, repetition. All computable from the
+ *          transcript plus the speech window the client measures locally, which
+ *          is a truer answer duration anyway — it excludes the thinking pause
+ *          before the candidate starts talking.
+ *   Lost:  pause profile and articulation-rate-versus-gross-rate. Those need
+ *          inter-word gaps and cannot be recovered from a flat transcript.
  *
- * The trade-off it does carry: whisper-1 does not stream. Answers are
- * transcribed after the candidate stops, which adds ~1-2s per turn. The
- * alternative — streaming with gpt-live-transcribe for the UI plus whisper-1
- * afterwards for timing — is the "pay twice and reconcile two clocks" shape D7
- * explicitly rejects. One clock, native word timing, lower bill.
+ * `wordTimestamps: false` is what keeps that honest downstream: E2 reports the
+ * pause metrics as unavailable rather than inventing them, and S1 renormalises
+ * the fluency weights over the components it actually has.
  */
 type VoicePair = { stt: VoiceModelSpec; tts: VoiceModelSpec };
 
 const OPENAI_VOICE: VoicePair = {
   stt: {
-    id: 'whisper-1',
-    pricePerMinute: 0.006,
-    wordTimestamps: true,
+    id: 'gpt-4o-mini-transcribe',
+    pricePerMinute: 0.003,
+    // No per-word timing. E2 works from the transcript plus the client-measured
+    // speech window instead; see the note above.
+    wordTimestamps: false,
     streaming: false,
   },
   tts: {
@@ -282,6 +305,48 @@ export function isProviderId(value: string): value is ProviderId {
 
 export function getModelSpec(provider: ProviderId, tier: ModelTier): ModelSpec {
   return CATALOG[provider][tier];
+}
+
+/**
+ * Maps a requested reasoning effort onto something the model will actually take.
+ *
+ * The whole point of the tier abstraction is that an agent states intent and the
+ * catalog resolves it. Effort has to work the same way, or pinning a different
+ * model via `AI_MODEL_<AGENT>` turns a config value into a 400 at request time.
+ *
+ * Nearest rung on the ladder wins. Ties go DOWN — the cheaper, faster direction.
+ * Falling back to less thinking than asked for is a mild quality regression;
+ * silently spending more than asked for is a surprise on the bill.
+ */
+export function resolveReasoningEffort(
+  spec: ModelSpec,
+  requested: ReasoningEffort | undefined,
+): ReasoningEffort | undefined {
+  if (!requested) return undefined;
+
+  const supported = spec.reasoningEfforts;
+  if (!supported || supported.includes(requested)) return requested;
+
+  const wanted = REASONING_LADDER.indexOf(requested);
+  if (wanted === -1) return undefined;
+
+  let best: ReasoningEffort | undefined;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  // Walking the ladder low to high, with a strict `<`, means an equidistant
+  // lower rung is reached first and kept — the tie-break falls out of the
+  // iteration order rather than needing its own branch.
+  REASONING_LADDER.forEach((candidate, index) => {
+    if (!supported.includes(candidate)) return;
+
+    const distance = Math.abs(index - wanted);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  });
+
+  return best;
 }
 
 /**

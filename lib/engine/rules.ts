@@ -15,7 +15,14 @@
  */
 
 import type { Blueprint, ConversationalIntent, UtterancePlan } from '../agents/schemas';
-import type { Coverage, CandidateAction, EntryStyle, SessionRuntime } from './types';
+import {
+  NO_FLOOR_SECTIONS,
+  SECTION_QUESTION_BUDGET,
+  type Coverage,
+  type CandidateAction,
+  type EntryStyle,
+  type SessionRuntime,
+} from './types';
 import type { MemoryItem } from './l2-memory-store';
 
 const SHORTLIST_MAX = 8;
@@ -58,6 +65,8 @@ export interface RuleInput {
   majorErrorPresent?: boolean;
   /** Seconds elapsed in the current section, for section ceilings. */
   sectionElapsedSec?: number;
+  /** Drives R12's per-section question budget. */
+  difficulty?: 'easy' | 'medium' | 'hard';
 }
 
 // ── Enumeration ──────────────────────────────────────────────────────────────
@@ -200,6 +209,8 @@ export function legalActions(input: RuleInput): CandidateAction[] {
   candidates = applyCorrectionBudget(candidates, input);                // R7
   candidates = applyRhythmPolicy(candidates, input);                    // R8
   candidates = boostCallbacks(candidates, input);                       // R3
+  candidates = applyGradingModeVariety(candidates, input);              // R13
+  candidates = applySectionBudget(candidates, input);                   // R12 — last word
 
   // Never return an empty set — L1 must always have something legal to choose.
   if (candidates.length === 0) {
@@ -215,7 +226,28 @@ export function legalActions(input: RuleInput): CandidateAction[] {
     ];
   }
 
-  return candidates.sort((a, b) => b.priority - a.priority).slice(0, SHORTLIST_MAX);
+  const sorted = candidates.sort((a, b) => b.priority - a.priority);
+  const shortlist = sorted.slice(0, SHORTLIST_MAX);
+
+  /*
+   * The option to LEAVE always survives the cut.
+   *
+   * TRANSITION_SECTION carries the lowest priority in the whole enumeration
+   * (0.15), and a section with two goals contributes a dozen bank questions
+   * above it — so the top-8 slice dropped it every time. L1 could then only ever
+   * leave a section by exhausting its question ceiling, which is precisely the
+   * "it never switches sections" behaviour, and it would have made R12's floor
+   * read as a fixed question count rather than a range.
+   *
+   * Below the floor this is a no-op: R12 has already removed the action from the
+   * candidate set, so there is nothing to reinstate.
+   */
+  if (!shortlist.some((c) => c.action === 'TRANSITION_SECTION')) {
+    const exit = sorted.find((c) => c.action === 'TRANSITION_SECTION');
+    if (exit) shortlist[shortlist.length - 1] = exit;
+  }
+
+  return shortlist;
 }
 
 /**
@@ -342,6 +374,91 @@ function applyRhythmPolicy(candidates: CandidateAction[], input: RuleInput): Can
   }
 
   return out.length > 0 ? out : candidates;
+}
+
+/**
+ * R12 · A section gets a bounded number of questions.
+ *
+ * Runs LAST, and it is allowed to overrule everything above it, because it is
+ * the only rule that guarantees the interview terminates section by section.
+ * Goal satisfaction was carrying that responsibility alone and could not: a
+ * goal closes on verified evidence or on running out of turns, and L1 may
+ * rotate between a section's goals forever without either happening. That is
+ * how one section ended up asking every question in the interview.
+ *
+ * Below the floor, leaving is illegal. At the ceiling, leaving is the only
+ * thing left.
+ */
+function applySectionBudget(candidates: CandidateAction[], input: RuleInput): CandidateAction[] {
+  const budget = SECTION_QUESTION_BUDGET[input.difficulty ?? 'medium'];
+  const asked = input.runtime.questions_in_section ?? 0;
+
+  const section = input.blueprint.sections.find(
+    (s) => s.section_id === input.runtime.current_section_id,
+  );
+  const goals = input.coverage.goals.filter((g) => g.section_id === input.runtime.current_section_id);
+  const allDone =
+    goals.length > 0 && goals.every((g) => g.status === 'satisfied' || g.status === 'abandoned');
+
+  const overTime =
+    section !== undefined &&
+    (input.sectionElapsedSec ?? 0) > section.time_ceiling_sec;
+
+  // Ceiling, or the section is genuinely finished, or it has run over its time
+  // budget: the only remaining move is out.
+  if (asked >= budget.max || allDone || overTime) {
+    const leaving = candidates.filter((c) => c.action === 'TRANSITION_SECTION');
+    return leaving.length > 0
+      ? leaving
+      : [
+          {
+            action: 'TRANSITION_SECTION',
+            section_id: input.runtime.current_section_id,
+            skill_tags: [],
+            source_kind: 'none',
+            targets_evidence: [],
+            priority: 1,
+          },
+        ];
+  }
+
+  // Floor. The warm-up and the close are exempt — they have their own natural
+  // length and padding them out helps nobody.
+  const hasFloor = section !== undefined && !NO_FLOOR_SECTIONS.has(section.type);
+  if (hasFloor && asked < budget.min) {
+    const staying = candidates.filter((c) => c.action !== 'TRANSITION_SECTION');
+    if (staying.length > 0) return staying;
+  }
+
+  return candidates;
+}
+
+/**
+ * R13 · Vary what KIND of question gets asked.
+ *
+ * A section's bank holds resume-grounded questions, straight skill checks and
+ * behavioural ones, but L1 selects purely by evidence gap — so whichever kind
+ * happened to target the largest gap got asked over and over, and the skill
+ * checks were never reached. This is what makes the mix actually reach the
+ * candidate rather than merely existing in the blueprint.
+ *
+ * A boost, not a ban: if the only question that closes a real gap is the same
+ * kind as the last two, it should still win.
+ */
+function applyGradingModeVariety(
+  candidates: CandidateAction[],
+  input: RuleInput,
+): CandidateAction[] {
+  const recent = input.runtime.recent_grading_modes ?? [];
+  if (recent.length < 2) return candidates;
+
+  const lastTwo = recent.slice(-2);
+  if (lastTwo[0] !== lastTwo[1]) return candidates;
+
+  const overused = lastTwo[0];
+  return candidates.map((c) =>
+    c.grading_mode && c.grading_mode !== overused ? { ...c, priority: c.priority + 0.3 } : c,
+  );
 }
 
 /**

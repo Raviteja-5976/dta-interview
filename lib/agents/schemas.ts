@@ -494,6 +494,21 @@ export const gradingSchema = z.object({
   }),
   observations: z.array(z.string().max(300)).max(6),
   one_thing_to_change: z.string().max(300),
+  /**
+   * Coding mode inputs for S1 §9.5. Null for every other grading mode.
+   *
+   * `test_pass_rate` is deliberately NOT here: it comes from a sandbox run, never
+   * from a model's opinion about whether the code works (agentdesign §9.5). These
+   * are the three judgements a test runner cannot make.
+   */
+  coding: z.object({
+    /** How close the solution is to the challenge's stated target complexity. */
+    complexity_match: confidence,
+    /** Naming, structure, edge-case handling. Not style preferences. */
+    code_quality: confidence,
+    /** Whether they explained the approach as they worked, not just typed. */
+    verbal_reasoning: confidence,
+  }).nullable(),
 });
 export type Grading = z.infer<typeof gradingSchema>;
 
@@ -578,3 +593,53 @@ export const resumeSuggestionsSchema = z.object({
   projected_ats_gain: z.number().int().min(0).max(40),
 });
 export type ResumeSuggestions = z.infer<typeof resumeSuggestionsSchema>;
+
+// ── L3v · Live evidence verification ─────────────────────────────────────────
+
+/**
+ * One judgement per outstanding evidence item, for the answer just given.
+ *
+ * Deliberately tiny. This runs inside a live turn against the cheapest model
+ * with no reasoning, so the output has to be something a fast model produces
+ * reliably: a bounded list of ids it was handed, each with a number and a quote.
+ * It is never asked to invent an evidence id, only to rule on the ones given.
+ */
+export const evidenceVerdictSchema = z.object({
+  v: z.literal(2),
+  verdicts: z.array(
+    z.object({
+      evidence_id: z.string(),
+      /** Confidence the answer ESTABLISHES this, not that it mentioned it. */
+      confidence: confidence,
+      /** The words that establish it, quoted from the answer. Null when nothing does. */
+      span: z.string().nullable(),
+    }),
+  ).max(8),
+});
+export type EvidenceVerdicts = z.infer<typeof evidenceVerdictSchema>;
+
+// ── L6 · Answering the candidate's own question ──────────────────────────────
+
+/**
+ * What the interviewer says back when the CANDIDATE asks something.
+ *
+ * Near the end of an interview the candidate is invited to ask questions, and
+ * ignoring what they ask is both rude and a lost signal — what someone asks
+ * about a role tells you what they care about. This is the only place in the
+ * system where the interviewer supplies information rather than eliciting it,
+ * so it is also the only place that can invent a fact about the company. Hence
+ * `grounded`: it records whether the answer came from the material or from
+ * nowhere, and an ungrounded answer says so out loud instead of guessing.
+ */
+export const candidateQuestionAnswerSchema = z.object({
+  v: z.literal(2),
+  /** False when the candidate did not actually ask anything. */
+  is_question: z.boolean(),
+  /** What they wanted to know, in one line. Empty when is_question is false. */
+  question_summary: z.string().max(200),
+  /** The spoken reply. Empty when is_question is false. */
+  answer: z.string().max(700),
+  /** True only when the answer is supported by the JD or company material given. */
+  grounded: z.boolean(),
+});
+export type CandidateQuestionAnswer = z.infer<typeof candidateQuestionAnswerSchema>;

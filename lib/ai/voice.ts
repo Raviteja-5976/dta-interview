@@ -18,7 +18,7 @@
  * scoring across the whole product rather than raising an error.
  */
 
-import { transcribe, generateSpeech } from 'ai';
+import { transcribe, generateSpeech, NoTranscriptGeneratedError } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 
@@ -88,18 +88,49 @@ export async function transcribeAnswer(
   const spec = VOICE_CATALOG[providerId].stt;
   const started = Date.now();
 
-  const result = await transcribe({
-    model: voiceModelsFor(providerId).transcription(),
-    audio: audio instanceof ArrayBuffer ? new Uint8Array(audio) : audio,
-    providerOptions: {
-      openai: {
-        // The line that makes E2 possible. Only honoured by whisper-1.
-        timestampGranularities: ['word'],
-        // ISO-639-1 only; "en-IN" would be rejected.
-        language: opts.language?.split('-')[0],
+  let result;
+  try {
+    result = await transcribe({
+      model: voiceModelsFor(providerId).transcription(),
+      audio: audio instanceof ArrayBuffer ? new Uint8Array(audio) : audio,
+      providerOptions: {
+        openai: {
+          // No `timestampGranularities`: that parameter is whisper-1 only and
+          // gpt-4o-mini-transcribe rejects it. Pace is computed from the
+          // client-measured speech window instead — see the STT note in catalog.ts.
+          //
+          // ISO-639-1 only; "en-IN" would be rejected.
+          language: opts.language?.split('-')[0],
+        },
       },
-    },
-  });
+    });
+  } catch (err) {
+    /*
+     * Whisper returns nothing when the clip has no speech in it, and the SDK
+     * turns that into NoTranscriptGeneratedError. That is not a failure —
+     * "silence is not an error state" (sitemap-workflow.md §9). A candidate who
+     * paused, coughed, or had their mic muted should get the interviewer
+     * gently following up, not a 500 that kills the turn.
+     *
+     * Returning an empty transcript is the honest representation: L3 finds no
+     * evidence, marks the answer weak, and R9 boosts REASSURE_AND_RETRY.
+     */
+    if (NoTranscriptGeneratedError.isInstance(err)) {
+      recordAgentRun({
+        agent: 'L2',
+        phase: 'live',
+        provider: providerId === 'openai' ? 'openai' : 'google',
+        model: spec.id,
+        latencyMs: Date.now() - started,
+        ok: true,
+        context: opts.context,
+        meta: { step: 'stt', empty: true },
+      });
+
+      return { text: '', words: [], durationSec: 0, hasWordTimings: false };
+    }
+    throw err;
+  }
 
   const words = toWordTimings(result.segments);
   const durationSec = result.segments.at(-1)?.endSecond ?? 0;

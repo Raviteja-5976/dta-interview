@@ -1,0 +1,63 @@
+# AWS Amplify Hosting build spec.
+#
+# This is Amplify's auto-generated spec plus one thing it cannot know to add.
+# The npm cache flags and cache paths below are exactly as Amplify generated them.
+#
+# ── The one addition, and why ────────────────────────────────────────────────
+# Amplify makes Console environment variables available to the BUILD, but not to
+# the Next.js server runtime. From the AWS docs:
+#
+#   "a Next.js server component doesn't have access to those environment
+#    variables by default. This behavior is intentional to protect any secrets
+#    stored in environment variables that your application uses during the
+#    build phase."
+#
+# Everything server-side in this app reads process.env at request time inside a
+# route handler — the AI provider keys in lib/ai/registry.ts, the service-role
+# key in lib/supabase/admin.ts, the Razorpay secrets in lib/payments/razorpay.ts.
+# Without the step below they are all undefined in production, and every one of
+# those routes returns 503. Payments is simply the first place you notice.
+#
+# NEXT_PUBLIC_* does NOT need this to reach the browser — Next inlines those at
+# build time. They are included anyway because server code reads some of them
+# too (the Supabase URL, for one).
+#
+# ── Security note ────────────────────────────────────────────────────────────
+# AWS is explicit that anything written this way is readable by anyone with
+# access to the deployment artifacts. It is their documented approach and it is
+# fine for a single-owner app. If this ever needs hardening, the answer is SSM
+# Parameter Store or an IAM role for the compute function — not a cleverer grep.
+#
+# ── Precedence ───────────────────────────────────────────────────────────────
+# An amplify.yml committed at the repo root overrides the build spec saved in
+# the Amplify Console. Edit this file, not the Console, from here on.
+
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci --cache .npm --prefer-offline
+    build:
+      commands:
+        # Anchored alternation rather than the AWS docs' substring `-e` matching,
+        # so a variable is captured because of its NAME and never because some
+        # unrelated value happens to contain the string.
+        #
+        # `|| true` matters: grep exits 1 when nothing matches, and Amplify runs
+        # build commands under `set -e`. Without it, simply not having (say)
+        # XAI_API_KEY set would fail the whole build with no useful message.
+        - env | grep -E '^(NEXT_PUBLIC_|SUPABASE_SERVICE_ROLE_KEY=|OPENAI_|GOOGLE_GENERATIVE_AI_|XAI_|RAZORPAY_|AI_|CODE_RUNNER=|JUDGE0_)' >> .env.production || true
+        # Fail the build loudly if the two that everything depends on are absent,
+        # rather than shipping a deploy whose every server route 503s.
+        - grep -q '^OPENAI_API_KEY=' .env.production || (echo "MISSING OPENAI_API_KEY in Amplify environment variables" && exit 1)
+        - grep -q '^SUPABASE_SERVICE_ROLE_KEY=' .env.production || (echo "MISSING SUPABASE_SERVICE_ROLE_KEY in Amplify environment variables" && exit 1)
+        - npm run build
+  artifacts:
+    baseDirectory: .next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - .next/cache/**/*
+      - .npm/**/*
