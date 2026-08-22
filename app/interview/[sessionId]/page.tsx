@@ -26,7 +26,7 @@ import { Mic, MicOff, PhoneOff } from 'lucide-react';
 import { Button, Card, Chip, ErrorCard, StageList } from '@/components/app/ui';
 import CodingMode, { type CodeDraft, type CodingChallengeView } from '@/components/app/CodingMode';
 import { SESSION_PREP_STAGES } from '@/lib/pipelines/prep-stages';
-import { startLiveTranscript, type LiveTranscriptHandle } from '@/lib/speech/live-transcript';
+import { openLiveStt, type LiveSttResult, type LiveSttSession } from '@/lib/speech/deepgram-live';
 import { supabase } from '@/lib/supabase/client';
 
 type Phase = 'loading' | 'preparing' | 'ready' | 'speaking' | 'listening' | 'thinking' | 'ended' | 'failed';
@@ -42,17 +42,28 @@ type Phase = 'loading' | 'preparing' | 'ready' | 'speaking' | 'listening' | 'thi
 const RESPONSE_GRACE_MS = 5_000;
 
 /**
- * End-of-utterance: silence for this long AFTER speech has started ends the
- * answer.
+ * End-of-utterance, FALLBACK ONLY: silence for this long after speech has
+ * started ends the answer.
  *
- * Deliberately generous. People pause mid-answer — to recall a detail, to
- * decide how to phrase something — and cutting in after a second and a half of
- * that reads as being interrupted, which is exactly what makes a voice agent
- * feel unnatural.
+ * Deepgram's `UtteranceEnd` is the primary signal now, and it is a better one
+ * for the reason §12 gives — an amplitude threshold cannot tell a candidate
+ * thinking mid-sentence from one who has finished, because both are quiet. This
+ * rule applies only when the live socket could not be opened.
+ *
+ * Deliberately generous either way. People pause mid-answer — to recall a
+ * detail, to decide how to phrase something — and cutting in after a second and
+ * a half of that reads as being interrupted, which is exactly what makes a
+ * voice agent feel unnatural.
  */
 const SILENCE_MS = 2_500;
 
-/** Below this RMS counts as silence. */
+/**
+ * Below this RMS counts as silence.
+ *
+ * Still read on every frame, because it drives the waveform and marks the
+ * speech window E2 measures pace against. It only decides the END of a turn on
+ * the fallback path.
+ */
 const SILENCE_THRESHOLD = 0.045;
 
 /** Never cut someone off before they have really started. */
@@ -78,6 +89,15 @@ interface RecordedAnswer {
   /** When speech actually began — not when the recorder did. */
   startedAt: number;
   endedAt: number;
+  /**
+   * What the live socket heard, when it was open.
+   *
+   * Present on the ordinary path, and it is the whole point of streaming: the
+   * transcript and its word timings are already here the moment the candidate
+   * stops talking. Null means the socket never opened and the clip has to go to
+   * the batch route instead.
+   */
+  live: LiveSttResult | null;
 }
 
 export default function LiveInterviewPage() {
@@ -109,8 +129,35 @@ export default function LiveInterviewPage() {
   /** Set once the interview is over, so nothing queued keeps running. */
   const aborted = useRef(false);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  /** The browser recogniser drawing interim text, while an answer is in flight. */
-  const liveTranscriptRef = useRef<LiveTranscriptHandle | null>(null);
+  /** The Deepgram socket, open only while an answer is in flight. */
+  const liveSttRef = useRef<LiveSttSession | null>(null);
+  /**
+   * A Deepgram token and the moment it stops working.
+   *
+   * Cached because minting one is a round trip to our server and then to
+   * Deepgram, and doing that between the question ending and the microphone
+   * opening would put it right inside the pause the candidate experiences as
+   * the interviewer waiting for them. One token covers several answers.
+   */
+  const voiceTokenRef = useRef<{ token: string; expiresAt: number } | null>(null);
+  /** Session language, for the STT socket. Read once the session loads. */
+  const languageRef = useRef<string>('en-IN');
+  /** Deepgram heard speech begin, in wall-clock terms. */
+  const dgSpeechStartedRef = useRef<number | null>(null);
+  /**
+   * Deepgram's end-of-utterance signal for the answer in flight.
+   *
+   * Set when Deepgram thinks they have finished and CLEARED again the moment
+   * another word arrives, because an end-of-utterance is only ever a guess.
+   * A latching flag here is a real bug rather than a cosmetic one: the grace
+   * window below suppresses the stop decision for the first few seconds, so a
+   * flag set during it survives to fire the instant the window expires — and
+   * cuts off a candidate who opened with "Um, okay —", thought for a moment,
+   * and is now mid-answer.
+   */
+  const dgUtteranceEndedRef = useRef(false);
+  /** The socket died mid-answer; fall back to the amplitude rule. */
+  const dgFailedRef = useRef(false);
   /** The question currently on screen, so /reflect knows what it is reading. */
   const lastQuestionIdRef = useRef<string | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -200,7 +247,7 @@ export default function LiveInterviewPage() {
   const loadSession = useCallback(async () => {
     const { data } = await supabase
       .from('sessions')
-      .select('id, status')
+      .select('id, status, config')
       .eq('id', sessionId)
       .maybeSingle();
 
@@ -209,6 +256,11 @@ export default function LiveInterviewPage() {
       setPhase('failed');
       return;
     }
+
+    // The STT socket needs this, and it is opened from a callback that cannot
+    // wait on a query.
+    const config = data.config as { language?: string } | null;
+    if (config?.language) languageRef.current = config.language;
 
     if (data.status === 'complete') {
       router.replace(`/sessions/${sessionId}/report`);
@@ -290,28 +342,96 @@ export default function LiveInterviewPage() {
   }, []);
 
   /**
-   * Records one answer.
+   * A Deepgram token, minted on demand and reused until it is nearly expired.
    *
-   * The rule that matters: trailing silence only ends the turn once the
-   * candidate has ACTUALLY SPOKEN. Stopping on silence unconditionally meant
-   * anyone who paused to think for three seconds had their turn submitted as an
-   * empty clip — which is where "we didn't catch that" came from. Thinking
-   * before answering is normal interview behaviour, not the end of an answer.
-   *
-   * Returns the clip plus the speech window, which is what E2 needs for pace now
-   * that the transcript carries no per-word timing.
+   * Returns null on any failure, which is not fatal: the answer is recorded and
+   * transcribed in batch instead. Invariant 12 — degrade texture, never
+   * terminate.
    */
-  const recordAnswer = useCallback((): Promise<RecordedAnswer | null> => {
-    return new Promise((resolve) => {
-      const stream = streamRef.current;
-      const analyser = analyserRef.current;
+  const voiceToken = useCallback(async (): Promise<string | null> => {
+    const cached = voiceTokenRef.current;
+    // Thirty seconds of headroom, so a token cannot expire between this check
+    // and the socket handshake that uses it.
+    if (cached && cached.expiresAt - Date.now() > 30_000) return cached.token;
 
-      // A stopped track cannot be recorded: MediaRecorder.start() throws
-      // NotSupportedError rather than failing gracefully. This happens when the
-      // interview ended while the loop was mid-flight.
-      const live = stream?.getAudioTracks().some((t) => t.readyState === 'live');
-      if (!stream || !analyser || !live) return resolve(null);
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/voice-token`, { method: 'POST' });
+      if (!res.ok) return null;
 
+      const body = (await res.json()) as { accessToken?: string; expiresIn?: number };
+      if (!body.accessToken) return null;
+
+      voiceTokenRef.current = {
+        token: body.accessToken,
+        expiresAt: Date.now() + (body.expiresIn ?? 300) * 1000,
+      };
+      return body.accessToken;
+    } catch {
+      return null;
+    }
+  }, [sessionId]);
+
+  /**
+   * Records one answer, streaming it to Deepgram as it is spoken.
+   *
+   * ── What ends the turn ───────────────────────────────────────────────────
+   * Deepgram's `UtteranceEnd`, which is derived from gaps between recognised
+   * WORDS. This used to be an RMS threshold over the microphone, and the
+   * difference is the one §12 calls the primary risk of a cascaded voice stack:
+   * an energy threshold cannot tell a candidate thinking mid-sentence from one
+   * who has finished, because both are quiet. A pause with breathing, keyboard
+   * noise, or a trailing "um" in it is not silence to Deepgram.
+   *
+   * The floors below still apply on top, because they encode interview manners
+   * rather than acoustics — the grace window before any stop decision is taken,
+   * the minimum answer length, and the point at which we hand back so the
+   * interviewer can prompt someone who has not spoken at all.
+   *
+   * The RMS reading stays, but only to drive the waveform. When the socket
+   * cannot be opened it becomes the end-of-turn signal again, exactly as before.
+   */
+  const recordAnswer = useCallback(async (): Promise<RecordedAnswer | null> => {
+    const stream = streamRef.current;
+    const analyser = analyserRef.current;
+
+    // A stopped track cannot be recorded: MediaRecorder.start() throws
+    // NotSupportedError rather than failing gracefully. This happens when the
+    // interview ended while the loop was mid-flight.
+    const trackLive = stream?.getAudioTracks().some((t) => t.readyState === 'live');
+    if (!stream || !analyser || !trackLive) return null;
+
+    const token = await voiceToken();
+    const stt = token
+      ? await openLiveStt({
+          token,
+          language: languageRef.current,
+          onInterim: setPartial,
+          // Deepgram heard speech begin. More reliable than the amplitude
+          // threshold, which also trips on a door closing.
+          onSpeechStarted: () => {
+            dgSpeechStartedRef.current ??= Date.now();
+          },
+          onUtteranceEnd: () => {
+            dgUtteranceEndedRef.current = true;
+          },
+          // They are still talking, so any pending end-of-utterance was a
+          // guess that has just been proven wrong. See the note on the flag.
+          onSpeech: () => {
+            dgUtteranceEndedRef.current = false;
+          },
+          onFailure: () => {
+            // Fall back to the RMS rule for the remainder of this answer.
+            dgFailedRef.current = true;
+          },
+        })
+      : null;
+
+    liveSttRef.current = stt;
+    dgSpeechStartedRef.current = null;
+    dgUtteranceEndedRef.current = false;
+    dgFailedRef.current = false;
+
+    const recorded = await new Promise<Omit<RecordedAnswer, 'live'> | null>((resolve) => {
       let recorder: MediaRecorder;
       try {
         recorder = new MediaRecorder(stream);
@@ -323,25 +443,26 @@ export default function LiveInterviewPage() {
       recorderRef.current = recorder;
       answerStartRef.current = Date.now();
 
-      /*
-       * Interim text, drawn as they talk. Local to the browser and never graded
-       * — the clip still goes to the transcription model, and that transcript is
-       * what reaches the tracker and the report.
-       */
-      const liveText = startLiveTranscript({ onText: setPartial });
-      liveTranscriptRef.current = liveText;
-
       let speechStartedAt: number | null = null;
       let speechEndedAt: number | null = null;
       let silenceSince: number | null = null;
 
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
+        if (e.data.size === 0) return;
+        /*
+         * Both destinations, every chunk.
+         *
+         * The socket is the fast path and the clip is the insurance: if the
+         * socket dies halfway through an answer, the recording is complete and
+         * the batch route can still recover what was said. Keeping the blob
+         * costs memory for the length of one answer and nothing else.
+         */
+        chunksRef.current.push(e.data);
+        stt?.sendAudio(e.data);
       };
+
       recorder.onstop = () => {
         if (rafRef.current) cancelAnimationFrame(rafRef.current);
-        liveText?.stop();
-        liveTranscriptRef.current = null;
         setAmplitude(0);
 
         if (speechStartedAt === null) return resolve(null); // nothing was said
@@ -354,6 +475,8 @@ export default function LiveInterviewPage() {
       };
 
       try {
+        // 250ms slices. Small enough that Deepgram is transcribing continuously
+        // rather than in visible jumps, large enough not to flood the socket.
         recorder.start(250);
       } catch {
         return resolve(null);
@@ -373,34 +496,57 @@ export default function LiveInterviewPage() {
         const now = Date.now();
         const speaking = rms >= SILENCE_THRESHOLD;
         const sinceQuestion = now - answerStartRef.current;
+        const streaming = Boolean(stt) && !dgFailedRef.current;
 
+        // The speech window E2 uses for pace. Tracked from the microphone
+        // either way — Deepgram's word times are relative to the socket, and
+        // this is the clock the rest of the turn is measured on.
         if (speaking) {
           speechStartedAt ??= now;
           speechEndedAt = now;
           silenceSince = null;
         } else {
           silenceSince ??= now;
+        }
 
-          // The grace floor. No stop decision at all until it has passed, so a
-          // candidate who takes a moment to gather their thoughts is never cut
-          // off before they have begun.
-          if (sinceQuestion < RESPONSE_GRACE_MS) {
-            rafRef.current = requestAnimationFrame(tick);
-            return;
-          }
+        // Deepgram may have heard speech the amplitude threshold missed —
+        // someone softly spoken, or a distant microphone.
+        if (streaming && dgSpeechStartedRef.current !== null) {
+          speechStartedAt ??= dgSpeechStartedRef.current;
+        }
 
-          if (speechStartedAt !== null) {
-            // They spoke and have now stopped — end the turn.
-            if (now - silenceSince > SILENCE_MS && now - speechStartedAt > MIN_ANSWER_MS) {
-              recorder.stop();
-              return;
-            }
-          } else if (sinceQuestion > WAIT_FOR_SPEECH_MS) {
-            // Still nothing. Hand back so the interviewer can prompt, rather
-            // than posting silence to the transcriber.
+        // The grace floor. No stop decision of any kind before it elapses, so a
+        // candidate who takes a moment to gather their thoughts is never cut off
+        // before they have begun.
+        if (sinceQuestion < RESPONSE_GRACE_MS) {
+          rafRef.current = requestAnimationFrame(tick);
+          return;
+        }
+
+        if (speechStartedAt !== null) {
+          const longEnough = now - speechStartedAt > MIN_ANSWER_MS;
+
+          // Primary: Deepgram says the utterance ended.
+          if (streaming && dgUtteranceEndedRef.current && longEnough) {
             recorder.stop();
             return;
           }
+
+          // Fallback: the old amplitude rule, for when the socket is not there.
+          if (
+            !streaming &&
+            silenceSince !== null &&
+            now - silenceSince > SILENCE_MS &&
+            longEnough
+          ) {
+            recorder.stop();
+            return;
+          }
+        } else if (sinceQuestion > WAIT_FOR_SPEECH_MS) {
+          // Still nothing. Hand back so the interviewer can prompt, rather than
+          // posting silence to the transcriber.
+          recorder.stop();
+          return;
         }
 
         rafRef.current = requestAnimationFrame(tick);
@@ -408,7 +554,23 @@ export default function LiveInterviewPage() {
 
       rafRef.current = requestAnimationFrame(tick);
     });
-  }, []);
+
+    /*
+     * Close the socket even when nothing was recorded — an abandoned answer
+     * still leaves an open WebSocket, and a session's worth of those is a leak
+     * the candidate pays for in dropped connections later.
+     */
+    if (!recorded) {
+      stt?.abort();
+      liveSttRef.current = null;
+      return null;
+    }
+
+    const live = stt ? await stt.finish() : null;
+    liveSttRef.current = null;
+
+    return { ...recorded, live: live?.transcript ? live : null };
+  }, [voiceToken]);
 
   /**
    * Plays one clip, driving the waveform from its real amplitude.
@@ -630,42 +792,68 @@ export default function LiveInterviewPage() {
 
     setPhase('thinking');
 
-    const form = new FormData();
-    form.set('audio', new File([recorded.blob], 'answer.webm', { type: 'audio/webm' }));
+    /*
+     * ── The ordinary path costs nothing ──────────────────────────────────────
+     *
+     * The socket transcribed the answer while it was being spoken, so there is
+     * no transcription step here at all — no upload, no round trip, no model
+     * call. The whole of what used to sit in the silence after an answer is
+     * already done by the time the candidate stops talking.
+     *
+     * The word timings arrive with it, from the same pass (invariant 16), which
+     * is what gives E2 back its pause profile.
+     */
+    let transcript = recorded.live?.transcript ?? '';
+    let words = recorded.live?.words ?? [];
+    let asrConfidence = recorded.live?.confidenceAvg;
 
-    const res = await fetch(`/api/sessions/${sessionId}/transcribe`, { method: 'POST', body: form });
-    const stt = await res.json();
+    if (!transcript) {
+      // The socket never opened, or closed with nothing. The clip is still in
+      // hand, so the answer is recovered rather than lost.
+      const form = new FormData();
+      form.set('audio', new File([recorded.blob], 'answer.webm', { type: 'audio/webm' }));
 
-    if (!res.ok) {
-      setError(stt.error ?? 'We could not hear that clearly.');
-      setPhase('failed');
-      return null;
+      const res = await fetch(`/api/sessions/${sessionId}/transcribe`, { method: 'POST', body: form });
+      const stt = await res.json();
+
+      if (!res.ok) {
+        setError(stt.error ?? 'We could not hear that clearly.');
+        setPhase('failed');
+        return null;
+      }
+
+      transcript = stt.transcript ?? '';
+      words = stt.words ?? [];
+      asrConfidence = undefined;
     }
 
     // The authoritative transcript replaces the interim one — unless it came
-    // back empty, in which case whatever the browser heard is better than
-    // telling someone who just spoke that we caught nothing.
-    setPartial((live) =>
-      stt.transcript?.trim() ? stt.transcript : live.trim() || "(we didn't catch that)",
-    );
+    // back empty, in which case whatever was heard live is better than telling
+    // someone who just spoke that we caught nothing.
+    setPartial((live) => transcript.trim() || live.trim() || "(we didn't catch that)");
 
     /*
      * The speech window comes from the CLIENT, measured between the first and
-     * last moment the microphone was above the silence threshold. The
-     * transcriber no longer returns per-word timing, and this is a truer answer
-     * duration anyway: it excludes the thinking pause before the candidate
-     * started, which would otherwise drag their words-per-minute down for
-     * having considered the question.
+     * last moment the microphone was above the silence threshold.
+     *
+     * Kept even now that word timings are back, because it is the truer answer
+     * duration: it excludes the thinking pause before the candidate started,
+     * which would otherwise drag their words-per-minute down for having
+     * considered the question. The word timings serve a different purpose —
+     * the gaps BETWEEN words, which is the pause profile.
      */
     const speechMs = Math.max(0, recorded.endedAt - recorded.startedAt);
     const base = startedAt.current ?? recorded.startedAt;
 
     return {
-      transcript: stt.transcript,
+      transcript,
       durationSec: speechMs / 1000,
-      wordCount: stt.wordCount,
+      wordCount: words.length || transcript.split(/\s+/).filter(Boolean).length,
       startMs: recorded.startedAt - base,
       endMs: recorded.endedAt - base,
+      asrConfidence,
+      // Uploaded to Storage by /turn and read once by E2 at evaluation time.
+      words,
     };
   }, [sessionId, recordAnswer]);
 
@@ -789,8 +977,10 @@ export default function LiveInterviewPage() {
     // Release a loop parked on the coding promise, or it never returns.
     codingDoneRef.current?.(null as unknown as CodingSummary);
     stopPlaybackRef.current?.();
-    liveTranscriptRef.current?.stop();
-    liveTranscriptRef.current = null;
+    // Dropped, not drained: the interview is over, so there is no answer left
+    // to recover and nothing to wait for the trailing finals on.
+    liveSttRef.current?.abort();
+    liveSttRef.current = null;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
 
     try {

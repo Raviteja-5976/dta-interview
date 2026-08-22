@@ -8,12 +8,19 @@
  */
 
 import type { AgentId, AgentPhase, ProviderId, RunContext } from './types';
+import type { VoiceProviderId } from './catalog';
 import { hasServiceRole } from '../supabase/admin';
 
 export interface AgentRunRecord {
   agent: AgentId;
   phase: AgentPhase;
-  provider: ProviderId;
+  /**
+   * Language-model providers and the voice provider share this column. They are
+   * separate routing decisions (voice does not follow AI_PROVIDER — see
+   * lib/ai/voice.ts) but one cost ledger, because "what did this interview
+   * cost" has to be answerable in a single query.
+   */
+  provider: ProviderId | VoiceProviderId;
   model: string;
   latencyMs: number;
   inputTokens?: number;

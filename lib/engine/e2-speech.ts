@@ -95,15 +95,22 @@ export interface SpeechMetrics {
 /**
  * Metrics from a transcript plus the speech window, with no per-word timing.
  *
- * This is the path the live pipeline takes now: gpt-4o-mini-transcribe returns
- * text, and the client measures when speech started and stopped from the
- * microphone's own amplitude. That window is arguably a better answer duration
- * than a transcript-derived one — it excludes the thinking pause before the
- * candidate began, which would otherwise drag their pace down for having
- * considered the question.
+ * ── The DEGRADED path, not the ordinary one ─────────────────────────────────
+ * Deepgram's nova-3 returns per-word timing on the live socket, so a normal
+ * answer reaches `computeSpeechMetrics` above with the full metric set. This
+ * function is what runs when an answer arrived without it — a session recorded
+ * before the move to Deepgram, or one where the live socket never opened and
+ * the word array is missing from Storage.
  *
- * What genuinely cannot be recovered without inter-word gaps: the pause profile,
- * and articulation rate as distinct from gross rate. Those are returned as null
+ * It works from the speech window the client measured off the microphone's own
+ * amplitude. That window is arguably a better answer DURATION than a
+ * transcript-derived one — it excludes the thinking pause before the candidate
+ * began, which would otherwise drag their pace down for having considered the
+ * question — which is why it is still measured and still used for pace even on
+ * the good path.
+ *
+ * What cannot be recovered without inter-word gaps: the pause profile, and
+ * articulation rate as distinct from gross rate. Those are returned as null
  * rather than approximated, and S1 renormalises the fluency weights over
  * whatever is actually present.
  */

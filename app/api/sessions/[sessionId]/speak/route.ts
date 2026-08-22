@@ -21,8 +21,14 @@
 import type { NextRequest } from 'next/server';
 
 import { createSupabaseServerClient, requireUser } from '@/lib/supabase/server';
-import { VOICE_CATALOG, ttsCostUsd } from '@/lib/ai/catalog';
-import { prosodyToInstructions, resolveVoiceProvider } from '@/lib/ai/voice';
+import { ttsCostUsd } from '@/lib/ai/catalog';
+import {
+  DEEPGRAM_TTS_MODEL,
+  isDeepgramConfigured,
+  openSpeechStream,
+  voiceForPersona,
+} from '@/lib/ai/deepgram';
+import { prosodyToInstructions } from '@/lib/ai/voice';
 import { recordAgentRun } from '@/lib/ai/telemetry';
 import { failure, handleRouteError, notFound } from '@/lib/api/respond';
 
@@ -54,15 +60,20 @@ export async function GET(request: NextRequest, ctx: RouteContext<'/api/sessions
 
     if (!session) return notFound();
 
-    const provider = resolveVoiceProvider();
-    if (provider !== 'openai') {
-      return failure(501, 'Streaming speech is only wired up for OpenAI right now.');
-    }
-
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return failure(503, 'Speech is not configured.');
+    if (!isDeepgramConfigured()) return failure(503, 'Speech is not configured.');
 
     const params = request.nextUrl.searchParams;
+
+    /*
+     * The voice is chosen from the persona, and it is the ONLY delivery control
+     * Aura exposes.
+     *
+     * L4's prosody still arrives on the query string and is still computed, but
+     * Deepgram takes no delivery direction, so `instructions` is logged rather
+     * than sent — see the note in lib/ai/voice.ts. Recording it keeps the turn
+     * replayable (invariant 14) and keeps the gap visible in `agent_runs`
+     * instead of it looking like L4 never had an opinion.
+     */
     const rate = Number(params.get('rate'));
     const instructions = prosodyToInstructions({
       emotion: params.get('emotion') ?? 'neutral',
@@ -70,31 +81,16 @@ export async function GET(request: NextRequest, ctx: RouteContext<'/api/sessions
       emphasis: params.get('emphasis')?.split('|').filter(Boolean) ?? [],
     });
 
+    const model = params.get('voice') || voiceForPersona(params.get('persona') ?? '');
+
     const started = Date.now();
 
     /*
-     * The raw endpoint rather than the SDK's generateSpeech, which resolves to a
-     * complete Uint8Array. Streaming is the entire point here — buffering the
-     * response would put us back where we started.
+     * The raw endpoint rather than a buffered helper. Streaming is the entire
+     * point here — resolving the whole MP3 first would put us back where we
+     * started, with the candidate listening to silence while a file is built.
      */
-    const upstream = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: VOICE_CATALOG.openai.tts.id,
-        input: text,
-        voice: params.get('voice') || 'alloy',
-        instructions,
-        response_format: 'mp3',
-        // `speed` and `instructions` fight each other on gpt-4o-mini-tts — the
-        // prose direction already carries pace, and sending both makes delivery
-        // lurch. Prosody rate reaches the model through the instruction.
-      }),
-      signal: AbortSignal.timeout(30_000),
-    });
+    const upstream = await openSpeechStream(text, { model, encoding: 'mp3' });
 
     if (!upstream.ok || !upstream.body) {
       console.error('[speak] upstream failed', upstream.status, (await upstream.text()).slice(0, 200));
@@ -106,13 +102,19 @@ export async function GET(request: NextRequest, ctx: RouteContext<'/api/sessions
     recordAgentRun({
       agent: 'L4',
       phase: 'live',
-      provider: 'openai',
-      model: VOICE_CATALOG.openai.tts.id,
+      provider: 'deepgram',
+      model: model || DEEPGRAM_TTS_MODEL,
       latencyMs: Date.now() - started,
-      costUsd: ttsCostUsd('openai', text.length),
+      costUsd: ttsCostUsd('deepgram', text.length),
       ok: true,
       context: { projectId: session.project_id, sessionId },
-      meta: { step: 'tts', characters: text.length, streamed: true },
+      meta: {
+        step: 'tts',
+        characters: text.length,
+        streamed: true,
+        // Recorded, not sent. See above.
+        prosody_intent: instructions,
+      },
     });
 
     return new Response(upstream.body, {

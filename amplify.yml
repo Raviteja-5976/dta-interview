@@ -47,11 +47,14 @@ frontend:
         # `|| true` matters: grep exits 1 when nothing matches, and Amplify runs
         # build commands under `set -e`. Without it, simply not having (say)
         # XAI_API_KEY set would fail the whole build with no useful message.
-        - env | grep -E '^(NEXT_PUBLIC_|SUPABASE_SERVICE_ROLE_KEY=|OPENAI_|GOOGLE_GENERATIVE_AI_|XAI_|RAZORPAY_|AI_|CODE_RUNNER=|JUDGE0_)' >> .env.production || true
-        # Fail the build loudly if the two that everything depends on are absent,
-        # rather than shipping a deploy whose every server route 503s.
+        - env | grep -E '^(NEXT_PUBLIC_|SUPABASE_SERVICE_ROLE_KEY=|OPENAI_|GOOGLE_GENERATIVE_AI_|XAI_|DEEPGRAM_|RAZORPAY_|AI_|CODE_RUNNER=|JUDGE0_)' >> .env.production || true
+        # Fail the build loudly if the three that everything depends on are
+        # absent, rather than shipping a deploy whose every server route 503s.
         - grep -q '^OPENAI_API_KEY=' .env.production || (echo "MISSING OPENAI_API_KEY in Amplify environment variables" && exit 1)
         - grep -q '^SUPABASE_SERVICE_ROLE_KEY=' .env.production || (echo "MISSING SUPABASE_SERVICE_ROLE_KEY in Amplify environment variables" && exit 1)
+        # Without this there is no voice at all: no transcription, no speech, and
+        # the interview screen cannot mint the token its STT socket connects with.
+        - grep -q '^DEEPGRAM_API_KEY=' .env.production || (echo "MISSING DEEPGRAM_API_KEY in Amplify environment variables" && exit 1)
         - npm run build
   artifacts:
     baseDirectory: .next

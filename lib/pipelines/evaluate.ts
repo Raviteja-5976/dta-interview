@@ -97,15 +97,19 @@ export async function runEvaluation(
       const words = wordsBySeq.get(q.seq);
 
       /*
-       * Two paths, because the transcriber no longer returns per-word timing.
+       * Two paths, and the first one is now the ordinary case again.
        *
-       * With words: the full metric set including the pause profile. Kept for
-       * sessions recorded under whisper-1, and for whenever a word-timing STT
-       * comes back.
+       * With words: the full metric set including the pause profile. Deepgram's
+       * nova-3 returns per-word timing from the live socket that transcribed
+       * the answer, so this is what a session recorded on the current stack
+       * lands on (invariant 16 — the timing comes from the live STT, not a
+       * second pass).
        *
        * Without: transcript plus the speech window the client measured from the
        * microphone. Pace, fillers and repetition are all real; pause metrics are
-       * reported as unavailable and S1 renormalises around them.
+       * reported as unavailable and S1 renormalises around them. This covers
+       * sessions recorded before the move to Deepgram, and answers where the
+       * live socket never opened.
        */
       metricsBySeq.set(
         q.seq,

@@ -1,13 +1,21 @@
 /**
- * POST /api/sessions/[sessionId]/transcribe — L5's speech-to-text leg.
+ * POST /api/sessions/[sessionId]/transcribe — L5's speech-to-text FALLBACK.
  *
- * Takes a recorded answer and returns the transcript WITH word-level timestamps.
- * Those timestamps are the entire basis of E2, so `hasWordTimings: false` in the
- * response is a real signal, not a detail — it means fluency for that answer
- * will be reported as unavailable rather than guessed at.
+ * The live socket (lib/speech/deepgram-live.ts) is the main road: it transcribes
+ * the answer while it is being spoken, so an ordinary turn reaches /turn with
+ * the transcript and its word timings already in hand and never touches this
+ * route at all.
  *
- * This is the batch endpoint. True streaming STT with semantic end-of-utterance
- * detection is the remaining piece of L5; see the note in the build summary.
+ * This is what happens when that socket could not be opened — no token, a
+ * blocked WebSocket, a network that dropped mid-answer. The browser still has
+ * the recorded clip, so the answer is recovered here instead of lost. Same
+ * model, same word timings; it just costs a second pass and its whole latency
+ * lands in the silence after the candidate stops talking, which is exactly what
+ * streaming exists to avoid.
+ *
+ * `hasWordTimings: false` in the response is a real signal, not a detail: it
+ * means E2 will report that answer's pause profile as unavailable rather than
+ * guessing at it.
  */
 
 import type { NextRequest } from 'next/server';
@@ -42,6 +50,9 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
     const config = session.config as { language?: string };
     const result = await transcribeAnswer(await audio.arrayBuffer(), {
       language: config.language ?? 'en-IN',
+      // The recorder's own container type, so Deepgram is not left guessing at
+      // a WebM/Opus stream it was told was something else.
+      mimeType: audio.type || 'audio/webm',
       context: { userId: session.user_id, projectId: session.project_id, sessionId },
     });
 

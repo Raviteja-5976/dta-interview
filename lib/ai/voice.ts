@@ -1,227 +1,108 @@
 /**
- * L5's voice layer — STT and TTS, behind the same provider abstraction as the
- * language models.
+ * L5's voice layer — the seam every caller goes through.
  *
- * ── The hard requirement ─────────────────────────────────────────────────────
- * The STT model MUST return WORD-level timestamps. E2's entire speech-metrics
- * layer — pace, pause profile, filler rate, repetition — is arithmetic over
- * per-word timing (agentdesign.md D7, and §12 lists "STT without word-level
- * timestamps" as a build-stopping risk).
- *
- * On OpenAI that means `whisper-1`, and only `whisper-1`: the newer transcription
- * models do not accept `timestamp_granularities`. See the note in catalog.ts.
+ * The implementation is Deepgram (lib/ai/deepgram.ts); this file is the shape
+ * the rest of the system sees, so a future provider change touches one file
+ * rather than five call sites.
  *
  * ── Why voice does not follow AI_PROVIDER ────────────────────────────────────
- * Language models and voice models switch independently. Voice stays on OpenAI
- * unless AI_VOICE_PROVIDER explicitly says otherwise, because the word-timestamp
- * guarantee is provider-specific and silently losing it would disable fluency
- * scoring across the whole product rather than raising an error.
+ * Language models are a routing choice — an agent declares a tier and the
+ * catalog resolves it, so the whole system moves on one env var. Voice is not,
+ * and deliberately so: it rests on a capability that is provider-specific and
+ * whose loss is silent rather than loud.
+ *
+ * The STT model MUST return WORD-level timestamps. E2's entire speech-metrics
+ * layer — pace, pause profile, filler rate, repetition — is arithmetic over
+ * per-word timing (D7, and §12 lists losing it as build-stopping). A provider
+ * without it does not fail; it quietly produces a report with the delivery
+ * panel dark. So there is one voice provider, it is named in the catalog, and
+ * GET /api/ai/status reports `wordTimestampsAvailable` so the property can be
+ * checked rather than assumed.
+ *
+ * ── Where the live path is ───────────────────────────────────────────────────
+ * NOT here. The streaming socket is opened by the BROWSER
+ * (lib/speech/deepgram-live.ts) against a short-lived token this app mints, so
+ * the audio and the transcript take one leg each instead of three. What remains
+ * in this file is the server-side work: P8's pre-synthesis, and the batch
+ * transcription fallback for when that socket could not be opened.
  */
 
-import { transcribe, generateSpeech, NoTranscriptGeneratedError } from 'ai';
-import { createOpenAI } from '@ai-sdk/openai';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
-
-import { PROVIDER_ENV_KEY, VOICE_CATALOG, sttCostUsd, ttsCostUsd, type VoiceProviderId } from './catalog';
-import { recordAgentRun } from './telemetry';
+import {
+  isDeepgramConfigured,
+  synthesizeUtterance as deepgramSynthesize,
+  transcribePrerecorded,
+  voiceForPersona as deepgramVoiceForPersona,
+  type SynthesisOutput,
+  type TranscriptionOutput,
+} from './deepgram';
+import { VOICE_CATALOG, VOICE_ENV_KEY, type VoiceProviderId } from './catalog';
 import type { RunContext } from './types';
-import type { WordTiming } from '../engine/types';
 
-export type { VoiceProviderId };
+export type { VoiceProviderId, SynthesisOutput, TranscriptionOutput };
 
 /**
- * Defaults to OpenAI regardless of AI_PROVIDER. Only an explicit
- * AI_VOICE_PROVIDER moves it.
+ * There is one, and it is not switchable by env var.
+ *
+ * Kept as a function rather than a constant because every caller already treats
+ * it as one, and because the day a second provider earns its place the
+ * signature should not have to change.
  */
 export function resolveVoiceProvider(): VoiceProviderId {
-  const explicit = process.env.AI_VOICE_PROVIDER;
-  if (explicit === 'openai' || explicit === 'google') return explicit;
-  return 'openai';
+  return 'deepgram';
 }
+
+export function voiceConfigured(): boolean {
+  return isDeepgramConfigured();
+}
+
+export { VOICE_ENV_KEY };
 
 /**
- * Not every provider exposes both model kinds — the SDK types them as optional.
- * Resolving them here means a provider that cannot do voice fails with a clear
- * message instead of `undefined is not a function` mid-interview.
+ * Batch transcription — the fallback path.
+ *
+ * The live socket normally transcribes an answer while it is being spoken, so
+ * reaching this means the browser could not hold a WebSocket. Same model and
+ * same word timings; it just costs a second pass and lands after the candidate
+ * has already stopped talking.
  */
-function voiceModelsFor(id: VoiceProviderId) {
-  const apiKey = process.env[PROVIDER_ENV_KEY[id]];
-  if (!apiKey) throw new Error(`Voice provider "${id}" needs ${PROVIDER_ENV_KEY[id]}.`);
-
-  const provider = id === 'openai' ? createOpenAI({ apiKey }) : createGoogleGenerativeAI({ apiKey });
-  const { stt, tts } = VOICE_CATALOG[id];
-
-  return {
-    transcription: () => {
-      if (!provider.transcriptionModel) {
-        throw new Error(`Voice provider "${id}" does not expose a transcription model.`);
-      }
-      return provider.transcriptionModel(stt.id);
-    },
-    speech: () => {
-      if (!provider.speechModel) {
-        throw new Error(`Voice provider "${id}" does not expose a speech model.`);
-      }
-      return provider.speechModel(tts.id);
-    },
-  };
-}
-
-// ── Speech to text ───────────────────────────────────────────────────────────
-
-export interface TranscriptionOutput {
-  text: string;
-  words: WordTiming[];
-  durationSec: number;
-  /**
-   * False when the provider returned only segment-level timing. E2 treats these
-   * answers as low-reliability rather than computing fluency from them.
-   */
-  hasWordTimings: boolean;
-}
-
 export async function transcribeAnswer(
   audio: Uint8Array | ArrayBuffer,
-  opts: { language?: string; context?: RunContext } = {},
+  opts: { language?: string; mimeType?: string; context?: RunContext } = {},
 ): Promise<TranscriptionOutput> {
-  const providerId = resolveVoiceProvider();
-  const spec = VOICE_CATALOG[providerId].stt;
-  const started = Date.now();
-
-  let result;
-  try {
-    result = await transcribe({
-      model: voiceModelsFor(providerId).transcription(),
-      audio: audio instanceof ArrayBuffer ? new Uint8Array(audio) : audio,
-      providerOptions: {
-        openai: {
-          // No `timestampGranularities`: that parameter is whisper-1 only and
-          // gpt-4o-mini-transcribe rejects it. Pace is computed from the
-          // client-measured speech window instead — see the STT note in catalog.ts.
-          //
-          // ISO-639-1 only; "en-IN" would be rejected.
-          language: opts.language?.split('-')[0],
-        },
-      },
-    });
-  } catch (err) {
-    /*
-     * Whisper returns nothing when the clip has no speech in it, and the SDK
-     * turns that into NoTranscriptGeneratedError. That is not a failure —
-     * "silence is not an error state" (sitemap-workflow.md §9). A candidate who
-     * paused, coughed, or had their mic muted should get the interviewer
-     * gently following up, not a 500 that kills the turn.
-     *
-     * Returning an empty transcript is the honest representation: L3 finds no
-     * evidence, marks the answer weak, and R9 boosts REASSURE_AND_RETRY.
-     */
-    if (NoTranscriptGeneratedError.isInstance(err)) {
-      recordAgentRun({
-        agent: 'L2',
-        phase: 'live',
-        provider: providerId === 'openai' ? 'openai' : 'google',
-        model: spec.id,
-        latencyMs: Date.now() - started,
-        ok: true,
-        context: opts.context,
-        meta: { step: 'stt', empty: true },
-      });
-
-      return { text: '', words: [], durationSec: 0, hasWordTimings: false };
-    }
-    throw err;
-  }
-
-  const words = toWordTimings(result.segments);
-  const durationSec = result.segments.at(-1)?.endSecond ?? 0;
-
-  // One segment per word is what word granularity looks like. If we got far
-  // fewer segments than words, the provider gave us sentence timing instead.
-  const expectedWords = result.text.trim().split(/\s+/).filter(Boolean).length;
-  const hasWordTimings =
-    Boolean(spec.wordTimestamps) && words.length > 0 && words.length >= expectedWords * 0.8;
-
-  recordAgentRun({
-    agent: 'L2', // L5 has no LLM of its own; voice spend is logged under the live phase.
-    phase: 'live',
-    provider: providerId === 'openai' ? 'openai' : 'google',
-    model: spec.id,
-    latencyMs: Date.now() - started,
-    audioSec: Math.round(durationSec * 100) / 100,
-    costUsd: sttCostUsd(providerId, durationSec),
-    ok: true,
-    context: opts.context,
-    meta: { step: 'stt', word_timings: hasWordTimings, words: words.length },
-  });
-
-  return { text: result.text, words, durationSec, hasWordTimings };
-}
-
-function toWordTimings(
-  segments: ReadonlyArray<{ text: string; startSecond: number; endSecond: number }>,
-): WordTiming[] {
-  return segments
-    .map((s) => ({
-      w: s.text.trim(),
-      s: Math.round(s.startSecond * 1000),
-      e: Math.round(s.endSecond * 1000),
-    }))
-    .filter((w) => w.w.length > 0);
-}
-
-// ── Text to speech ───────────────────────────────────────────────────────────
-
-export interface SynthesisOutput {
-  audio: Uint8Array;
-  mediaType: string;
-  durationSecEstimate: number;
-}
-
-export async function synthesizeUtterance(
-  text: string,
-  opts: { voice?: string; speed?: number; instructions?: string; context?: RunContext } = {},
-): Promise<SynthesisOutput> {
-  const providerId = resolveVoiceProvider();
-  const spec = VOICE_CATALOG[providerId].tts;
-  const started = Date.now();
-
-  const result = await generateSpeech({
-    model: voiceModelsFor(providerId).speech(),
-    text,
-    voice: opts.voice ?? 'alloy',
-    speed: opts.speed,
-    // Only sent when the model can act on it; on a model that ignores
-    // instructions this would be dead weight in the request.
-    providerOptions:
-      opts.instructions && spec.supportsInstructions
-        ? { openai: { instructions: opts.instructions } }
-        : undefined,
-  });
-
-  recordAgentRun({
-    agent: 'L4',
-    phase: 'live',
-    provider: providerId === 'openai' ? 'openai' : 'google',
-    model: spec.id,
-    latencyMs: Date.now() - started,
-    costUsd: ttsCostUsd(providerId, text.length),
-    ok: true,
-    context: opts.context,
-    meta: { step: 'tts', characters: text.length },
-  });
-
-  return {
-    audio: result.audio.uint8Array,
-    mediaType: result.audio.mediaType ?? 'audio/mpeg',
-    // ~2.6 words/second is a natural interviewer pace.
-    durationSecEstimate: Math.max(1, text.split(/\s+/).length / 2.6),
-  };
+  return transcribePrerecorded(audio, opts);
 }
 
 /**
- * Prosody rendered as a natural-language instruction. gpt-4o-mini-tts takes
- * delivery direction as prose, and L4 is the only component permitted to
- * originate it (invariant 4: the blueprint never emits an emotion tag).
+ * Buffered synthesis, for P8's pre-synthesis pass.
+ *
+ * Live turns do not come through here — they stream from
+ * /api/sessions/[id]/speak, which pipes Deepgram's response body straight to
+ * the audio element without buffering.
+ */
+export async function synthesizeUtterance(
+  text: string,
+  opts: { voice?: string; context?: RunContext } = {},
+): Promise<SynthesisOutput> {
+  return deepgramSynthesize(text, { model: opts.voice, context: opts.context });
+}
+
+/** Persona → the concrete Aura voice that speaks the interview. */
+export function voiceForPersona(persona: string): string {
+  return deepgramVoiceForPersona(persona);
+}
+
+/**
+ * Prosody rendered as a natural-language delivery direction.
+ *
+ * ── Currently inert, and kept on purpose ─────────────────────────────────────
+ * Aura accepts no delivery direction, so this string no longer reaches a
+ * synthesiser. It is still produced and still logged to `agent_runs`, for two
+ * reasons: L4's prosody decision remains inspectable, which is what invariant
+ * 14 (every turn replayable) is for; and the moment a TTS model that takes
+ * direction is wired in, the thing to send is already being computed.
+ *
+ * Invariant 4 is unaffected either way — the blueprint never emits an emotion
+ * tag, and L4 remains the only component permitted to originate one.
  */
 export function prosodyToInstructions(prosody: {
   emotion: string;
@@ -236,7 +117,13 @@ export function prosodyToInstructions(prosody: {
   return `Speak in a ${prosody.emotion} tone, ${pace}, as an interviewer talking to a candidate.${emphasis}`;
 }
 
-/** Whether the active voice provider can produce the timings E2 needs. */
+/**
+ * Whether the active voice provider can produce the timings E2 needs.
+ *
+ * True on Deepgram. Kept as a live check rather than hardcoded so the day the
+ * catalog changes, everything downstream of it changes with it instead of
+ * disagreeing with it.
+ */
 export function voiceSupportsWordTimings(): boolean {
   return Boolean(VOICE_CATALOG[resolveVoiceProvider()].stt.wordTimestamps);
 }

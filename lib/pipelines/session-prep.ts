@@ -27,7 +27,7 @@ import type {
   JdProfile,
   ResumeProfile,
 } from '../agents/schemas';
-import { synthesizeUtterance } from '../ai/voice';
+import { synthesizeUtterance, voiceForPersona } from '../ai/voice';
 import { ACKNOWLEDGEMENT_POOL } from '../engine/rules';
 import { seedCoverage } from '../engine/l3-evidence';
 import { emptyMemory } from '../engine/l2-memory-store';
@@ -351,19 +351,6 @@ async function presynthesizeVoice(
   }
 
   return index;
-}
-
-function voiceForPersona(persona: string): string {
-  switch (persona) {
-    case 'warm_professional':
-      return 'alloy';
-    case 'direct':
-      return 'onyx';
-    case 'friendly':
-      return 'nova';
-    default:
-      return 'alloy';
-  }
 }
 
 async function failSession(

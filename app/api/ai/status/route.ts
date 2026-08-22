@@ -8,8 +8,8 @@
 
 import { describeRouting } from '@/lib/ai/registry';
 import { AGENT_POLICY } from '@/lib/ai/config';
-import { CATALOG, PROVIDER_ENV_KEY, VOICE_CATALOG } from '@/lib/ai/catalog';
-import { resolveVoiceProvider } from '@/lib/ai/voice';
+import { CATALOG, VOICE_CATALOG, VOICE_ENV_KEY } from '@/lib/ai/catalog';
+import { resolveVoiceProvider, voiceConfigured } from '@/lib/ai/voice';
 import { checkCodeRunner } from '@/lib/execution/health';
 import { requireUser } from '@/lib/supabase/server';
 import { handleRouteError, ok } from '@/lib/api/respond';
@@ -54,16 +54,33 @@ export async function GET() {
 
       voice: {
         provider: voiceProvider,
-        configured: Boolean(process.env[PROVIDER_ENV_KEY[voiceProvider]]),
+        envKey: VOICE_ENV_KEY[voiceProvider],
+        configured: voiceConfigured(),
         stt: voice.stt,
         tts: voice.tts,
         /*
          * The single most important flag on this endpoint. If word timestamps are
-         * unavailable, E2 cannot compute pace, pauses, filler rate or repetition
-         * for ANY answer — fluency is reported as unavailable rather than wrong,
-         * but the whole delivery panel goes dark.
+         * unavailable, E2 cannot compute the pause profile for ANY answer — it is
+         * reported as unavailable rather than wrong, but that half of the delivery
+         * panel goes dark.
+         *
+         * True on Deepgram, which is most of why it is the voice provider.
          */
         wordTimestampsAvailable: Boolean(voice.stt.wordTimestamps),
+        /*
+         * Both legs stream. STT runs on a WebSocket the BROWSER holds, so the
+         * transcript arrives while the candidate is still talking; TTS streams
+         * its response body so the interviewer starts speaking on the first MP3
+         * frames rather than the last.
+         */
+        streaming: { stt: Boolean(voice.stt.streaming), tts: Boolean(voice.tts.streaming) },
+        /*
+         * Aura takes no delivery direction, so L4's prosody currently shapes
+         * only the WORDS, not how they sound. Surfaced rather than left to be
+         * discovered — a report that says the interviewer adapts its delivery
+         * should be checkable against whether it actually can.
+         */
+        prosodyDirectionSupported: Boolean(voice.tts.supportsInstructions),
       },
 
       /*

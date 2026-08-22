@@ -220,61 +220,63 @@ export interface VoiceModelSpec {
 }
 
 /**
- * ── The STT decision ─────────────────────────────────────────────────────────
- * gpt-4o-mini-transcribe. It is faster and cheaper than whisper-1, and it is
- * accurate on accented English, which matters for this user base.
+ * ── The voice decision ───────────────────────────────────────────────────────
+ * Deepgram, for both legs, and it does NOT follow AI_PROVIDER. The language
+ * models are a routing choice; this is not, because of one property nothing
+ * else on the list has.
  *
- * What it does NOT return is per-word timestamps — `timestamp_granularities` is
- * a whisper-1-only parameter. That is a deliberate trade, not an oversight:
+ * `nova-3` returns WORD-LEVEL TIMESTAMPS on the live streaming socket. D7 makes
+ * that a hard vendor requirement — E2's entire speech-metrics layer (pace,
+ * pause profile, filler rate, repetition) is arithmetic over per-word timing —
+ * and §12 lists losing it as build-stopping. The transcriber before this one
+ * did not return it, so the pause profile had been dark and pace was inferred
+ * from a speech window the browser measured off the microphone.
  *
- *   Kept:  words per minute, filler rate, repetition. All computable from the
- *          transcript plus the speech window the client measures locally, which
- *          is a truer answer duration anyway — it excludes the thinking pause
- *          before the candidate starts talking.
- *   Lost:  pause profile and articulation-rate-versus-gross-rate. Those need
- *          inter-word gaps and cannot be recovered from a flat transcript.
+ * It also arrives from the SAME pass that transcribes the answer, which is
+ * invariant 16 stated exactly: word timing comes from the live STT, never from
+ * a second transcription pass.
  *
- * `wordTimestamps: false` is what keeps that honest downstream: E2 reports the
- * pause metrics as unavailable rather than inventing them, and S1 renormalises
- * the fluency weights over the components it actually has.
+ * What the move cost is real and is recorded rather than hidden:
+ * `supportsInstructions: false`. gpt-4o-mini-tts took a prose delivery
+ * direction, which is how L4's prosody reached the audio. Aura exposes no
+ * equivalent — voice selection is the only delivery control it has — so D3's
+ * "slower when encouraging, brisker when confident" no longer reaches the
+ * speaker. L4's tone still shapes the WORDS, which is most of what a candidate
+ * perceives as warmth, but the delivery half of that decision is currently
+ * inert. See lib/ai/deepgram.ts.
  */
 type VoicePair = { stt: VoiceModelSpec; tts: VoiceModelSpec };
 
-const OPENAI_VOICE: VoicePair = {
+const DEEPGRAM_VOICE: VoicePair = {
   stt: {
-    id: 'gpt-4o-mini-transcribe',
-    pricePerMinute: 0.003,
-    // No per-word timing. E2 works from the transcript plus the client-measured
-    // speech window instead; see the note above.
-    wordTimestamps: false,
-    streaming: false,
+    id: 'nova-3',
+    pricePerMinute: 0.0077,
+    // The reason this provider was chosen. E2 gets its full metric set back.
+    wordTimestamps: true,
+    // Live WebSocket with speech-aware endpointing, so the transcript arrives
+    // while the candidate is still talking instead of after they stop.
+    streaming: true,
   },
   tts: {
-    // gpt-4o-mini-tts is the only TTS model that accepts `instructions`, which
-    // is how L4's prosody actually reaches the audio. tts-1 ignores it entirely,
-    // which would make the Dialogue Styler's delivery work decorative.
-    id: 'gpt-4o-mini-tts',
-    pricePer1MChars: 12.0,
-    supportsInstructions: true,
+    id: 'aura-2-thalia-en',
+    pricePer1MChars: 30.0,
+    // Aura takes no delivery direction. See the note above — this being false
+    // is what stops L4's prosody being shipped as a dead parameter.
+    supportsInstructions: false,
+    streaming: true,
   },
 };
 
-/**
- * Gemini's speech surface does not expose word-level timestamps, so switching
- * voice to Google trades E2's entire fluency layer for whatever else it buys.
- * `wordTimestamps: false` is what makes that trade visible instead of silent.
- */
-const GOOGLE_VOICE: VoicePair = {
-  stt: { id: 'gemini-3.6-flash', wordTimestamps: false, streaming: true },
-  tts: { id: 'gemini-3.1-flash-tts-preview', supportsInstructions: true },
-};
-
-export const VOICE_CATALOG: Record<'openai' | 'google', VoicePair> = {
-  openai: OPENAI_VOICE,
-  google: GOOGLE_VOICE,
+export const VOICE_CATALOG: Record<'deepgram', VoicePair> = {
+  deepgram: DEEPGRAM_VOICE,
 };
 
 export type VoiceProviderId = keyof typeof VOICE_CATALOG;
+
+/** Env var holding the voice provider's key. Separate from the model keys. */
+export const VOICE_ENV_KEY: Record<VoiceProviderId, string> = {
+  deepgram: 'DEEPGRAM_API_KEY',
+};
 
 /** STT cost for a stretch of audio. */
 export function sttCostUsd(provider: VoiceProviderId, seconds: number): number | undefined {
