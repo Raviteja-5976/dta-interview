@@ -19,6 +19,7 @@ import type { editor } from 'monaco-editor';
 import { Loader2 } from 'lucide-react';
 
 import type { LanguageId } from '@/lib/execution/types';
+import type { EditorLanguage as GeneratedLanguage } from '@/lib/agents/schemas';
 
 const LOCAL_VS = '/monaco/vs';
 
@@ -68,14 +69,56 @@ function EditorSkeleton() {
   );
 }
 
-/** Our LanguageId → Monaco's language id. They mostly agree; cpp is the exception. */
-const MONACO_LANGUAGE: Record<LanguageId, string> = {
+/**
+ * Everything the editor can open in.
+ *
+ * A superset of `LanguageId`, which is what the SANDBOX can run. The skill
+ * challenge has no sandbox, so it can ask for SQL against a schema on the page,
+ * Kotlin for an Android role, or a design written in markdown — none of which
+ * Judge0 would know what to do with, and none of which needs it to.
+ *
+ * `import type` so the client bundle gets the union and none of zod.
+ */
+export type EditorLanguage = LanguageId | GeneratedLanguage;
+
+/**
+ * Our language id → Monaco's.
+ *
+ * They mostly agree. A `Record` rather than a lookup with a fallback on
+ * purpose: adding a language to the schema enum without teaching the editor
+ * about it becomes a compile error here, instead of a candidate meeting a pane
+ * with no syntax highlighting in a round they paid for.
+ */
+const MONACO_LANGUAGE: Record<EditorLanguage, string> = {
   python: 'python',
   javascript: 'javascript',
   typescript: 'typescript',
   java: 'java',
   cpp: 'cpp',
   go: 'go',
+  csharp: 'csharp',
+  php: 'php',
+  ruby: 'ruby',
+  rust: 'rust',
+  kotlin: 'kotlin',
+  swift: 'swift',
+  dart: 'dart',
+  scala: 'scala',
+  r: 'r',
+  elixir: 'elixir',
+  solidity: 'sol',
+  lua: 'lua',
+  shell: 'shell',
+  powershell: 'powershell',
+  yaml: 'yaml',
+  hcl: 'hcl',
+  dockerfile: 'dockerfile',
+  html: 'html',
+  css: 'css',
+  xml: 'xml',
+  graphql: 'graphql',
+  sql: 'sql',
+  markdown: 'markdown',
 };
 
 const THEME = 'dta-interview';
@@ -117,7 +160,7 @@ export default function MonacoEditor({
   onChange,
   readOnly = false,
 }: {
-  language: LanguageId;
+  language: EditorLanguage;
   value: string;
   onChange: (next: string) => void;
   readOnly?: boolean;
@@ -154,6 +197,24 @@ export default function MonacoEditor({
     monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
       noSemanticValidation: true,
       noSyntaxValidation: false,
+    });
+
+    /*
+     * JSX has to be enabled explicitly, or a React skill challenge is a wall of
+     * red the moment the candidate types a tag.
+     *
+     * Syntax validation stays ON — it is the only feedback available in a round
+     * with no runner behind it — so the parser has to actually understand JSX
+     * rather than flagging every `<Component />` as an unexpected token.
+     */
+    const jsx = { jsx: monaco.languages.typescript.JsxEmit.React, allowJs: true, allowNonTsExtensions: true };
+    monaco.languages.typescript.typescriptDefaults.setCompilerOptions({
+      ...monaco.languages.typescript.typescriptDefaults.getCompilerOptions(),
+      ...jsx,
+    });
+    monaco.languages.typescript.javascriptDefaults.setCompilerOptions({
+      ...monaco.languages.typescript.javascriptDefaults.getCompilerOptions(),
+      ...jsx,
     });
 
     instance.focus();

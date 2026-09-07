@@ -34,6 +34,8 @@ export default function NewProjectPage() {
   const [companyName, setCompanyName] = useState('');
   const [roleTitle, setRoleTitle] = useState('');
   const [seniority, setSeniority] = useState('mid');
+  /** Optional — most people don't know it yet, and it can be set on the plan tab. */
+  const [interviewDate, setInterviewDate] = useState('');
 
   const canAdvance = [
     file !== null,
@@ -53,6 +55,7 @@ export default function NewProjectPage() {
     form.set('role_title', roleTitle);
     form.set('company_url', companyUrl);
     form.set('seniority', seniority);
+    form.set('interview_date', interviewDate);
 
     try {
       const res = await fetch('/api/projects', { method: 'POST', body: form });
@@ -244,6 +247,23 @@ export default function NewProjectPage() {
                     </button>
                   ))}
                 </div>
+              </Field>
+
+              {/* Optional, and said so. Someone who has not booked the interview
+                  yet must not feel they are filling the form in wrong — they
+                  can set it on the Prep plan tab the day they do book it. */}
+              <Field label="Interview date (optional)">
+                <input
+                  type="date"
+                  value={interviewDate}
+                  min={new Date().toISOString().slice(0, 10)}
+                  onChange={(e) => setInterviewDate(e.target.value)}
+                  className="w-full px-4 py-3 bg-[#F5EBE0] border-4 border-[#1B1F3B] rounded-2xl text-sm focus:outline-none focus:bg-white"
+                />
+                <span className="block mt-1.5 text-xs text-[#1B1F3B]/60">
+                  If you know it, we&apos;ll build a day-by-day preparation plan around it. You can
+                  add it later.
+                </span>
               </Field>
             </div>
           )}

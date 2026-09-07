@@ -54,7 +54,7 @@ export default function ProfilePage() {
   const [defaultDifficulty, setDefaultDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
   const [defaultDuration, setDefaultDuration] = useState(15);
   const [defaultCoding, setDefaultCoding] = useState(true);
-  const [defaultSystemDesign, setDefaultSystemDesign] = useState(false);
+  const [defaultSkillChallenge, setDefaultSkillChallenge] = useState(false);
 
   // Active Tab
   const [activeTab, setActiveTab] = useState<'details' | 'prefs' | 'credits'>('details');
@@ -86,7 +86,8 @@ export default function ProfilePage() {
           if (prefs.defaults.difficulty) setDefaultDifficulty(prefs.defaults.difficulty);
           if (prefs.defaults.duration_min) setDefaultDuration(prefs.defaults.duration_min);
           if (typeof prefs.defaults.coding === 'boolean') setDefaultCoding(prefs.defaults.coding);
-          if (typeof prefs.defaults.system_design === 'boolean') setDefaultSystemDesign(prefs.defaults.system_design);
+          if (typeof prefs.defaults.skill_challenge === 'boolean')
+            setDefaultSkillChallenge(prefs.defaults.skill_challenge);
         }
       } catch (err) {
         console.error('Error fetching profile:', err);
@@ -118,7 +119,7 @@ export default function ProfilePage() {
             difficulty: defaultDifficulty,
             duration_min: defaultDuration,
             coding: defaultCoding,
-            system_design: defaultSystemDesign,
+            skill_challenge: defaultSkillChallenge,
           },
         },
       });
@@ -526,13 +527,13 @@ export default function ProfilePage() {
 
                   <label className="flex items-center justify-between p-4 bg-[#FFF8F0] border-2 border-[#1B1F3B] rounded-2xl cursor-pointer hover:bg-[#F5EBE0] transition-colors shadow-[2px_2px_0_#1B1F3B]">
                     <div>
-                      <span className="font-bold text-sm text-[#1B1F3B] block">Enable System Design by default</span>
-                      <span className="text-xs text-[#1B1F3B]/60 font-medium">Architecture & trade-off prompts</span>
+                      <span className="font-bold text-sm text-[#1B1F3B] block">Enable the skill challenge by default</span>
+                      <span className="text-xs text-[#1B1F3B]/60 font-medium">A hands-on task in a technology the role needs</span>
                     </div>
                     <input
                       type="checkbox"
-                      checked={defaultSystemDesign}
-                      onChange={(e) => setDefaultSystemDesign(e.target.checked)}
+                      checked={defaultSkillChallenge}
+                      onChange={(e) => setDefaultSkillChallenge(e.target.checked)}
                       className="w-5 h-5 accent-[#FF6B35] rounded cursor-pointer"
                     />
                   </label>

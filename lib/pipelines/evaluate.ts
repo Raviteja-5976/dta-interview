@@ -15,7 +15,15 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { runGrading } from '../agents/e4-grading';
 import { runRewriteCoach } from '../agents/e5-rewrite';
 import { runReportComposer } from '../agents/e6-report';
-import type { Blueprint, Grading, SkillOutcome } from '../agents/schemas';
+import { runSkillValidation } from '../agents/sv-validate';
+import type { ChallengeSet } from '../agents/p7-challenge';
+import type {
+  Blueprint,
+  Grading,
+  SkillChallenge,
+  SkillOutcome,
+  SkillValidation,
+} from '../agents/schemas';
 import {
   computeSpeechMetrics,
   computeSpeechMetricsFromText,
@@ -26,7 +34,10 @@ import {
 import {
   aggregateSession,
   computeReadiness,
+  isGradeable,
   scoreQuestion,
+  skillRequirementCoverage,
+  type EvidenceRollup,
   type Readiness,
   type RubricSignal,
   type ScoredQuestion,
@@ -46,7 +57,9 @@ export async function runEvaluation(
 ): Promise<EvaluationResult> {
   const { data: session } = await supabase
     .from('sessions')
-    .select('id, user_id, project_id, seq, config, blueprint, live_state, media, started_at, credits_charged')
+    .select(
+      'id, user_id, project_id, seq, config, blueprint, live_state, media, started_at, credits_charged, skill_challenge',
+    )
     .eq('id', sessionId)
     .single();
 
@@ -73,9 +86,18 @@ export async function runEvaluation(
     await supabase.from('sessions').update({ status: 'processing' }).eq('id', sessionId);
 
     // ── E1 · Transcript assembly ─────────────────────────────────────────────
+    /*
+     * `skipped` is excluded, and that is not the same as having no transcript.
+     *
+     * A question the candidate answered with a question — "which Spark do you
+     * mean?" — carries a real transcript and is marked skipped by the turn,
+     * because what they said was a request for clarification and not an answer.
+     * Grading it would mark them down for a question they never got a clear
+     * version of, and the interviewer re-asked it properly on the next turn.
+     */
     const answered = state.questions.filter(
       (q): q is QuestionRecord & { answer: NonNullable<QuestionRecord['answer']> } =>
-        Boolean(q.answer?.transcript?.trim()),
+        q.status !== 'skipped' && Boolean(q.answer?.transcript?.trim()),
     );
 
     if (answered.length === 0) {
@@ -90,6 +112,22 @@ export async function runEvaluation(
 
     // Sandbox results, keyed to the question the submission was recorded against.
     const codingBySeq = mapCodingSubmissions(state, answered);
+
+    /*
+     * ── SV · Skill challenge review ──────────────────────────────────────────
+     *
+     * Started here, before E4, and awaited after it. Nothing in the two depends
+     * on the other, and SV is the slowest call in the pipeline — deep tier, high
+     * reasoning effort, up to three of them — so running it alongside ~15 E4
+     * calls costs no wall clock at all rather than adding half a minute to
+     * every evaluation that bought the module.
+     */
+    const skillReviewPromise = reviewSkillSubmissions(
+      state,
+      answered,
+      session.skill_challenge as ChallengeSet<SkillChallenge> | null,
+      context,
+    );
 
     // ── E2 · Speech metrics · deterministic, parallel-free ───────────────────
     const metricsBySeq = new Map<number, SpeechMetrics>();
@@ -145,10 +183,15 @@ export async function runEvaluation(
               ? resumeContext
               : undefined,
           codingContext: codingBySeq.get(q.seq),
+          skillContext: skillContextFor(q, state, answered),
         },
         context,
       ),
     );
+
+    // Collected now that the grading fan-out is done. Empty when the module was
+    // not bought, or when nothing was submitted.
+    const skillBySeq = await skillReviewPromise;
 
     // ── S1 · Scoring · deterministic ─────────────────────────────────────────
     const scored: ScoredQuestion[] = answered.map((q, i) => {
@@ -157,6 +200,19 @@ export async function runEvaluation(
       const signals = extractSignals(q);
 
       const submission = codingBySeq.get(q.seq);
+      const skillReview = skillBySeq.get(q.seq);
+
+      /*
+       * Requirement coverage is computed here, in code, from SV's per-
+       * requirement verdicts and P7's plan-time weights — the skill round's
+       * answer to the sandbox pass rate, and the reason two candidates who met
+       * the same requirements get the same number however differently they
+       * phrased their code.
+       *
+       * Null when SV returned no verdicts at all, which reads as "not scored"
+       * rather than as zero (§9.6).
+       */
+      const coverage = skillReview ? skillRequirementCoverage(skillReview.outcomes) : null;
 
       const scores = scoreQuestion({
         mode: q.grading_mode,
@@ -181,6 +237,24 @@ export async function runEvaluation(
                 verbalReasoning: grading.coding.verbal_reasoning,
               }
             : undefined,
+        /*
+         * Four inputs from three sources, and that split is the point: the
+         * coverage is arithmetic, correctness and quality are SV's reading of
+         * the artifact, and verbal reasoning is E4's reading of the transcript.
+         * No single model is asked to be the whole grader.
+         */
+        skill:
+          skillReview && coverage !== null
+            ? {
+                requirementCoverage: coverage,
+                correctness: skillReview.validation.correctness,
+                codeQuality: skillReview.validation.code_quality,
+                // E4 fills the `coding` block for skill answers too. Zero when
+                // it did not, which is the right reading: no evidence they
+                // talked through it.
+                verbalReasoning: grading.coding?.verbal_reasoning ?? 0,
+              }
+            : undefined,
       });
 
       return {
@@ -189,13 +263,33 @@ export async function runEvaluation(
         sectionId: q.section_id,
         weight: q.weight,
         scores,
-        // Ungraded and low-reliability questions are excluded from all
-        // denominators (§9.6) — never scored as zero.
-        excluded: signals.length === 0 && q.grading_mode === 'factual',
+        /*
+         * Ungraded questions are excluded from all denominators (§9.6) — never
+         * scored as zero.
+         *
+         * This used to test `factual` only, which left every experiential
+         * question without a rubric scoring a hard 0 and counting. Generated
+         * probes, memory callbacks and follow-up-bank entries all arrive with
+         * no rubric and all grade as experiential, so an interviewer that
+         * probed and called back well produced a WORSE report than one that
+         * read the bank straight through. `isGradeable` is the rule for every
+         * mode, in one place.
+         */
+        excluded: !isGradeable({
+          mode: q.grading_mode,
+          signals,
+          hasCodingResult: Boolean(submission),
+          hasSkillResult: coverage !== null,
+        }),
       };
     });
 
-    const sessionScores = aggregateSession(scored, state.coverage, blueprint);
+    const sessionScores = aggregateSession(scored, state.coverage, blueprint, {
+      mode: (session.config as { mode?: 'practice' | 'screening' }).mode ?? 'practice',
+      // Where each question actually came from, so the report can say whether
+      // its question scores are comparable to another session's.
+      origins: answered.map((q) => q.origin),
+    });
 
     // ── E5 · Rewrites · parallel ─────────────────────────────────────────────
     const rewrites = await mapWithConcurrency(answered, 4, async (q, i) =>
@@ -228,10 +322,29 @@ export async function runEvaluation(
         blueprint,
         roleTitle: project?.role_title ?? 'this role',
         companyName: project?.company_name ?? 'the company',
+        /*
+         * Every question the session recorded, not just the answered ones.
+         *
+         * The per-goal counts must reflect what was ASKED. Filtering to answered
+         * questions first would drop a question the candidate skipped or talked
+         * over and report its goal as never raised, which is a different — and
+         * much worse — statement to make about someone.
+         *
+         * `displayed_goal` is preferred over `goal_id` because it is what the
+         * candidate was actually shown beside the question, and on a handoff it
+         * is populated where `goal_id` is not.
+         */
+        askedGoalIds: state.questions
+          .map((q) => q.displayed_goal?.goal_id ?? q.goal_id)
+          .filter((id): id is string => Boolean(id)),
         questions: answered.map((q, i) => ({
           seq: q.seq,
           text: q.text,
           transcript: q.answer.transcript.slice(0, 1200),
+          // The goal this question was asked in service of, so the narrative
+          // can tie a weakness to what the question was reaching for rather
+          // than to its wording alone.
+          goal: q.displayed_goal?.statement,
           accuracy: scored[i].scores.primary,
           oneThingToChange: gradings[i].one_thing_to_change,
           covered: gradings[i].concept_coverage.filter((c) => c.status === 'covered').length,
@@ -258,6 +371,7 @@ export async function runEvaluation(
       rewrites,
       metrics: metricsBySeq,
       scored,
+      skillReviews: skillBySeq,
     });
 
     // ── Rollups ──────────────────────────────────────────────────────────────
@@ -267,7 +381,7 @@ export async function runEvaluation(
       sessionId,
     });
 
-    const skills = deriveSkillOutcomes(state, blueprint, scored);
+    const skills = deriveSkillOutcomes(state, blueprint, scored, sessionScores.evidence);
 
     const report = {
       ...narrative,
@@ -369,6 +483,170 @@ function mapCodingSubmissions(
   return out;
 }
 
+/**
+ * One skill submission, as recorded by the skill route.
+ *
+ * `challenge_index` is what joins it back to the task in
+ * `sessions.skill_challenge` — the submissions array is append-only and a
+ * candidate may submit the same task twice, so position in the array is not the
+ * index of the challenge.
+ */
+interface SkillSubmission {
+  challenge_index: number;
+  skill: string;
+  format: string;
+  language: string;
+  source: string;
+}
+
+function readSkillSubmissions(state: LiveState): SkillSubmission[] {
+  const raw = (state as unknown as { skill_submissions?: unknown[] }).skill_submissions;
+  if (!Array.isArray(raw)) return [];
+
+  return raw
+    .map((entry) => entry as Partial<SkillSubmission>)
+    .filter((s): s is SkillSubmission => typeof s.source === 'string' && s.source.trim().length > 0)
+    .map((s) => ({
+      challenge_index: typeof s.challenge_index === 'number' ? s.challenge_index : 0,
+      skill: s.skill ?? 'the required skill',
+      format: s.format ?? 'implement',
+      language: s.language ?? 'text',
+      source: s.source,
+    }));
+}
+
+/**
+ * The LAST submission for each challenge, in challenge order.
+ *
+ * Last, not first: the route appends rather than replaces, so a candidate who
+ * submitted, kept working and submitted again has two entries for one task and
+ * only the second is the answer they stood behind.
+ */
+function latestSkillSubmissions(state: LiveState): SkillSubmission[] {
+  const byIndex = new Map<number, SkillSubmission>();
+  for (const s of readSkillSubmissions(state)) byIndex.set(s.challenge_index, s);
+  return [...byIndex.entries()].sort((a, b) => a[0] - b[0]).map(([, s]) => s);
+}
+
+/**
+ * The submission a skill question is graded against, for E4's transcript read.
+ *
+ * Matched by position among skill-mode questions, the same join
+ * `mapCodingSubmissions` uses and for the same reason: the client sends a
+ * submission as the answer to whichever question was live when the editor
+ * opened.
+ */
+function skillContextFor(
+  question: QuestionRecord,
+  state: LiveState,
+  /**
+   * The graded set, NOT `state.questions`.
+   *
+   * `reviewSkillSubmissions` counts positions over the same list, and the two
+   * must agree: a skipped skill question would shift one basis and not the
+   * other, and E4 would then be shown a different submission than SV reviewed
+   * for the very same question.
+   */
+  answered: QuestionRecord[],
+): { skill: string; format: string; language: string; source: string } | undefined {
+  if (question.grading_mode !== 'skill') return undefined;
+  const submissions = latestSkillSubmissions(state);
+  if (submissions.length === 0) return undefined;
+
+  // Which skill question this is, counting from the first.
+  const skillQuestions = answered
+    .filter((q) => q.grading_mode === 'skill')
+    .sort((a, b) => a.seq - b.seq);
+  const position = skillQuestions.findIndex((q) => q.seq === question.seq);
+  const submission = submissions[position];
+  if (!submission) return undefined;
+
+  return {
+    skill: submission.skill,
+    format: submission.format,
+    language: submission.language,
+    source: submission.source,
+  };
+}
+
+export interface SkillReview {
+  validation: SkillValidation;
+  outcomes: Array<{ met: 'yes' | 'partial' | 'no'; weight: number }>;
+  skill: string;
+  format: string;
+}
+
+/**
+ * Runs SV over every skill submission and keys the result to the question it
+ * was recorded against.
+ *
+ * Failures are swallowed per submission rather than failing the evaluation.
+ * A validator that could not be reached leaves that question out of every
+ * denominator — `isGradeable` sees no requirement verdicts and excludes it —
+ * which is §9.6's rule and is the honest outcome: the review did not happen,
+ * so nothing is claimed about the work. Losing a whole report because one
+ * review timed out would be a far worse trade.
+ */
+async function reviewSkillSubmissions(
+  state: LiveState,
+  answered: QuestionRecord[],
+  set: ChallengeSet<SkillChallenge> | null,
+  context: { userId: string; projectId: string; sessionId: string },
+): Promise<Map<number, SkillReview>> {
+  const out = new Map<number, SkillReview>();
+
+  const submissions = latestSkillSubmissions(state);
+  if (submissions.length === 0 || !set?.challenges?.length) return out;
+
+  const skillQuestions = answered
+    .filter((q) => q.grading_mode === 'skill')
+    .sort((a, b) => a.seq - b.seq);
+
+  const reviews = await Promise.all(
+    submissions.map(async (submission, position) => {
+      const challenge = set.challenges[submission.challenge_index];
+      const question = skillQuestions[position];
+      if (!challenge || !question) return null;
+
+      try {
+        const validation = await runSkillValidation(
+          {
+            challenge,
+            source: submission.source,
+            spokenContext: question.answer?.transcript,
+          },
+          context,
+        );
+
+        /*
+         * Joined back to P7's weights by requirement id.
+         *
+         * A verdict whose id matches nothing in the challenge is dropped rather
+         * than given a default weight: SV is asked to echo the ids it was
+         * handed, and one it invented is about a requirement that does not
+         * exist. Crediting it would let a model inflate coverage by inventing
+         * requirements it had already decided were met.
+         */
+        const byId = new Map(challenge.requirements.map((r) => [r.id, r.weight] as const));
+        const outcomes = validation.requirements_met
+          .filter((r) => byId.has(r.id))
+          .map((r) => ({ met: r.met, weight: byId.get(r.id)! }));
+
+        return { seq: question.seq, review: { validation, outcomes, skill: challenge.skill, format: challenge.format } };
+      } catch (err) {
+        console.error('[SV] skill validation failed', context.sessionId, err);
+        return null;
+      }
+    }),
+  );
+
+  for (const r of reviews) {
+    if (r) out.set(r.seq, r.review);
+  }
+
+  return out;
+}
+
 function extractSignals(question: QuestionRecord): RubricSignal[] {
   const rubric = question.rubric as { expected_signals?: RubricSignal[] } | undefined;
   return rubric?.expected_signals ?? [];
@@ -434,6 +712,8 @@ async function writeSessionQuestions(
     rewrites: Array<Awaited<ReturnType<typeof runRewriteCoach>> | null>;
     metrics: Map<number, SpeechMetrics>;
     scored: ScoredQuestion[];
+    /** SV's reading of a skill submission, keyed by question seq. Usually empty. */
+    skillReviews: Map<number, SkillReview>;
   },
 ): Promise<void> {
   const rows = args.questions.map((q, i) => ({
@@ -457,6 +737,10 @@ async function writeSessionQuestions(
     metrics: args.metrics.get(q.seq) ?? null,
     grading: args.gradings[i],
     rewrite: args.rewrites[i],
+    // Its own column, not folded into `grading`: that one is E4's contract, and
+    // keeping one agent's output per column is what lets the report say which
+    // reader said what.
+    skill_review: args.skillReviews.get(q.seq)?.validation ?? null,
     scores: {
       accuracy: args.scored[i].scores.accuracy,
       depth: args.scored[i].scores.depth,
@@ -484,8 +768,12 @@ function deriveSkillOutcomes(
   state: LiveState,
   blueprint: Blueprint,
   scored: ScoredQuestion[],
+  evidence: EvidenceRollup,
 ): SkillOutcome[] {
-  const bySkill = new Map<string, { scores: number[]; confidence: number[]; depth: string }>();
+  const bySkill = new Map<
+    string,
+    { answerScores: number[]; confidence: number[]; depth: string }
+  >();
 
   for (const section of blueprint.sections) {
     for (const goal of section.goals) {
@@ -493,11 +781,10 @@ function deriveSkillOutcomes(
       if (!coverage) continue;
 
       const goalScores = scored.filter((s) => s.goalId === goal.goal_id && !s.excluded);
-      if (goalScores.length === 0) continue;
 
       for (const skill of goal.skill_tags) {
-        const entry = bySkill.get(skill) ?? { scores: [], confidence: [], depth: 'surface' };
-        entry.scores.push(...goalScores.map((s) => s.scores.primary));
+        const entry = bySkill.get(skill) ?? { answerScores: [], confidence: [], depth: 'surface' };
+        entry.answerScores.push(...goalScores.map((s) => s.scores.primary));
         entry.confidence.push(coverage.confidence);
         entry.depth = coverage.depth_reached;
         bySkill.set(skill, entry);
@@ -505,21 +792,61 @@ function deriveSkillOutcomes(
     }
   }
 
-  return [...bySkill.entries()].map(([skill, e]) => {
-    const score = e.scores.reduce((a, b) => a + b, 0) / e.scores.length;
-    const confidence = e.confidence.reduce((a, b) => a + b, 0) / e.confidence.length;
+  const evidenceBySkill = new Map(evidence.by_skill.map((s) => [s.skill, s]));
 
-    return {
-      skill,
-      status: score >= 7 ? 'STRONG' : score >= 5 ? 'WEAK' : confidence < 0.3 ? 'UNVERIFIED' : 'WEAK',
-      score: Math.round(score * 10) / 10,
-      confidence: Math.round(confidence * 100) / 100,
-      depth: e.depth as SkillOutcome['depth'],
-      // Carried forward by finalize_session's coalesce, so the seeded P4 value
-      // survives rather than being overwritten with nothing.
-      jd_importance: null,
-    };
-  });
+  return [...bySkill.entries()]
+    .map(([skill, e]) => {
+      const covered = evidenceBySkill.get(skill);
+
+      /*
+       * ── The skill score is EVIDENCE coverage, not answer quality ───────────
+       *
+       * `skill_progress` is read across sessions — it is the "Verified" column
+       * on the Gap Analysis tab and the thing the report's action plan links
+       * into. So it has to mean the same thing in session one and session four.
+       *
+       * Answer scores do not: once the interviewer writes its own questions,
+       * two sessions ask different things and averaging their question scores
+       * compares two different measurements. Evidence coverage asks "is this
+       * established", which the blueprint fixes once per project and which
+       * therefore survives the comparison.
+       *
+       * Answer quality still decides STRONG vs WEAK below, because coverage
+       * says a thing was established and says nothing about how well.
+       */
+      if (!covered) return null;
+      const score = covered.score;
+
+      const answered = e.answerScores.length
+        ? e.answerScores.reduce((a, b) => a + b, 0) / e.answerScores.length
+        : null;
+
+      const confidence = e.confidence.length
+        ? e.confidence.reduce((a, b) => a + b, 0) / e.confidence.length
+        : 0;
+
+      // Nothing was established and nothing was asked well enough to tell —
+      // reported as unverified rather than as a low score the candidate earned.
+      const unverified = covered.verified === 0 && covered.partial === 0;
+
+      const status: SkillOutcome['status'] = unverified
+        ? 'UNVERIFIED'
+        : (answered ?? score) >= 7 && score >= 6
+          ? 'STRONG'
+          : 'WEAK';
+
+      return {
+        skill,
+        status,
+        score: Math.round(score * 10) / 10,
+        confidence: Math.round(confidence * 100) / 100,
+        depth: e.depth as SkillOutcome['depth'],
+        // Carried forward by finalize_session's coalesce, so the seeded P4 value
+        // survives rather than being overwritten with nothing.
+        jd_importance: null,
+      };
+    })
+    .filter((s): s is NonNullable<typeof s> => s !== null);
 }
 
 /** Keeps E4/E5 fan-out from tripping provider rate limits. */

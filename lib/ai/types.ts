@@ -8,8 +8,8 @@
  * is one environment variable.
  */
 
-/** Providers we can route to. Adding a fourth means touching catalog.ts only. */
-export type ProviderId = 'openai' | 'google' | 'xai';
+/** Providers we can route to. Adding another means touching catalog.ts only. */
+export type ProviderId = 'openai' | 'google' | 'xai' | 'groq';
 
 /**
  * Capability tiers, ordered by cost. An agent picks the *cheapest tier that can
@@ -38,17 +38,19 @@ export type AgentId =
   | 'P4' // Gap Analysis
   | 'P5' // Interview Strategy
   | 'P6' // Interview Blueprint
-  | 'P7' // Coding Challenge
-  | 'L1' // Conversation Manager
+  | 'P7' // Coding Challenge (DSA, with hidden tests)
+  | 'SC' // Skill Challenge — the hands-on task, no hidden tests to get right
+  | 'IV' // Live Interviewer — decides what to ask AND says it, in one call
   | 'L2' // Structured Interview Memory
-  | 'L3' // Live evidence verification (runs concurrently with L1)
-  | 'L4' // Dialogue Styler
-  | 'L6' // Answers the candidate's own question
+  | 'L3' // Live evidence verification (runs concurrently with IV)
   | 'E3' // Evidence & Knowledge Router
   | 'E4' // Answer Grading
+  | 'SV' // Skill Challenge Validation (the round with no sandbox)
   | 'E5' // Rewrite Coach
   | 'E6' // Report Composer
-  | 'RI'; // Resume Improvement (sitemap-workflow.md §7)
+  | 'RI' // Ideal Resume — what can honestly be sent today
+  | 'SP' // Study Plan — the timetable and the projects worth building
+  | 'TR'; // Target Resume — what the resume says once the plan is done
 
 /** Which phase an agent belongs to. Written to `agent_runs.phase`. */
 export type AgentPhase = 'prep' | 'live' | 'eval';
@@ -123,6 +125,20 @@ export interface ModelSpec {
 export interface AgentPolicy {
   tier: ModelTier;
   phase: AgentPhase;
+  /**
+   * The provider this agent belongs on, regardless of AI_PROVIDER.
+   *
+   * Almost no agent should set this — the whole point of the tier system is
+   * that agents state intent and the system routes them. It exists for the one
+   * case where the provider IS the requirement rather than a preference: the
+   * live interviewer runs inside the silence after a candidate stops talking,
+   * so time-to-first-token is its binding constraint and moving it to a slower
+   * provider does not make it cheaper, it makes the product feel broken.
+   *
+   * Still overridable per agent by AI_PROVIDER_<AGENT>, which is the escape
+   * hatch for measuring exactly that claim.
+   */
+  provider?: ProviderId;
   /**
    * Hard wall-clock ceiling in ms. On expiry the call is aborted and the
    * caller's fallback is used — invariant 12: degrade texture, never terminate.

@@ -29,6 +29,12 @@ The verdict line is one sentence, factual, addressed to the candidate:
 
 A goal that was not established is not a failure to report harshly. It is information: the interview could not confirm the claim. Say that plainly.
 
+questions_asked is given to you per goal and is COUNTED from what was actually asked. Copy it exactly; never derive it from turns_spent or from the transcript.
+
+A goal with questions_asked = 0 was never reached — the interview ran out of time before it, or went elsewhere. Its verdict says exactly that and nothing more: "Not covered — the interview did not reach this." Do not write it up as though the candidate failed to answer something they were never asked, and do not imply they avoided it.
+
+A goal with questions_asked > 0 and no evidence verified IS a real finding: it was asked about and the answer did not establish it. That distinction is the most useful thing in this block, so make it unmistakable in the wording.
+
 ## summary
 
 Four to six sentences. Reference actual questions and actual answers. A summary that would fit any candidate is worthless — name the specific thing that went well and the specific thing that did not.
@@ -56,6 +62,16 @@ export interface ReportComposerInput {
   scores: SessionScores;
   coverage: Coverage;
   blueprint: Blueprint;
+  /**
+   * Every question asked, with the goal it was attributed to AS IT WAS ASKED.
+   *
+   * `questions_asked` used to be left to the model, which was given
+   * `turns_spent` and asked for a different number — so a goal that was never
+   * raised could still be written up as though it had been probed, and one
+   * asked about twice could report one question. It is counted here instead,
+   * from the record of what was actually said.
+   */
+  askedGoalIds: string[];
   roleTitle: string;
   companyName: string;
   questions: Array<{
@@ -83,6 +99,11 @@ export async function runReportComposer(
 ): Promise<ReportNarrative> {
   // Project the coverage ledger into the goal statements it belongs to, so the
   // model never has to join two structures itself.
+  const askedCount = new Map<string, number>();
+  for (const id of input.askedGoalIds) {
+    askedCount.set(id, (askedCount.get(id) ?? 0) + 1);
+  }
+
   const goalRows = input.coverage.goals.map((g) => {
     const statement = findGoalStatement(input.blueprint, g.goal_id);
     const verified = g.evidence.filter((e) => e.status === 'verified').length;
@@ -90,6 +111,8 @@ export async function runReportComposer(
       goal_id: g.goal_id,
       statement,
       status: g.status,
+      // Counted, never inferred. This is the number the report prints.
+      questions_asked: askedCount.get(g.goal_id) ?? 0,
       evidence_verified: verified,
       evidence_total: g.evidence.length,
       depth_reached: g.depth_reached,

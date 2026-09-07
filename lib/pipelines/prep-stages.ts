@@ -11,10 +11,18 @@
  * cannot drift apart, without either side importing the other's dependencies.
  */
 
+/*
+ * Three stages, not four.
+ *
+ * `challenges` used to be its own step, back when P7 ran after P6. They are
+ * concurrent now, so a separate bar for it would either sit unlit while work was
+ * happening or send the bar backwards when the blueprint finished second.
+ * Question-writing and challenge-building are one stage because they are one
+ * stretch of wall clock; the detail line says which of them is running.
+ */
 export const SESSION_PREP_STAGES = [
   { key: 'strategy', label: 'Planning the interview' },
   { key: 'blueprint', label: 'Writing your questions' },
-  { key: 'challenges', label: 'Preparing the coding round' },
   { key: 'voice', label: 'Warming up the voice' },
 ] as const;
 

@@ -115,6 +115,13 @@ create table if not exists public.projects (
   gap_report       jsonb,
   strategy         jsonb,
 
+  -- The day of the real interview, in the candidate's own calendar. A `date`
+  -- rather than a timestamp: only the calendar day matters, and a timestamp
+  -- would carry a timezone nobody supplied.
+  interview_date   date,
+  -- Ideal resume, projects worth building, and the dated timetable. See 018.
+  prep_plan        jsonb,
+
   readiness        jsonb not null default '{}'::jsonb,
   stats            jsonb not null default '{}'::jsonb,
 
@@ -182,7 +189,7 @@ create table if not exists public.sessions (
   config           jsonb not null default '{}'::jsonb,
   blueprint        jsonb,
   coding_challenge jsonb,
-  design_challenge jsonb,
+  skill_challenge  jsonb,
   voice_assets     jsonb,
 
   live_state       jsonb,
@@ -227,6 +234,8 @@ create table if not exists public.session_questions (
   grading     jsonb,
   rewrite     jsonb,
   scores      jsonb,
+  -- SV's review of a skill-challenge submission. Null on every other question.
+  skill_review jsonb,
 
   skill_tags   text[] not null default '{}',
   grading_mode text,

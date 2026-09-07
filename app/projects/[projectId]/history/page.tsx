@@ -23,7 +23,15 @@ interface SessionRow {
   overall_score: number | null;
   duration_sec: number | null;
   created_at: string;
-  config: { modules?: { coding?: boolean; system_design?: boolean; behavioral?: boolean } } | null;
+  config: {
+    modules?: {
+      coding?: boolean;
+      skill_challenge?: boolean;
+      /** Sessions created before the module was renamed. */
+      system_design?: boolean;
+      behavioral?: boolean;
+    };
+  } | null;
 }
 
 interface ProjectShell {
@@ -160,6 +168,7 @@ export default function HistoryPage() {
 
                     <div className="flex items-center gap-2 flex-wrap">
                       {s.config?.modules?.coding && <Chip accent="sky">Coding</Chip>}
+                      {s.config?.modules?.skill_challenge && <Chip accent="yellow">Skill challenge</Chip>}
                       {s.config?.modules?.system_design && <Chip accent="yellow">System design</Chip>}
 
                       {s.overall_score != null && (

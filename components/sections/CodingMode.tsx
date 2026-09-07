@@ -120,7 +120,7 @@ export default function CodingMode() {
 
       <div className="text-center mt-6">
         <span className="inline-block px-3 py-1 bg-[#F5EBE0] border-2 border-[#1B1F3B] rounded-full font-[family-name:var(--font-mono)] text-xs font-bold text-[#1B1F3B]">
-          💡 Optional — toggle coding round off in setup if you only want system design or behavior.
+          💡 Optional — toggle the coding round off in setup if you only want the skill challenge or the conversation.
         </span>
       </div>
     </section>

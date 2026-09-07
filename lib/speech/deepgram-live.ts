@@ -186,14 +186,22 @@ export async function openLiveStt(opts: LiveSttOptions): Promise<LiveSttSession 
      * would leak it into proxy and server access logs.
      */
     socket = new WebSocket(`${LISTEN_URL}?${params}`, ['bearer', opts.token]);
-  } catch {
+  } catch (err) {
+    console.warn('[live-stt] Failed to construct WebSocket', err);
     return null;
   }
 
   socket.binaryType = 'arraybuffer';
 
   const opened = await waitForOpen(socket);
-  if (!opened) return null;
+  if (!opened) {
+    console.warn('[live-stt] WebSocket failed to connect; falling back to batch recording');
+    return null;
+  }
+
+  // The positive case, logged once. Without it a working socket is silent and
+  // indistinguishable from one that never opened.
+  console.info(`[live-stt] connected (${opts.language ?? 'default'}), streaming live`);
 
   // ── Accumulated state ──────────────────────────────────────────────────────
   /** Finalised segments, in order. These never change again. */
@@ -234,6 +242,11 @@ export async function openLiveStt(opts: LiveSttOptions): Promise<LiveSttSession 
     };
   };
 
+  let sentChunks = 0;
+  let sentBytes = 0;
+  let droppedChunks = 0;
+  let resultsSeen = 0;
+
   const settle = () => {
     if (!resolveFinish) return;
     if (finishTimer) clearTimeout(finishTimer);
@@ -246,9 +259,32 @@ export async function openLiveStt(opts: LiveSttOptions): Promise<LiveSttSession 
     } catch {
       /* already closing */
     }
-    done(snapshot());
+
+    const result = snapshot();
+    /*
+     * One line per answer, and the only place the whole capture path is visible
+     * at once. Reading it: bytes at zero means the microphone sent nothing, so
+     * the fault is upstream of this module; bytes healthy with results at zero
+     * means the socket took the audio and Deepgram returned nothing, which is a
+     * container or language mismatch rather than a dead device.
+     */
+    console.info(
+      `[live-stt] closed: sent ${sentChunks} chunk(s) / ${(sentBytes / 1024).toFixed(0)} KB, ` +
+        `dropped ${droppedChunks}, ${resultsSeen} result message(s), ` +
+        `transcript ${result.transcript.length} char(s), ${result.words.length} word(s)`,
+    );
+
+    done(result);
   };
 
+  /*
+   * Per-connection accounting, reported once when the socket settles.
+   *
+   * "Is it hearing me?" was previously unanswerable from the console: a healthy
+   * socket logged nothing at all, so a silent transcript looked identical
+   * whether the microphone sent nothing, the socket dropped every chunk, or
+   * Deepgram genuinely heard silence. These three numbers separate the cases.
+   */
   socket.onmessage = (event) => {
     let msg: DeepgramLiveMessage;
     try {
@@ -271,6 +307,7 @@ export async function openLiveStt(opts: LiveSttOptions): Promise<LiveSttSession 
     }
 
     if (msg.type !== 'Results') return;
+    resultsSeen += 1;
 
     const alt = msg.channel?.alternatives?.[0];
     const text = alt?.transcript?.trim() ?? '';
@@ -344,11 +381,16 @@ export async function openLiveStt(opts: LiveSttOptions): Promise<LiveSttSession 
     },
 
     sendAudio(chunk: Blob) {
-      if (!alive || finishing || socket.readyState !== WebSocket.OPEN) return;
+      if (!alive || finishing || socket.readyState !== WebSocket.OPEN) {
+        droppedChunks += 1;
+        return;
+      }
       // Blob goes straight out; the socket frames it. Deepgram sniffs the
       // WebM/Opus container from the first chunk, so chunks must be sent in
       // order and all from the same MediaRecorder session.
       socket.send(chunk);
+      sentChunks += 1;
+      sentBytes += chunk.size;
     },
 
     finish() {
@@ -415,12 +457,19 @@ function waitForOpen(socket: WebSocket): Promise<boolean> {
       } catch {
         /* nothing to close */
       }
+      console.warn('[live-stt] Handshake timed out after 4s');
       done(false);
     }, 4_000);
 
     socket.onopen = () => done(true);
-    socket.onerror = () => done(false);
-    socket.onclose = () => done(false);
+    socket.onerror = (e) => {
+      console.warn('[live-stt] Handshake socket error', e);
+      done(false);
+    };
+    socket.onclose = (e) => {
+      console.warn('[live-stt] Handshake socket closed prematurely', e.code, e.reason);
+      done(false);
+    };
   });
 }
 

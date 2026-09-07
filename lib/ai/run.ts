@@ -272,18 +272,40 @@ function buildProviderOptions(
 ): Record<string, Record<string, unknown>> | undefined {
   if (!resolved.spec.supportsReasoningEffort) return extra;
 
-  const openai: Record<string, unknown> = {};
+  /*
+   * Provider options are namespaced by provider, and getting the namespace
+   * wrong is silent: the SDK passes an unrecognised key straight through and
+   * the model simply never receives the setting. That is the failure mode this
+   * file exists to prevent — an agent configured for no reasoning that quietly
+   * reasons anyway spends its entire latency budget on invisible tokens.
+   */
+  const namespace = resolved.provider;
+  const options: Record<string, unknown> = {};
 
   // Resolved against what THIS model accepts, not just what the provider
   // documents. gpt-5.6-luna rejects `minimal` with a 400 despite it being a
   // documented value, so an unmapped effort is a runtime failure.
   const effort = resolveReasoningEffort(resolved.spec, policy.reasoningEffort);
-  if (effort) openai.reasoningEffort = effort;
-  if (policy.textVerbosity) openai.textVerbosity = policy.textVerbosity;
+  if (effort) options.reasoningEffort = effort;
 
-  if (Object.keys(openai).length === 0) return extra;
+  if (resolved.provider === 'groq') {
+    /*
+     * gpt-oss emits its chain of thought as part of the response. `hidden`
+     * keeps it out — without it the reasoning arrives in the text channel and
+     * `generateObject` fails schema validation on prose it did not expect,
+     * which the live loop would see as a timeout-shaped fallback on every turn.
+     */
+    options.reasoningFormat = 'hidden';
+    // Ask for real JSON-schema enforcement rather than best-effort JSON.
+    options.structuredOutputs = true;
+  } else {
+    // OpenAI-only knob; Groq has no equivalent and rejects unknown fields.
+    if (policy.textVerbosity) options.textVerbosity = policy.textVerbosity;
+  }
 
-  return { ...extra, openai: { ...openai, ...extra?.openai } };
+  if (Object.keys(options).length === 0) return extra;
+
+  return { ...extra, [namespace]: { ...options, ...extra?.[namespace] } };
 }
 
 function fallbackResult<T>(

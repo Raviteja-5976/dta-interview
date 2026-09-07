@@ -77,7 +77,8 @@ export default function DashboardPage() {
 
   // Derived Metrics for Stat Counter Strip
   const totalProjects = projects.length;
-  const creditsRemaining = profile?.credits_balance ?? 4;
+  // Same rule as the header pill: no invented fallback. Unknown reads as '—'.
+  const creditsRemaining = profile?.credits_balance ?? null;
   const totalInterviews = projects.reduce((acc, p) => acc + (p.sessions_count || p.stats?.sessions_count || 0), 0);
   
   const readyProjectsWithScores = projects.filter((p) => (p.readiness_overall || p.readiness?.overall) && (p.readiness_overall || p.readiness?.overall)! > 0);
@@ -143,7 +144,7 @@ export default function DashboardPage() {
               <div className="h-9 w-16 bg-gray-200 rounded animate-pulse my-0.5" />
             ) : (
               <div className="font-[family-name:var(--font-display)] text-3xl md:text-4xl font-extrabold text-[#1B1F3B] tabular-nums">
-                {creditsRemaining}
+                {creditsRemaining ?? '—'}
               </div>
             )}
             <p className="text-xs text-[#1B1F3B]/60 mt-1 font-medium">Ready to spend</p>

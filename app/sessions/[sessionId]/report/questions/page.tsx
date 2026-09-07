@@ -45,6 +45,21 @@ interface QuestionRow {
     observations?: string[];
   } | null;
   rewrite: { improved: string; ideal: string; one_change: string } | null;
+  /**
+   * SV's review of a skill-challenge submission. Null on every other question.
+   *
+   * It is the only place the candidate ever finds out what the reader made of
+   * the code they wrote — nothing about it is shown during the interview, by
+   * design, so this page is where the round pays off.
+   */
+  skill_review: {
+    requirements_met?: Array<{ id: string; met: 'yes' | 'partial' | 'no'; evidence: string; note: string }>;
+    defects?: Array<{ severity: 'major' | 'minor'; what: string; where: string }>;
+    strengths?: string[];
+    bug_found?: 'yes' | 'partial' | 'no' | 'not_applicable';
+    summary?: string;
+    verdict?: 'strong' | 'acceptable' | 'weak' | 'incorrect';
+  } | null;
   scores: { primary: number } | null;
   accuracy: number | null;
   fluency: number | null;
@@ -83,7 +98,9 @@ function QuestionReviewContent() {
     (async () => {
       const { data } = await supabase
         .from('session_questions')
-        .select('seq, question, answer, metrics, grading, rewrite, scores, accuracy, fluency, grading_mode, skill_tags')
+        .select(
+          'seq, question, answer, metrics, grading, rewrite, skill_review, scores, accuracy, fluency, grading_mode, skill_tags',
+        )
         .eq('session_id', sessionId)
         .order('seq');
 
@@ -249,6 +266,80 @@ function QuestionCard({
                     </li>
                   ))}
                 </ul>
+              </div>
+            )}
+
+            {/* What the reader made of the code, on the skill round only. */}
+            {row.skill_review && (
+              <div className="p-4 border-4 border-[#1B1F3B] rounded-2xl bg-white space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <Eyebrow>Review of what you wrote</Eyebrow>
+                  {row.skill_review.verdict && (
+                    <Chip
+                      accent={
+                        row.skill_review.verdict === 'strong'
+                          ? 'mint'
+                          : row.skill_review.verdict === 'acceptable'
+                            ? 'yellow'
+                            : 'coral'
+                      }
+                    >
+                      {row.skill_review.verdict}
+                    </Chip>
+                  )}
+                </div>
+
+                {row.skill_review.summary && (
+                  <p className="text-sm text-[#1B1F3B]/85 leading-relaxed">{row.skill_review.summary}</p>
+                )}
+
+                {/* Only meaningful on a debug task, where finding the fault WAS
+                    the task — so it is not rendered when it does not apply. */}
+                {row.skill_review.bug_found && row.skill_review.bug_found !== 'not_applicable' && (
+                  <Chip accent={row.skill_review.bug_found === 'yes' ? 'mint' : 'coral'}>
+                    {row.skill_review.bug_found === 'yes'
+                      ? 'Found the bug'
+                      : row.skill_review.bug_found === 'partial'
+                        ? 'Partly found the bug'
+                        : 'Did not find the bug'}
+                  </Chip>
+                )}
+
+                {/* The requirements, and how each one landed. This is the mark
+                    scheme, shown afterwards — during the round it is withheld,
+                    because a visible checklist turns the task into a checklist. */}
+                {row.skill_review.requirements_met && row.skill_review.requirements_met.length > 0 && (
+                  <ul className="space-y-1.5">
+                    {row.skill_review.requirements_met.map((r) => (
+                      <li key={r.id} className="flex gap-2 text-sm">
+                        <span
+                          className="shrink-0 mt-1 w-3 h-3 rounded-full border-2 border-[#1B1F3B]"
+                          style={{
+                            backgroundColor:
+                              r.met === 'yes' ? '#6EE7B7' : r.met === 'partial' ? '#FFC93C' : '#FF5C7A',
+                          }}
+                        />
+                        <span className="text-[#1B1F3B]/85">{r.note}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {row.skill_review.defects && row.skill_review.defects.length > 0 && (
+                  <div>
+                    <p className="font-[family-name:var(--font-mono)] text-[10px] font-bold uppercase tracking-widest text-[#1B1F3B]/55 mb-1">
+                      What would bite you
+                    </p>
+                    <ul className="space-y-1">
+                      {row.skill_review.defects.map((d, i) => (
+                        <li key={i} className="text-sm text-[#1B1F3B]/85">
+                          <span className="font-[family-name:var(--font-mono)] text-xs">{d.where}</span> —{' '}
+                          {d.what}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             )}
 

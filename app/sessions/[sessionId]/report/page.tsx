@@ -63,6 +63,7 @@ interface Scores {
   depth: number | null;
   behavioral: number | null;
   coding: number | null;
+  skill: number | null;
   fluency: number | null;
 }
 
@@ -81,7 +82,15 @@ interface SessionRow {
   project_id: string;
   duration_sec: number | null;
   created_at: string;
-  config: { modules?: { coding?: boolean; system_design?: boolean }; difficulty?: string } | null;
+  config: {
+    modules?: {
+      coding?: boolean;
+      skill_challenge?: boolean;
+      /** Sessions created before the module was renamed. */
+      system_design?: boolean;
+    };
+    difficulty?: string;
+  } | null;
   scores: Scores | null;
   report: ReportShape | null;
   speech_summary: SpeechSummary | null;
@@ -169,6 +178,7 @@ export default function ReportPage() {
             {session.duration_sec && <Chip>{Math.round(session.duration_sec / 60)} min</Chip>}
             {session.config?.difficulty && <Chip>{session.config.difficulty}</Chip>}
             {session.config?.modules?.coding && <Chip accent="sky">Coding</Chip>}
+            {session.config?.modules?.skill_challenge && <Chip accent="yellow">Skill challenge</Chip>}
             {session.config?.modules?.system_design && <Chip accent="yellow">System design</Chip>}
           </div>
         </div>
@@ -204,6 +214,7 @@ export default function ReportPage() {
             <ScoreBar label="Depth of experience" score={scores.depth} />
             <ScoreBar label="Behavioral" score={scores.behavioral} />
             {scores.coding != null && <ScoreBar label="Coding" score={scores.coding} />}
+            {scores.skill != null && <ScoreBar label="Skill challenge" score={scores.skill} />}
           </div>
         </div>
       </Card>

@@ -159,11 +159,7 @@ export default function ProjectOverviewPage() {
   if (loading) {
     return (
       <Page>
-        <Skeleton className="h-24 mb-6" />
-        <div className="grid md:grid-cols-3 gap-4">
-          <Skeleton className="h-40 md:col-span-2" />
-          <Skeleton className="h-40" />
-        </div>
+        <OverviewSkeleton />
       </Page>
     );
   }
@@ -264,7 +260,7 @@ export default function ProjectOverviewPage() {
                 <ScoreBar label="Technical" score={pct(readiness.technical)} />
                 <ScoreBar label="Behavioral" score={pct(readiness.behavioral)} />
                 <ScoreBar label="Coding" score={pct(readiness.coding)} />
-                <ScoreBar label="System design" score={pct(readiness.system_design)} />
+                <ScoreBar label="Skill challenge" score={pct(readiness.skill_challenge)} />
               </div>
             </div>
           )}
@@ -377,6 +373,55 @@ export default function ProjectOverviewPage() {
         )}
       </Card>
     </Page>
+  );
+}
+
+/**
+ * The overview at its real dimensions, so nothing jumps when the data lands:
+ * same header block, same three-column readiness row, same two cards below.
+ * A centred spinner would be honest about waiting and dishonest about shape.
+ */
+function OverviewSkeleton() {
+  return (
+    <div aria-busy="true" aria-label="Loading project">
+      {/* Project header: logo, title block, start button */}
+      <div className="mb-8">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <Skeleton className="w-14 h-14 rounded-2xl shrink-0" />
+            <div className="space-y-2">
+              <Skeleton className="h-8 w-52 md:w-64 rounded-2xl" />
+              <Skeleton className="h-4 w-36 rounded-full" />
+            </div>
+          </div>
+          <Skeleton className="h-12 w-44 rounded-2xl" />
+        </div>
+
+        {/* Tab strip */}
+        <div className="mt-6 flex gap-2">
+          <Skeleton className="h-10 w-28 rounded-2xl" />
+          <Skeleton className="h-10 w-32 rounded-2xl" />
+          <Skeleton className="h-10 w-28 rounded-2xl" />
+          <Skeleton className="h-10 w-24 rounded-2xl" />
+        </div>
+      </div>
+
+      {/* Readiness + stat tiles */}
+      <div className="grid lg:grid-cols-3 gap-5 mb-6">
+        <Skeleton className="lg:col-span-2 h-[260px]" />
+        <div className="grid grid-cols-2 lg:grid-cols-1 gap-4">
+          <Skeleton className="h-[76px] lg:h-20" />
+          <Skeleton className="h-[76px] lg:h-20" />
+          <Skeleton className="h-[76px] lg:h-20" />
+        </div>
+      </div>
+
+      {/* What to work on */}
+      <Skeleton className="h-56 mb-6" />
+
+      {/* Recent interviews */}
+      <Skeleton className="h-48" />
+    </div>
   );
 }
 

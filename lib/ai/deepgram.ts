@@ -324,7 +324,7 @@ export async function synthesizeUtterance(
   const audio = new Uint8Array(await res.arrayBuffer());
 
   recordAgentRun({
-    agent: 'L4',
+    agent: 'IV',
     phase: 'live',
     provider: 'deepgram',
     model,

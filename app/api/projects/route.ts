@@ -14,6 +14,7 @@
 import { createSupabaseServerClient, requireUser } from '@/lib/supabase/server';
 import { extractResumeText, ResumeExtractionError } from '@/lib/pipelines/resume-text';
 import { domainFromUrl } from '@/lib/agents/p1-company';
+import { isValidIsoDate } from '@/lib/engine/prep-window';
 import { created, failure, handleRouteError } from '@/lib/api/respond';
 
 const MAX_RESUME_BYTES = 5 * 1024 * 1024;
@@ -30,6 +31,19 @@ export async function POST(request: Request) {
     const roleTitle = String(form.get('role_title') ?? '').trim();
     const companyUrl = String(form.get('company_url') ?? '').trim() || null;
     const seniority = String(form.get('seniority') ?? '').trim() || null;
+    const interviewDateRaw = String(form.get('interview_date') ?? '').trim();
+
+    /*
+     * Optional, and silently dropped when malformed rather than failing the
+     * whole creation.
+     *
+     * Most people do not know the date when they create the project, and the
+     * ones who do can set it on the plan tab later. Rejecting a project because
+     * a date field was odd would lose the resume upload and the pasted job
+     * description along with it, which is a bad trade for a field nothing yet
+     * depends on.
+     */
+    const interviewDate = isValidIsoDate(interviewDateRaw) ? interviewDateRaw : null;
 
     if (!(file instanceof File)) return failure(400, 'A resume file is required.');
     if (file.size > MAX_RESUME_BYTES) return failure(400, 'That resume is over the 5 MB limit.');
@@ -58,6 +72,7 @@ export async function POST(request: Request) {
         role_title: roleTitle,
         seniority,
         jd_raw: jdRaw,
+        interview_date: interviewDate,
         status: 'preparing',
         readiness: {},
         stats: {},

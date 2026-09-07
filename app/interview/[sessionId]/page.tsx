@@ -25,6 +25,11 @@ import { Mic, MicOff, PhoneOff } from 'lucide-react';
 
 import { Button, Card, Chip, ErrorCard, StageList } from '@/components/app/ui';
 import CodingMode, { type CodeDraft, type CodingChallengeView } from '@/components/app/CodingMode';
+import SkillMode, {
+  type SkillChallengeView,
+  type SkillDraft,
+  type SkillSummary,
+} from '@/components/app/SkillMode';
 import { SESSION_PREP_STAGES } from '@/lib/pipelines/prep-stages';
 import { openLiveStt, type LiveSttResult, type LiveSttSession } from '@/lib/speech/deepgram-live';
 import { supabase } from '@/lib/supabase/client';
@@ -64,10 +69,20 @@ const SILENCE_MS = 2_500;
  * speech window E2 measures pace against. It only decides the END of a turn on
  * the fallback path.
  */
-const SILENCE_THRESHOLD = 0.045;
+const SILENCE_THRESHOLD = 0.02;
 
 /** Never cut someone off before they have really started. */
 const MIN_ANSWER_MS = 1_200;
+
+/**
+ * The hard ceiling on a single answer, enforced on a timer.
+ *
+ * Well past any real interview answer — this is not a pacing rule, it is the
+ * backstop for the frame loop not running at all (a hidden tab, a throttled
+ * background window). Reaching it means something else went wrong, and ending
+ * the answer with whatever was captured beats waiting forever.
+ */
+const MAX_ANSWER_MS = 4 * 60 * 1_000;
 
 /**
  * How long to wait for the candidate to begin at all.
@@ -76,6 +91,32 @@ const MIN_ANSWER_MS = 1_200;
  * answer. Waiting past that hands back so the interviewer can prompt.
  */
 const WAIT_FOR_SPEECH_MS = 12_000;
+
+/**
+ * Below this many bytes in a whole answer window, the microphone is dead.
+ *
+ * Not a silence threshold — a liveness one. Opus encodes a silent room at
+ * roughly 1–2 KB per second, so any window in which someone merely said nothing
+ * still lands in the tens of kilobytes. Coming out of one under a couple of KB
+ * means no samples arrived at all, which is a broken capture path and not
+ * something the interviewer should paper over by re-asking the question.
+ */
+const MIN_LIVE_AUDIO_BYTES = 2_048;
+
+/**
+ * The container to record in, preferred rather than left to the browser.
+ *
+ * Deepgram detects the container from the first bytes on the socket, so the
+ * recorder and the fallback upload must agree on what it is. Chrome and Firefox
+ * give WebM/Opus; Safari only does MP4/AAC, which the batch route was
+ * mislabelling as WebM. Returning undefined lets the browser pick, which is the
+ * right answer when none of these are supported.
+ */
+function preferredRecorderMime(): string | undefined {
+  if (typeof MediaRecorder === 'undefined') return undefined;
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+  return candidates.find((t) => MediaRecorder.isTypeSupported(t));
+}
 
 interface CodingSummary {
   passed: number;
@@ -86,6 +127,19 @@ interface CodingSummary {
 
 interface RecordedAnswer {
   blob: Blob;
+  /** What the recorder actually produced, so the batch route is told the truth. */
+  mimeType: string;
+  /** Bytes captured. Under `MIN_LIVE_AUDIO_BYTES` the microphone is dead. */
+  bytes: number;
+  /** Either the amplitude rule or Deepgram believed the candidate spoke. */
+  speechDetected: boolean;
+  /**
+   * The live socket was open and healthy for this answer.
+   *
+   * False means it never opened or died mid-answer — the case the recording is
+   * kept for, and the one where an empty transcript proves nothing.
+   */
+  liveSttUsable: boolean;
   /** When speech actually began — not when the recorder did. */
   startedAt: number;
   endedAt: number;
@@ -106,18 +160,37 @@ export default function LiveInterviewPage() {
 
   const [phase, setPhase] = useState<Phase>('loading');
   const [question, setQuestion] = useState('');
+  /*
+   * What the current question is trying to establish.
+   *
+   * Arrives on the same `/turn` response as the question itself — it is a
+   * lookup the turn already performed, not a second request — so showing it
+   * costs nothing in the silence the candidate is waiting through.
+   */
+  const [questionGoal, setQuestionGoal] = useState<{
+    statement: string;
+    pursuing: string[];
+  } | null>(null);
   const [sectionTitle, setSectionTitle] = useState('');
   const [progress, setProgress] = useState({ sectionsTotal: 0, sectionsCompleted: 0 });
   const [partial, setPartial] = useState('');
   const [elapsed, setElapsed] = useState(0);
   const [muted, setMuted] = useState(false);
+  /*
+   * Mirrors `muted` for code that runs outside render — `acquireMicrophone`
+   * re-applies it to a freshly opened track, and a candidate who muted
+   * themselves must not come back unmuted because their headset reconnected.
+   */
+  const mutedRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmEnd, setConfirmEnd] = useState(false);
   const [amplitude, setAmplitude] = useState(0);
   const [prepStage, setPrepStage] = useState(0);
   const [prepDetail, setPrepDetail] = useState<string | null>(null);
-  /** Non-null while the candidate is in the editor. */
+  /** Non-null while the candidate is in the coding editor. */
   const [challenge, setChallenge] = useState<CodingChallengeView | null>(null);
+  /** Non-null while the candidate is in the skill-challenge editor. */
+  const [skillChallenge, setSkillChallenge] = useState<SkillChallengeView | null>(null);
 
   const startedAt = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -129,6 +202,7 @@ export default function LiveInterviewPage() {
   /** Set once the interview is over, so nothing queued keeps running. */
   const aborted = useRef(false);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const micCtxRef = useRef<AudioContext | null>(null);
   /** The Deepgram socket, open only while an answer is in flight. */
   const liveSttRef = useRef<LiveSttSession | null>(null);
   /**
@@ -158,7 +232,29 @@ export default function LiveInterviewPage() {
   const dgUtteranceEndedRef = useRef(false);
   /** The socket died mid-answer; fall back to the amplitude rule. */
   const dgFailedRef = useRef(false);
-  /** The question currently on screen, so /reflect knows what it is reading. */
+  /**
+   * The last answer window captured no audio at all.
+   *
+   * Distinct from "the candidate said nothing", which is an ordinary thing that
+   * happens in interviews and is handled by re-asking. This means the capture
+   * path is broken, and re-asking cannot fix it — see `captureAnswer`.
+   */
+  const micDeadRef = useRef(false);
+  /*
+   * Set when the answer window could not be opened AT ALL — no live track, or
+   * MediaRecorder refused to start.
+   *
+   * `recordAnswer` returns null for that and for a candidate who simply said
+   * nothing, and the caller used to treat both as silence: it handed back
+   * `undefined`, the interviewer asked the next question, and the loop raced
+   * through the whole plan without ever waiting for an answer. That is the
+   * "it isn't waiting for me to answer" symptom, and this flag is what tells
+   * the two apart.
+   */
+  const micUnavailableRef = useRef(false);
+  /** Consecutive answer windows that captured nothing. */
+  const micDeadStreak = useRef(0);
+  /** The question currently on screen. */
   const lastQuestionIdRef = useRef<string | null>(null);
   const rafRef = useRef<number | null>(null);
   const answerStartRef = useRef<number>(0);
@@ -216,6 +312,15 @@ export default function LiveInterviewPage() {
   const getCodeDraft = useCallback((index: number) => codeDrafts.current[index], []);
   const saveCodeDraft = useCallback((index: number, draft: CodeDraft) => {
     codeDrafts.current[index] = draft;
+  }, []);
+
+  /** The skill round's twin of the two above. Same reasoning, separate store. */
+  const skillDoneRef = useRef<((summary: SkillSummary | null) => void) | null>(null);
+  const skillDrafts = useRef<Record<number, SkillDraft>>({});
+
+  const getSkillDraft = useCallback((index: number) => skillDrafts.current[index], []);
+  const saveSkillDraft = useCallback((index: number, draft: SkillDraft) => {
+    skillDrafts.current[index] = draft;
   }, []);
 
   // ── Elapsed clock ──────────────────────────────────────────────────────────
@@ -332,14 +437,174 @@ export default function LiveInterviewPage() {
 
   // ── Audio plumbing ─────────────────────────────────────────────────────────
 
-  const attachAnalyser = useCallback((stream: MediaStream) => {
-    const ctx = new AudioContext();
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 512;
-    source.connect(analyser);
-    analyserRef.current = analyser;
+  /**
+   * The page's ONE AudioContext, for the microphone analyser and for playback.
+   *
+   * It used to be one per clip — `playClip` constructed a context, wired the
+   * <audio> element into it, and closed it again when the clip ended — plus a
+   * separate permanent one for the microphone. That is what silenced the
+   * interview.
+   *
+   * Opening and closing a context reconfigures the browser's audio device, and
+   * on Windows that reconfiguration lands on the CAPTURE side too: the
+   * getUserMedia track keeps `readyState === 'live'` and reports no error, but
+   * stops delivering samples. So the first question played (context opened,
+   * then closed), and every recording after it read a dead microphone —
+   * MediaRecorder emitted zero-length chunks, the analyser read a flat line, and
+   * Deepgram received no audio. Every layer agreed there was silence, because
+   * from the page's point of view there genuinely was.
+   *
+   * One context, opened once and never closed while the interview runs, removes
+   * the churn. It also keeps us clear of Chrome's hard limit of six contexts per
+   * document, which the per-clip version was spending one of on every turn.
+   */
+  const audioContext = useCallback(async (): Promise<AudioContext | null> => {
+    let ctx = micCtxRef.current;
+
+    if (!ctx || ctx.state === 'closed') {
+      try {
+        ctx = new AudioContext();
+        micCtxRef.current = ctx;
+      } catch (err) {
+        console.warn('[interview] AudioContext unavailable', err);
+        return null;
+      }
+    }
+
+    /*
+     * Created outside a user gesture it starts suspended, and a suspended
+     * context both plays nothing and analyses nothing.
+     *
+     * Raced against a deadline because `resume()` on a context the browser is
+     * still refusing to start does not reject — it returns a promise that stays
+     * pending until a gesture that may never come. Awaiting that directly is
+     * enough to stall the whole turn loop, so the deadline hands back an
+     * unresumed context instead and the caller carries on without the waveform.
+     */
+    if (ctx.state === 'suspended') {
+      await Promise.race([
+        ctx.resume().catch(() => null),
+        new Promise((r) => setTimeout(r, 1_000)),
+      ]);
+    }
+    return ctx;
   }, []);
+
+  const attachAnalyser = useCallback(
+    async (stream: MediaStream) => {
+      try {
+        const ctx = await audioContext();
+        if (!ctx) return;
+
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        analyserRef.current = analyser;
+      } catch (err) {
+        // Cosmetic only — the waveform goes flat and the RMS fallback is lost,
+        // but recording and Deepgram are both unaffected. Never fatal.
+        console.warn('[interview] failed to attach mic analyser', err);
+      }
+    },
+    [audioContext],
+  );
+
+  /**
+   * Opens the microphone and wires up everything that watches it.
+   *
+   * Split out of `begin` because it is now needed twice: once to start, and
+   * again to RECOVER. A `MediaStreamTrack` ends for reasons that have nothing
+   * to do with the interview — a Bluetooth headset connecting or dropping, the
+   * OS default input changing, a USB device re-enumerating, Windows handing the
+   * device to another application — and an ended track never comes back. It is
+   * dead for the rest of the session, `MediaRecorder` yields zero bytes on it,
+   * and there was no path from there back to a working microphone.
+   */
+  const acquireMicrophone = useCallback(async (): Promise<MediaStream> => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // Without these the interviewer's own voice comes back through the
+        // speakers and Deepgram transcribes the questions as answers.
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+
+    // Whatever was there before is finished with. Left running it holds the
+    // device open, which on Windows is itself enough to make the new capture
+    // fail.
+    const previous = streamRef.current;
+    if (previous && previous !== stream) {
+      previous.getTracks().forEach((t) => t.stop());
+    }
+
+    streamRef.current = stream;
+    // Muting is a UI toggle and must survive re-acquisition, or a candidate who
+    // muted themselves comes back unmuted without touching anything.
+    stream.getAudioTracks().forEach((t) => (t.enabled = !mutedRef.current));
+
+    /*
+     * Awaited. It was not, and `attachAnalyser` is async, so the first answer
+     * could reach `recordAnswer` before `analyserRef` was populated — and
+     * `recordAnswer` then returned null without recording anything at all.
+     */
+    await attachAnalyser(stream);
+
+    /*
+     * A track that arrives already muted is a device held by something else,
+     * or muted at the OS level. It reports `readyState: 'live'` throughout, so
+     * nothing downstream can tell it apart from a quiet room; this is the only
+     * place the difference is visible.
+     */
+    const track = stream.getAudioTracks()[0];
+    console.info(
+      `[interview] microphone open: "${track?.label || 'unknown device'}" ` +
+        `(muted=${track?.muted ?? 'n/a'}, state=${track?.readyState ?? 'n/a'})`,
+    );
+    if (track?.muted) {
+      console.warn('[interview] microphone track is muted at the source');
+    }
+    track?.addEventListener('mute', () => {
+      console.warn('[interview] microphone track went silent mid-interview');
+    });
+    track?.addEventListener('unmute', () => {
+      console.info('[interview] microphone track came back');
+    });
+    track?.addEventListener('ended', () => {
+      // Not fatal any more. `ensureMicrophone` re-opens the device before the
+      // next answer window, so this is a note about the hardware rather than
+      // the end of the interview.
+      console.warn('[interview] microphone track ended — will re-acquire before the next answer');
+    });
+
+    return stream;
+  }, [attachAnalyser]);
+
+  /**
+   * The live audio track, re-opening the device if the old one died.
+   *
+   * Called at the top of every answer window. In the ordinary case it is a
+   * property read and costs nothing; when the track has ended it is one
+   * `getUserMedia` — the permission is already granted, so there is no prompt
+   * and no gesture requirement.
+   */
+  const ensureMicrophone = useCallback(async (): Promise<MediaStreamTrack | null> => {
+    const live = streamRef.current?.getAudioTracks().find((t) => t.readyState === 'live');
+    if (live) return live;
+
+    if (aborted.current) return null;
+
+    console.warn('[interview] no live audio track — re-acquiring the microphone');
+    try {
+      const stream = await acquireMicrophone();
+      return stream.getAudioTracks().find((t) => t.readyState === 'live') ?? null;
+    } catch (err) {
+      console.error('[interview] could not re-acquire the microphone', err);
+      return null;
+    }
+  }, [acquireMicrophone]);
 
   /**
    * A Deepgram token, minted on demand and reused until it is nearly expired.
@@ -391,21 +656,56 @@ export default function LiveInterviewPage() {
    * cannot be opened it becomes the end-of-turn signal again, exactly as before.
    */
   const recordAnswer = useCallback(async (): Promise<RecordedAnswer | null> => {
+    /*
+     * A stopped track cannot be recorded: MediaRecorder.start() throws
+     * NotSupportedError rather than failing gracefully.
+     *
+     * This used to return null on the spot, which conflated two situations the
+     * caller then treated identically — the interview ending while the loop was
+     * mid-flight, and the capture device having died under us. The second is
+     * recoverable and now is: `ensureMicrophone` re-opens the device, and only
+     * a genuine failure to get one falls through.
+     */
+    const track = await ensureMicrophone();
     const stream = streamRef.current;
+    if (!stream || !track) {
+      // Distinguishable from "the candidate said nothing", which is also null.
+      micUnavailableRef.current = true;
+      return null;
+    }
+    micUnavailableRef.current = false;
+
+    /*
+     * The analyser is NOT a precondition.
+     *
+     * It used to be — `if (!stream || !analyser || !trackLive) return null` —
+     * which made a cosmetic component load-bearing: `attachAnalyser` is async
+     * and `begin` did not await it, so an answer recorded before it resolved was
+     * thrown away without a single byte being captured, and the interviewer
+     * simply re-asked. The analyser drives the waveform and the RMS fallback;
+     * neither is worth losing an answer over.
+     */
     const analyser = analyserRef.current;
 
-    // A stopped track cannot be recorded: MediaRecorder.start() throws
-    // NotSupportedError rather than failing gracefully. This happens when the
-    // interview ended while the loop was mid-flight.
-    const trackLive = stream?.getAudioTracks().some((t) => t.readyState === 'live');
-    if (!stream || !analyser || !trackLive) return null;
+    // Suspended contexts analyse nothing, so the waveform and the RMS
+    // end-of-turn rule both go dead. Resuming is cheap and usually a no-op.
+    await audioContext();
+
+    dgSpeechStartedRef.current = null;
+    dgUtteranceEndedRef.current = false;
+    dgFailedRef.current = false;
 
     const token = await voiceToken();
     const stt = token
       ? await openLiveStt({
           token,
           language: languageRef.current,
-          onInterim: setPartial,
+          onInterim: (text) => {
+            if (text.trim()) {
+              dgSpeechStartedRef.current ??= Date.now();
+            }
+            setPartial(text);
+          },
           // Deepgram heard speech begin. More reliable than the amplitude
           // threshold, which also trips on a door closing.
           onSpeechStarted: () => {
@@ -417,9 +717,11 @@ export default function LiveInterviewPage() {
           // They are still talking, so any pending end-of-utterance was a
           // guess that has just been proven wrong. See the note on the flag.
           onSpeech: () => {
+            dgSpeechStartedRef.current ??= Date.now();
             dgUtteranceEndedRef.current = false;
           },
-          onFailure: () => {
+          onFailure: (reason) => {
+            console.warn('[interview] live STT failed:', reason);
             // Fall back to the RMS rule for the remainder of this answer.
             dgFailedRef.current = true;
           },
@@ -427,15 +729,24 @@ export default function LiveInterviewPage() {
       : null;
 
     liveSttRef.current = stt;
-    dgSpeechStartedRef.current = null;
-    dgUtteranceEndedRef.current = false;
-    dgFailedRef.current = false;
+
+    /*
+     * The recorder's own container type, asked for explicitly.
+     *
+     * Deepgram sniffs the container from the first frame on the socket, and the
+     * batch route is told what it is being sent. Letting the browser pick
+     * silently meant Safari handed both of them `audio/mp4` while the fallback
+     * upload claimed `audio/webm`.
+     */
+    const mimeType = preferredRecorderMime();
 
     const recorded = await new Promise<Omit<RecordedAnswer, 'live'> | null>((resolve) => {
       let recorder: MediaRecorder;
       try {
-        recorder = new MediaRecorder(stream);
-      } catch {
+        recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      } catch (err) {
+        console.error('[interview] MediaRecorder could not be created', err);
+        micUnavailableRef.current = true;
         return resolve(null);
       }
 
@@ -446,9 +757,12 @@ export default function LiveInterviewPage() {
       let speechStartedAt: number | null = null;
       let speechEndedAt: number | null = null;
       let silenceSince: number | null = null;
+      /** Bytes the recorder has actually produced. See the mic-health check. */
+      let bytes = 0;
 
       recorder.ondataavailable = (e) => {
         if (e.data.size === 0) return;
+        bytes += e.data.size;
         /*
          * Both destinations, every chunk.
          *
@@ -461,15 +775,40 @@ export default function LiveInterviewPage() {
         stt?.sendAudio(e.data);
       };
 
+      // MediaRecorder reports its own failures here, and they used to go
+      // nowhere: the recording simply stopped and the answer vanished.
+      recorder.onerror = (e) => {
+        console.error('[interview] MediaRecorder error', (e as ErrorEvent).error ?? e);
+      };
+
       recorder.onstop = () => {
         if (rafRef.current) cancelAnimationFrame(rafRef.current);
         setAmplitude(0);
 
-        if (speechStartedAt === null) return resolve(null); // nothing was said
+        /*
+         * A recorder that produced essentially nothing is a DEAD MICROPHONE,
+         * not a quiet candidate.
+         *
+         * Even a silent room yields kilobytes of Opus per second, so the only
+         * way to come out of a twelve-second window under a kilobyte is for the
+         * track to have delivered no samples at all — the device muted at the OS
+         * level, another application holding it exclusively, or the capture side
+         * knocked over by an audio-device reconfiguration.
+         *
+         * This used to resolve null here, indistinguishable from silence, so the
+         * interviewer just re-asked the question and the interview ran to its
+         * end having recorded nothing. It is reported now.
+         */
+        micDeadRef.current = bytes < MIN_LIVE_AUDIO_BYTES;
 
+        const effectiveStart = speechStartedAt ?? dgSpeechStartedRef.current ?? answerStartRef.current;
         resolve({
-          blob: new Blob(chunksRef.current, { type: 'audio/webm' }),
-          startedAt: speechStartedAt,
+          blob: new Blob(chunksRef.current, { type: recorder.mimeType || mimeType || 'audio/webm' }),
+          mimeType: recorder.mimeType || mimeType || 'audio/webm',
+          bytes,
+          speechDetected: speechStartedAt !== null || dgSpeechStartedRef.current !== null,
+          liveSttUsable: Boolean(stt) && !dgFailedRef.current,
+          startedAt: effectiveStart,
           endedAt: speechEndedAt ?? Date.now(),
         });
       };
@@ -478,18 +817,47 @@ export default function LiveInterviewPage() {
         // 250ms slices. Small enough that Deepgram is transcribing continuously
         // rather than in visible jumps, large enough not to flood the socket.
         recorder.start(250);
-      } catch {
+      } catch (err) {
+        console.error('[interview] MediaRecorder could not be started', err);
+        micUnavailableRef.current = true;
         return resolve(null);
       }
 
-      const data = new Uint8Array(analyser.frequencyBinCount);
+      /*
+       * The hard ceiling on one answer, on a timer rather than a frame callback.
+       *
+       * Every rule below runs inside `requestAnimationFrame`, which browsers
+       * stop delivering to a hidden tab. A candidate who switches windows
+       * mid-answer therefore froze the turn: the recorder kept running, no stop
+       * rule could ever fire, and the loop waited on a promise nothing would
+       * resolve. A timer keeps ticking while hidden, so the answer always ends.
+       */
+      const hardStop = setTimeout(
+        () => {
+          if (recorder.state === 'recording') {
+            console.warn('[interview] answer hit the hard ceiling; stopping the recorder');
+            recorder.stop();
+          }
+        },
+        MAX_ANSWER_MS,
+      );
+      recorder.addEventListener('stop', () => clearTimeout(hardStop), { once: true });
+
+      const data = analyser ? new Uint8Array(analyser.frequencyBinCount) : null;
 
       const tick = () => {
         if (recorder.state !== 'recording') return;
 
-        analyser.getByteTimeDomainData(data);
-        const rms =
-          Math.sqrt(data.reduce((acc, v) => acc + (v - 128) ** 2, 0) / data.length) / 128;
+        /*
+         * No analyser means no amplitude reading, and that is survivable: the
+         * waveform sits flat and `speaking` is decided by Deepgram alone. What
+         * must not happen is the turn ending because a cosmetic node is missing.
+         */
+        let rms = 0;
+        if (analyser && data) {
+          analyser.getByteTimeDomainData(data);
+          rms = Math.sqrt(data.reduce((acc, v) => acc + (v - 128) ** 2, 0) / data.length) / 128;
+        }
 
         setAmplitude(Math.min(1, rms * 6));
 
@@ -511,8 +879,10 @@ export default function LiveInterviewPage() {
 
         // Deepgram may have heard speech the amplitude threshold missed —
         // someone softly spoken, or a distant microphone.
-        if (streaming && dgSpeechStartedRef.current !== null) {
+        if (dgSpeechStartedRef.current !== null) {
           speechStartedAt ??= dgSpeechStartedRef.current;
+          speechEndedAt = now;
+          silenceSince = null;
         }
 
         // The grace floor. No stop decision of any kind before it elapses, so a
@@ -570,7 +940,7 @@ export default function LiveInterviewPage() {
     liveSttRef.current = null;
 
     return { ...recorded, live: live?.transcript ? live : null };
-  }, [voiceToken]);
+  }, [voiceToken, audioContext, ensureMicrophone]);
 
   /**
    * Plays one clip, driving the waveform from its real amplitude.
@@ -598,28 +968,44 @@ export default function LiveInterviewPage() {
     audio.src = url;
     audioElRef.current = audio;
 
-    // The analyser is what makes the waveform honest (sitemap §9), but it is
-    // also the part that can fail. If wiring it up throws — CORS refused, or
-    // the element is already attached to another context — fall back to plain
-    // playback. A flat waveform is a cosmetic loss; silence is not.
-    let ctx: AudioContext | null = null;
+    /*
+     * The analyser is what makes the waveform honest (sitemap §9), but it is
+     * also the part that can fail. If wiring it up throws — CORS refused, or
+     * the element is already attached to another context — fall back to plain
+     * playback. A flat waveform is a cosmetic loss; silence is not.
+     *
+     * The context is the PAGE's, borrowed for this clip and left open
+     * afterwards. It used to be built and closed per clip, which reconfigured
+     * the audio device between every question and answer and took the
+     * microphone down with it. Nothing here closes it now; `teardown` owns its
+     * lifetime.
+     */
+    const ctx = await audioContext();
+    let source: MediaElementAudioSourceNode | null = null;
     let analyser: AnalyserNode | null = null;
 
-    try {
-      ctx = new AudioContext();
-      // A context created outside a user gesture starts suspended, and a
-      // suspended context plays nothing.
-      if (ctx.state === 'suspended') await ctx.resume();
-
-      const source = ctx.createMediaElementSource(audio);
-      analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      analyser.connect(ctx.destination);
-    } catch {
-      void ctx?.close();
-      ctx = null;
-      analyser = null;
+    if (ctx) {
+      try {
+        source = ctx.createMediaElementSource(audio);
+        analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        analyser.connect(ctx.destination);
+      } catch (err) {
+        console.warn('[interview] could not wire clip into the audio graph', err);
+        /*
+         * Once `createMediaElementSource` has succeeded the element no longer
+         * reaches the speakers on its own — its output belongs to the graph. So
+         * a failure AFTER that point must reconnect it to the destination
+         * directly, or the clip plays to nowhere and the interviewer is mute.
+         */
+        try {
+          source?.connect(ctx.destination);
+        } catch {
+          /* nothing more to try; the element is on its own */
+        }
+        analyser = null;
+      }
     }
 
     await new Promise<void>((resolve) => {
@@ -633,7 +1019,19 @@ export default function LiveInterviewPage() {
         // from the promise keeps making sound.
         audio.pause();
         setAmplitude(0);
-        void ctx?.close();
+        /*
+         * Unhook this clip's nodes but leave the context running. A
+         * MediaElementAudioSourceNode stays bound to its element for that
+         * element's lifetime, so the only cleanup available — and the only one
+         * needed, since the element is discarded with the clip — is dropping it
+         * out of the graph.
+         */
+        try {
+          source?.disconnect();
+          analyser?.disconnect();
+        } catch {
+          /* already detached */
+        }
         resolve();
       };
 
@@ -660,15 +1058,29 @@ export default function LiveInterviewPage() {
         .play()
         .then(() => tick())
         .catch((err) => {
-          console.warn('[interview] playback blocked', err);
+          /*
+           * Every failure here resolves the promise, including AbortError.
+           *
+           * AbortError means the clip was interrupted by a pause or a new src —
+           * which is expected — but returning without calling `finish()` left
+           * the promise pending forever, and `speak` awaits it, and the turn
+           * loop awaits `speak`. One interrupted clip wedged the whole
+           * interview with no error anywhere.
+           */
+          if ((err as Error)?.name !== 'AbortError') {
+            console.warn('[interview] playback blocked', err);
+          }
           finish();
         });
     });
-  }, []);
+  }, [audioContext]);
 
   /** Speaks a whole turn: every clip in order, then hands the floor back. */
   const speak = useCallback(
     async (segments: Array<{ url: string }>, fallbackDurationSec: number) => {
+      // Pre-warm the voice token in background while the interviewer is speaking
+      void voiceToken();
+
       setPhase('speaking');
 
       if (segments.length === 0) {
@@ -685,7 +1097,7 @@ export default function LiveInterviewPage() {
       }
       setAmplitude(0);
     },
-    [playClip],
+    [playClip, voiceToken],
   );
 
   // ── The loop ───────────────────────────────────────────────────────────────
@@ -693,10 +1105,6 @@ export default function LiveInterviewPage() {
   const runTurn = useCallback(
     async (answerPayload: Record<string, unknown> | undefined) => {
       setPhase('thinking');
-
-      // The question this answer was given to, captured before the turn
-      // advances — /reflect needs to know what it is reflecting on.
-      const answeredQuestionId = lastQuestionIdRef.current;
 
       const res = await fetch(`/api/sessions/${sessionId}/turn`, {
         method: 'POST',
@@ -725,38 +1133,29 @@ export default function LiveInterviewPage() {
       }
 
       setQuestion(data.question);
+      setQuestionGoal(
+        data.goal?.statement
+          ? { statement: data.goal.statement, pursuing: data.goal.pursuing ?? [] }
+          : null,
+      );
       setSectionTitle(data.section?.title ?? '');
       setProgress(data.progress ?? { sectionsTotal: 0, sectionsCompleted: 0 });
       setPartial('');
       lastQuestionIdRef.current = data.questionId ?? null;
 
       /*
-       * The slow lane, started here and deliberately NOT awaited.
+       * No second request any more.
        *
-       * The turn above made no model call — it played the next prepared
-       * question — so this is where the interviewer actually reads what was
-       * said and decides whether to come back to it. It runs for the two or
-       * three seconds the interviewer is speaking, and its result is picked up
-       * by a later turn.
-       *
-       * Fired after /turn resolves rather than alongside it so the state it
-       * reads already includes this answer.
+       * `/turn` used to be followed by a `/reflect` call that read the answer
+       * properly and queued a probe for a later turn, because the turn itself
+       * had no latency budget to write one. The interviewer now decides and
+       * writes inside the turn, so the follow-up it wants to ask is the
+       * question it just asked.
        */
-      if (answerPayload && answeredQuestionId) {
-        void fetch(`/api/sessions/${sessionId}/reflect`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            questionId: answeredQuestionId,
-            transcript: answerPayload.transcript,
-            wordCount: answerPayload.wordCount,
-            durationSec: answerPayload.durationSec,
-          }),
-        }).catch(() => null);
-      }
 
-      // Closing the editor happens up front; opening it does not.
+      // Closing an editor happens up front; opening one does not.
       if (data.mode !== 'coding') setChallenge(null);
+      if (data.mode !== 'skill_challenge') setSkillChallenge(null);
 
       await speak(data.audio?.segments ?? [], 4);
 
@@ -775,6 +1174,13 @@ export default function LiveInterviewPage() {
         pauseBillingForCoding();
         setChallenge(data.challenge as CodingChallengeView);
       }
+
+      // The skill round follows the same rule for the same reason: reading a
+      // schema or unfamiliar broken code is not conversation and is not billed.
+      if (data.mode === 'skill_challenge' && data.skillChallenge) {
+        pauseBillingForCoding();
+        setSkillChallenge(data.skillChallenge as SkillChallengeView);
+      }
       return data;
     },
     [sessionId, router, speak, pauseBillingForCoding, codingSecondsSoFar],
@@ -783,13 +1189,98 @@ export default function LiveInterviewPage() {
   /**
    * Records one answer and transcribes it. Returns null when there was nothing
    * usable to send — better to re-ask than to hand silence to the grader.
+   *
+   * ── Re-asking is only the right answer for SILENCE ──────────────────────────
+   * This used to return null for three quite different situations and treat them
+   * identically: the candidate said nothing, the recorder produced nothing, and
+   * the live socket produced nothing. Only the first is a candidate who needs
+   * prompting. The other two are faults, and re-asking a broken microphone just
+   * runs the interview to its end recording no answers at all — which is exactly
+   * what happened, three sessions in a row, each ending on "No answers were
+   * recorded in this session."
    */
+  /**
+   * Stops the interview once the microphone has failed twice running.
+   *
+   * Two strikes rather than one because the first is often recoverable — a
+   * device switch, a headset reconnecting — and `captureAnswer` re-opens the
+   * device between them. A second failure after a fresh `getUserMedia` is a
+   * capture path that is genuinely broken, and continuing would produce an
+   * interview with no answers in it.
+   */
+  const failCaptureIfExhausted = useCallback(() => {
+    if (micDeadStreak.current < 2) return;
+    setError(
+      'We are not receiving any audio from your microphone. Check that the right input ' +
+        'device is selected and that no other app (Zoom, Teams, Discord) is holding it, ' +
+        'then reload to restart the interview.',
+    );
+    setPhase('failed');
+    aborted.current = true;
+  }, []);
+
   const captureAnswer = useCallback(async (): Promise<Record<string, unknown> | null> => {
     setPhase('listening');
 
     const recorded = await recordAnswer();
-    if (!recorded || recorded.blob.size < 1000) return null;
 
+    /*
+     * A window that could not be OPENED is a fault, not a quiet candidate.
+     *
+     * Returning null here without saying anything is what let the loop sprint:
+     * `captureAnswer` handed back undefined, `runTurn` was called with no
+     * answer, the interviewer asked the next question, and the whole plan went
+     * past in seconds with nothing recorded. It counts against the strike
+     * budget like a dead window, because that is what it is.
+     */
+    if (!recorded) {
+      if (!micUnavailableRef.current || aborted.current) return null;
+
+      micDeadStreak.current += 1;
+      console.error(
+        `[interview] could not open an answer window — no usable microphone ` +
+          `(streak ${micDeadStreak.current}).`,
+      );
+      failCaptureIfExhausted();
+      return null;
+    }
+
+    /*
+     * Nothing came off the microphone. Say so, and stop after the second one
+     * rather than conducting an entire interview into a dead input.
+     */
+    if (micDeadRef.current || recorded.bytes < MIN_LIVE_AUDIO_BYTES) {
+      micDeadStreak.current += 1;
+      console.error(
+        `[interview] microphone produced ${recorded.bytes} bytes in this answer window ` +
+          `(streak ${micDeadStreak.current}). Expected tens of kilobytes even in silence.`,
+      );
+
+      /*
+       * One repair attempt before giving up on the device.
+       *
+       * A track that has ended stays ended, so the second window would produce
+       * zero bytes exactly like the first and the interview would fail on a
+       * fault that re-opening the device fixes. Costs one `getUserMedia` on a
+       * permission that is already granted.
+       */
+      if (micDeadStreak.current === 1 && !aborted.current) {
+        console.warn('[interview] re-opening the microphone after a dead answer window');
+        await acquireMicrophone().catch((err) => {
+          console.error('[interview] microphone re-open failed', err);
+        });
+      }
+
+      failCaptureIfExhausted();
+      return null;
+    }
+
+    micDeadStreak.current = 0;
+    console.info(
+      `[interview] answer captured: ${(recorded.bytes / 1024).toFixed(0)} KB, ` +
+        `speech=${recorded.speechDetected}, liveSTT=${recorded.liveSttUsable}, ` +
+        `transcript="${(recorded.live?.transcript ?? '').slice(0, 60)}"`,
+    );
     setPhase('thinking');
 
     /*
@@ -808,16 +1299,44 @@ export default function LiveInterviewPage() {
     let asrConfidence = recorded.live?.confidenceAvg;
 
     if (!transcript) {
-      // The socket never opened, or closed with nothing. The clip is still in
-      // hand, so the answer is recovered rather than lost.
+      /*
+       * ── When an empty live transcript is worth a second opinion ────────────
+       *
+       * A healthy socket that heard nothing while nothing was detected on the
+       * microphone either is simply a candidate who did not speak. That is an
+       * ordinary interview event, the interviewer prompts, and paying for a
+       * batch pass over a clip of silence would buy the same empty string.
+       *
+       * Anything else — the socket never opened, it died mid-answer, or speech
+       * WAS detected and the socket still came back empty — is a fault, and the
+       * recording exists precisely so the answer survives it.
+       */
+      if (recorded.liveSttUsable && !recorded.speechDetected) {
+        setPartial('');
+        return null;
+      }
+
+      /*
+       * This is the path that never ran. The 1000-byte floor above it returned
+       * null before reaching here, so a failed socket meant a lost answer rather
+       * than a slower one — the entire point of keeping the recording.
+       */
+      console.warn('[interview] live STT returned nothing; recovering via batch transcription');
+
+      const ext = recorded.mimeType.includes('mp4') ? 'mp4' : recorded.mimeType.includes('ogg') ? 'ogg' : 'webm';
       const form = new FormData();
-      form.set('audio', new File([recorded.blob], 'answer.webm', { type: 'audio/webm' }));
+      // The recorder's real type, not an assumed one: Deepgram is told what it
+      // is actually being handed instead of being left to fail on a mislabel.
+      form.set('audio', new File([recorded.blob], `answer.${ext}`, { type: recorded.mimeType }));
 
       const res = await fetch(`/api/sessions/${sessionId}/transcribe`, { method: 'POST', body: form });
-      const stt = await res.json();
+      const stt = await res.json().catch(() => ({}) as { transcript?: string; error?: string });
 
       if (!res.ok) {
-        setError(stt.error ?? 'We could not hear that clearly.');
+        // Not fatal on its own — one lost answer beats a dead interview, and
+        // the interviewer will follow up. Only a repeated failure ends the run.
+        console.error('[interview] batch transcription failed', res.status, stt?.error);
+        setError(stt?.error ?? 'We could not hear that clearly.');
         setPhase('failed');
         return null;
       }
@@ -825,6 +1344,16 @@ export default function LiveInterviewPage() {
       transcript = stt.transcript ?? '';
       words = stt.words ?? [];
       asrConfidence = undefined;
+    }
+
+    /*
+     * Audio was captured but nothing was recognised in it — a candidate who
+     * coughed, or spoke too far from the microphone. That IS a silence, and
+     * re-asking is the right response, so it returns null like one.
+     */
+    if (!transcript.trim()) {
+      setPartial('');
+      return null;
     }
 
     // The authoritative transcript replaces the interim one — unless it came
@@ -855,7 +1384,7 @@ export default function LiveInterviewPage() {
       // Uploaded to Storage by /turn and read once by E2 at evaluation time.
       words,
     };
-  }, [sessionId, recordAnswer]);
+  }, [sessionId, recordAnswer, acquireMicrophone, failCaptureIfExhausted]);
 
   /**
    * Hands the floor to the editor and waits.
@@ -900,6 +1429,40 @@ export default function LiveInterviewPage() {
   }, [pauseBillingForCoding, resumeBillingAfterCoding]);
 
   /**
+   * The skill round's equivalent. Same shape, one difference that matters.
+   *
+   * There is no test tally to put in the header line, because nothing ran —
+   * SV reads this submission after the interview. So the header states what the
+   * task was instead, which is what the interviewer needs in order to ask its
+   * follow-up about the right thing.
+   */
+  const runSkillRound = useCallback(async (): Promise<Record<string, unknown> | null> => {
+    pauseBillingForCoding();
+
+    const summary = await new Promise<SkillSummary | null>((resolve) => {
+      skillDoneRef.current = resolve;
+    });
+
+    resumeBillingAfterCoding();
+    skillDoneRef.current = null;
+    setSkillChallenge(null);
+
+    if (!summary) return null;
+
+    return {
+      transcript:
+        `[Submitted ${summary.skill} ${summary.format} task "${summary.title}" in ${summary.language}]
+
+` +
+        summary.source,
+      durationSec: 0,
+      wordCount: summary.source.split(/\s+/).filter(Boolean).length,
+      startMs: 0,
+      endMs: 0,
+    };
+  }, [pauseBillingForCoding, resumeBillingAfterCoding]);
+
+  /**
    * The turn loop. An explicit `while` rather than recursion: a self-referencing
    * callback captures a stale closure of everything it closes over, and after
    * twenty-five turns that is exactly the kind of bug you cannot reproduce.
@@ -924,29 +1487,43 @@ export default function LiveInterviewPage() {
         const next = await runTurn(answer);
         if (!next || aborted.current) return; // finished, aborted, or already surfaced
 
-        // A coding section replaces listening with the editor.
+        // Either module section replaces listening with the editor. Everything
+        // else — including the turns AFTER a submission, where the interviewer
+        // asks about what was written — goes back to the microphone.
         answer =
           (next.mode === 'coding' && next.challenge
             ? await runCodingRound()
-            : await captureAnswer()) ?? undefined;
+            : next.mode === 'skill_challenge' && next.skillChallenge
+              ? await runSkillRound()
+              : await captureAnswer()) ?? undefined;
       }
     } finally {
       loopRunning.current = false;
     }
-  }, [runTurn, captureAnswer, runCodingRound]);
+  }, [runTurn, captureAnswer, runCodingRound, runSkillRound]);
 
   const begin = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      attachAnalyser(stream);
+      /*
+       * Opened FIRST, while the click that called this is still the current
+       * user gesture. A context created later — after the `await` below has
+       * spent the gesture — starts suspended, and on some browsers `resume()`
+       * on it then stays pending until the next click that never comes.
+       */
+      await audioContext();
+
+      await acquireMicrophone();
+
       startedAt.current = Date.now();
+      // Pre-warm the voice token so the first answer starts instantly
+      void voiceToken();
       void runLoop();
-    } catch {
+    } catch (err) {
+      console.error('[interview] could not start the microphone', err);
       setError('We need your microphone to run the interview.');
       setPhase('failed');
     }
-  }, [attachAnalyser, runLoop]);
+  }, [acquireMicrophone, audioContext, voiceToken, runLoop]);
 
   /**
    * Stops everything this page owns: the turn loop, playback, the recorder, and
@@ -974,8 +1551,9 @@ export default function LiveInterviewPage() {
      */
     resumeBillingAfterCoding();
 
-    // Release a loop parked on the coding promise, or it never returns.
+    // Release a loop parked on either editor promise, or it never returns.
     codingDoneRef.current?.(null as unknown as CodingSummary);
+    skillDoneRef.current?.(null);
     stopPlaybackRef.current?.();
     // Dropped, not drained: the interview is over, so there is no answer left
     // to recover and nothing to wait for the trailing finals on.
@@ -991,6 +1569,11 @@ export default function LiveInterviewPage() {
 
     audioElRef.current?.pause();
     streamRef.current?.getTracks().forEach((t) => t.stop());
+    // The page's one context, closed here and nowhere else — playback used to
+    // close it after every clip, which is what left the microphone dead.
+    micCtxRef.current?.close().catch(() => null);
+    micCtxRef.current = null;
+    analyserRef.current = null;
     setAmplitude(0);
   }, [resumeBillingAfterCoding]);
 
@@ -1016,11 +1599,24 @@ export default function LiveInterviewPage() {
     router.replace(`/sessions/${sessionId}/processing`);
   }, [sessionId, router, teardown, codingSecondsSoFar]);
 
-  // Leaving the page by any route — back button, a redirect, a crash elsewhere —
-  // must stop the loop too.
-  useEffect(() => teardown, [teardown]);
+  /*
+   * Leaving the page by any route — back button, a redirect, a crash elsewhere
+   * — must stop the loop too.
+   *
+   * Routed through a ref so the effect can depend on nothing. Registering
+   * `teardown` itself as the cleanup with `[teardown]` meant that the day
+   * anything in its closure stopped being stable, React would run it BETWEEN
+   * renders: microphone stopped, socket aborted, loop aborted, mid-interview,
+   * for a re-render. Unmount is the only event that should reach it.
+   */
+  const teardownRef = useRef(teardown);
+  useEffect(() => {
+    teardownRef.current = teardown;
+  }, [teardown]);
+  useEffect(() => () => teardownRef.current(), []);
 
   useEffect(() => {
+    mutedRef.current = muted;
     if (!streamRef.current) return;
     streamRef.current.getAudioTracks().forEach((t) => (t.enabled = !muted));
   }, [muted]);
@@ -1120,6 +1716,23 @@ export default function LiveInterviewPage() {
     );
   }
 
+  // The skill round takes the screen on the same terms, and is checked second
+  // so that a stale coding challenge can never be masked by one.
+  if (skillChallenge) {
+    return (
+      <SkillMode
+        sessionId={sessionId}
+        challenge={skillChallenge}
+        elapsedLabel={formatTime(elapsed)}
+        waveform={<Waveform phase={phase} amplitude={amplitude} />}
+        interviewerLine={question}
+        getDraft={getSkillDraft}
+        onDraftChange={saveSkillDraft}
+        onSubmitted={(summary) => skillDoneRef.current?.(summary)}
+      />
+    );
+  }
+
   return (
     <Shell>
       <div className="w-full max-w-3xl flex flex-col h-full">
@@ -1143,6 +1756,27 @@ export default function LiveInterviewPage() {
 
         {/* The question — stays on screen for the whole answer */}
         <div className="flex-1 flex flex-col justify-center">
+          {/*
+            What this question is for, above the question and deliberately
+            quieter than it.
+
+            Only the goal STATEMENT is shown. The evidence descriptions behind it
+            ("Names the specific workload deployed") travel in the same payload
+            and are stored with the question, but they are the marking scheme —
+            putting them on screen would tell the candidate the exact phrase that
+            scores, and the answer would stop measuring anything.
+          */}
+          {questionGoal && (
+            <div className="max-w-2xl mx-auto text-center mb-5">
+              <p className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[#1B1F3B]/45">
+                What I&apos;m trying to find out
+              </p>
+              <p className="text-sm md:text-base text-[#1B1F3B]/70 leading-snug mt-1.5">
+                {questionGoal.statement}
+              </p>
+            </div>
+          )}
+
           <p className="font-[family-name:var(--font-display)] text-2xl md:text-4xl font-extrabold text-[#1B1F3B] text-center leading-snug mb-10">
             {question}
           </p>

@@ -1,54 +1,44 @@
 /**
- * O1 · The live turn cycle — agentdesign.md §2.2, pipelined.
+ * O1 · The live turn cycle.
  *
- * ── The fast lane · `runTurn` · ZERO model calls ────────────────────────────
+ *   answer → L3 lexical ingest (<40ms) → IV interviewer (one Groq call)
+ *          → §4 structural overrides (~1ms) → speech      ⟂ L3v, L2 off-path
  *
- *   answer → L3 lexical ingest (<40ms) → §4 rules (~1ms) → top-ranked question
- *          → prepared audio                    ⟂ L3v, L2, L6 concurrent/off-path
+ * ── One model call, and it does everything ──────────────────────────────────
+ * §2.2 put L1 (deciding) and L4 (wording) in series inside this path, and the
+ * candidate paid for both in silence after every answer. A later revision took
+ * them out entirely and deferred adaptivity to a second HTTP request, which
+ * removed the silence but meant the question asked next was always one P6 had
+ * written in advance.
  *
- * §2.2 originally put L1 and L4 inside this path, and the candidate paid for
- * both in silence after every answer: up to 1.2s deciding, 0.9s wording, then
- * speech synthesis, none of which could start until they stopped talking.
+ * Neither arrangement is here now. `IV` decides AND speaks in a single call on
+ * a provider fast enough to do it inside the turn (see lib/agents/interviewer.ts
+ * for why the D2/D3 split is deliberately not preserved). The interviewer writes
+ * its own questions against what the candidate actually said, digs into an
+ * answer immediately rather than two turns later, and can answer a question
+ * asked back at it.
  *
- * Neither runs here now. The next question comes from the rule layer's own
- * ranking — which is not a downgrade, because §4 has already reduced the field
- * to what is legal, dropped questions whose evidence is verified (R11), varied
- * the question kind (R13), enforced the section budget (R12) and sorted by goal
- * priority. Choosing among those eight was L1's entire job.
- *
- * ── The slow lane · `reflectOnAnswer` · a separate request ──────────────────
- *
- * The adaptivity is deferred, not removed. `/reflect` runs L1 and L4 against the
- * answer WITH the transcript — which the live loop was never permitted to see
- * (§10 bars it from L1's prompt to stop context creep) — and queues a worded
- * follow-up for a turn or two later, prefaced so it reopens the topic by name.
- * The interviewer asks the next planned question immediately and comes back to
- * what you said a moment afterwards, which is also what a person does.
- *
- * It is a separate HTTP request rather than background work because there is no
- * job queue here, and work started after a response is flushed is not guaranteed
- * to survive on serverless compute.
- *
- * The orchestrator still makes NO interview decisions (invariant 1). Everything
- * below is sequencing, budget enforcement, and persistence. Where it looks like
- * it is deciding — picking the next section, ending the interview — it is
- * applying a ceiling the blueprint or the strategy already set.
+ * ── What the orchestrator still owns ────────────────────────────────────────
+ * Invariant 1 holds: no interview decision is made in this file. It sequences,
+ * it persists, and it enforces ceilings the blueprint and the strategy already
+ * set — the section question budget, the two-strike rule, the difficulty step,
+ * the hard time stop. The interviewer proposes; `applyStructuralRules` disposes.
+ * That is D8 unchanged: constraints in code, judgement in the model.
  */
 
-import type { Blueprint, ConversationalIntent, UtterancePlan } from '../agents/schemas';
-import { runConversationManager } from '../agents/l1-conversation';
-import { neutralPlan, runDialogueStyler } from '../agents/l4-styler';
+import type {
+  Blueprint,
+  ConversationalIntent,
+  InterviewerTurn,
+  UtterancePlan,
+} from '../agents/schemas';
+import { runInterviewer, type InterviewerInput } from '../agents/interviewer';
+import { DIFFICULTY_BRIEF } from '../agents/p5-strategy';
 import { runMemoryExtraction } from '../agents/l2-memory';
-import { runCandidateQuestion } from '../agents/l6-candidate-question';
-import {
-  callbackNouns,
-  markCallbackSpent,
-  mergeExtraction,
-  openCallbacks,
-  type InterviewMemory,
-} from '../engine/l2-memory-store';
+import { mergeExtraction, openCallbacks, type InterviewMemory } from '../engine/l2-memory-store';
 import {
   applyEvidenceVerdicts,
+  buildRubric,
   checkGoalExit,
   ingestAnswer,
   isSectionComplete,
@@ -56,13 +46,14 @@ import {
 import { runEvidenceCheck } from '../agents/l3-verify';
 import {
   ACKNOWLEDGEMENT_POOL,
+  isRepeatQuestion,
   legalActions,
   pickAcknowledgement,
   validateAndRepairPlan,
-  validateIntent,
   type RuleInput,
 } from '../engine/rules';
 import {
+  NO_FLOOR_SECTIONS,
   SECTION_QUESTION_BUDGET,
   withRuntimeDefaults,
   type CandidateAction,
@@ -79,40 +70,6 @@ export interface LiveState {
   questions: QuestionRecord[];
   strategy?: { difficulty_curve: { start_level: number; max_level: number } };
 }
-
-/**
- * A dig-deeper question produced by `/reflect` from an earlier answer.
- *
- * Carries its own preface because by the time it is asked, one or two other
- * questions have been asked in between — so it has to reopen the topic
- * explicitly ("Coming back to the ingestion pipeline you mentioned —") or the
- * candidate answers it at the wrong scope.
- */
-export interface PendingFollowup {
-  v: 2;
-  /** The full spoken line, preface included. Already worded by L4. */
-  question: string;
-  /** Which answer prompted it, for the transcript record. */
-  fromQuestionId: string;
-  goalId: string | null;
-  targetsEvidence: string[];
-  gradingMode: QuestionRecord['grading_mode'];
-  /** Turn at which it was produced. Used to expire it if it goes stale. */
-  createdAtTurn: number;
-  /** L1's difficulty judgement, applied when this is asked. */
-  difficultyDelta: number;
-  emotionalTone: string;
-}
-
-/**
- * How many turns a deferred follow-up may wait before it is dropped.
- *
- * Two is the point of the design — ask it after the next question, or the one
- * after if that one was itself deferred. Beyond that the candidate has moved on
- * twice and reopening reads as the interviewer losing the thread rather than
- * keeping it.
- */
-const FOLLOWUP_MAX_AGE_TURNS = 2;
 
 export interface TurnInput {
   sessionId: string;
@@ -137,51 +94,25 @@ export interface TurnInput {
   maxDurationSec: number;
   /** Sets R12's per-section question budget. Defaults to medium. */
   difficulty?: 'easy' | 'medium' | 'hard';
-  /**
-   * Material for answering a question the CANDIDATE asks (L6).
-   *
-   * Supplied by the route only when the last answer looks like a question, so an
-   * ordinary turn pays neither the database read nor the model call.
-   */
-  employer?: {
-    roleTitle: string;
-    companyName: string;
-    jdContext?: string;
-    companyContext?: string;
-  };
-  /** A follow-up `/reflect` prepared from an earlier answer, if one is waiting. */
-  pendingFollowup?: PendingFollowup | null;
 }
 
-/**
- * Does the last answer contain a question aimed at the interviewer?
+/*
+ * ── L6 and `/reflect` are gone, and both for the same reason ────────────────
  *
- * A deterministic gate in front of a model call, and the reason answering the
- * candidate costs nothing on the other twenty-four turns. Two ways in: the
- * interviewer explicitly invited questions, or the candidate's own words are
- * shaped like one.
+ * L6 answered a question the candidate asked back, behind a regex gate that
+ * guessed whether the last answer was really a question. `/reflect` generated a
+ * dig-deeper probe in a second HTTP request and queued it for a turn or two
+ * later, because the turn had no budget to write one.
  *
- * Exported because the route uses the same test to decide whether to load the
- * employer material at all.
+ * The interviewer does both, in the turn, from the conversation itself:
+ * ANSWER_QUESTION replaces the first and DEEP_DIVE the second. Neither needs a
+ * heuristic to detect the situation, because the model can see it — and a probe
+ * that arrives immediately is worth more than one that arrives after the
+ * candidate has moved on twice.
+ *
+ * The employer material L6 needed now lives in `blueprint.context`, which the
+ * interviewer already reads on every turn.
  */
-export function looksLikeCandidateQuestion(transcript: string, askedQuestion: string): boolean {
-  const asked = askedQuestion.toLowerCase();
-  const invited =
-    /\b(any questions|questions for me|anything you'?d like to ask|anything you want to know|anything else you)\b/.test(
-      asked,
-    );
-
-  const said = transcript.toLowerCase();
-  // An invitation counts even without a question mark — "yeah, what does the
-  // team look like" is a question however the transcriber punctuated it.
-  const interrogative =
-    /\b(what|how|why|when|where|who|which|is there|are there|do you|does the|could you|can you|would i|will i|what'?s)\b/.test(
-      said,
-    );
-
-  if (invited) return interrogative || said.includes('?');
-  return said.includes('?') && interrogative;
-}
 
 export interface TurnOutput {
   state: LiveState;
@@ -192,6 +123,25 @@ export interface TurnOutput {
     /** Cache key: a clip is played only when its text matches exactly. */
     cacheText: string;
     bankId?: string;
+    /**
+     * What this question is trying to establish, resolved as it is asked.
+     *
+     * Not a new decision and not a new model call: the interviewer already
+     * named `target_goal`, `resolveGeneratedQuestion` already joined it to the
+     * evidence, and P6 wrote both before the interview began. This is a lookup
+     * over objects already in memory — the whole reason it can be surfaced
+     * without costing the turn a millisecond.
+     *
+     * It exists so the candidate can see what a question is FOR while they are
+     * answering it, and so the report's goal outcomes are the same statements
+     * the candidate was shown rather than a post-hoc reconstruction.
+     */
+    goal: {
+      goal_id: string;
+      statement: string;
+      /** The specific evidence descriptions this question is aimed at. */
+      pursuing: string[];
+    } | null;
   } | null;
   finished: boolean;
   intent: ConversationalIntent | null;
@@ -202,6 +152,8 @@ export interface TurnOutput {
     l4Fallback: boolean;
     ruleRepairs: string[];
     intentRejected?: string;
+    /** What the interviewer decided to do. Read by ops queries on agent_runs. */
+    action?: ConversationalIntent['action'];
     newlyVerified: string[];
   };
 }
@@ -276,30 +228,6 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
       ? startEvidenceCheck(state, blueprint, lastQuestion, input.answer.transcript, context)
       : null;
 
-  /*
-   * L6 · did they ask US something? Launched alongside L1 for the same reason.
-   *
-   * The interviewer used to take "so what does the release process look like?"
-   * as an answer, grade it against a rubric, and ask the next question — which
-   * is the single rudest thing the system did. Now it gets answered before the
-   * interview continues.
-   */
-  const answeringCandidate =
-    input.answer && lastQuestion && input.employer &&
-    looksLikeCandidateQuestion(input.answer.transcript, lastQuestion.text)
-      ? runCandidateQuestion(
-          {
-            transcript: input.answer.transcript,
-            askedQuestion: lastQuestion.text,
-            roleTitle: input.employer.roleTitle,
-            companyName: input.employer.companyName,
-            jdContext: input.employer.jdContext,
-            companyContext: input.employer.companyContext,
-          },
-          context,
-        ).catch(() => null)
-      : null;
-
   state.runtime.turn += 1;
   state.runtime.elapsed_sec = input.elapsedSec;
 
@@ -362,77 +290,143 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
   const section = blueprint.sections.find((s) => s.section_id === state.runtime.current_section_id);
 
   /*
-   * ── 4 · Choosing the next question, WITHOUT a model call ─────────────────
+   * ── 4 · The interviewer decides and speaks ───────────────────────────────
    *
-   * This is the pipelining change, and it is the whole latency story.
+   * One model call, on Groq, and the only one inside the turn. It reads the
+   * section brief, what is still outstanding, and the last few exchanges, and
+   * it writes the actual sentence the candidate hears.
    *
-   * The turn used to run L1 (≤1.2s) then L4 (≤0.9s) then synthesize speech,
-   * serially, while the candidate sat listening to nothing. None of that could
-   * begin until they stopped talking, so the floor on "silence after your
-   * answer" was the sum of all of it.
-   *
-   * It no longer runs either. Two sources supply the next question:
-   *
-   *   1. A follow-up `/reflect` prepared from an EARLIER answer, already worded
-   *      and already carrying its own preface.
-   *   2. Otherwise the rule layer's top-ranked legal action — which is not a
-   *      degraded choice. §4 has already filtered to what is legal, dropped
-   *      questions whose evidence is verified (R11), varied the question kind
-   *      (R13), enforced the section budget (R12) and ranked by goal priority.
-   *      L1's contribution was picking among those eight; the ranking already
-   *      encodes most of that judgement.
-   *
-   * The adaptivity L1 provided is not lost, it is DEFERRED — and it comes back
-   * better informed, because `/reflect` reads the actual transcript, which L1
-   * was never allowed to see (§10 bars it from the live prompt). The interviewer
-   * asks the next planned question immediately and returns to what you said a
-   * moment later, which is also what a person does.
+   * The blueprint is a map, not a route. This is where the driving happens —
+   * following what the candidate opened up, digging into what they just said,
+   * answering when they ask something back, and still arriving at the
+   * milestones. What it cannot do is override structure: the section budget,
+   * the two-strike rule and the time ceiling are enforced below, in code,
+   * whatever it decides (D8 — constraints belong in code, judgement in the
+   * model).
    */
-  const followup = usablePendingFollowup(input.pendingFollowup, state.runtime.turn);
+  const budget = SECTION_QUESTION_BUDGET[input.difficulty ?? 'medium'];
+  const nextUp = nextSectionAfter(blueprint, state.runtime.current_section_id);
 
-  let intent: ConversationalIntent;
-  let intentRejected: string | undefined;
+  /*
+   * ── The clock, computed once ────────────────────────────────────────────
+   *
+   * P6 estimates each section (`time_budget_sec`, rescaled to the interview's
+   * real ceiling); this measures what has actually been spent in it. Both the
+   * interviewer's prompt and the structural rules below read the SAME derived
+   * pace, because a prompt that says "you have room" while the rules force a
+   * handoff produces a question that is written and then thrown away.
+   *
+   * `ahead` is deliberately generous — under 70% of the budget — so that "you
+   * have time, go deeper" fires while there is genuinely time to go deeper in,
+   * rather than at the ninety-second mark when there is not.
+   */
+  const sectionElapsedSec = Math.max(0, input.elapsedSec - state.runtime.section_started_sec);
+  const sectionBudgetSec = section?.time_budget_sec ?? 240;
+  const sectionCeilingSec = section?.time_ceiling_sec ?? Math.round(sectionBudgetSec * 1.25);
+  const remainingSec = Math.max(0, input.maxDurationSec - input.elapsedSec);
+  const pace: 'ahead' | 'on_track' | 'over' =
+    sectionElapsedSec >= sectionCeilingSec
+      ? 'over'
+      : sectionElapsedSec < sectionBudgetSec * 0.7
+        ? 'ahead'
+        : 'on_track';
 
-  if (followup) {
-    intent = intentFromFollowup(followup);
-  } else {
-    intent = intentFromAction(shortlist[0], neutralIntent(answerWeak));
+  const iv = section
+    ? await runInterviewer(
+        {
+          context: blueprint.context,
+          section: {
+            title: section.title,
+            type: section.type,
+            objective: section.objective,
+            question_focus: section.question_focus,
+            must_verify: section.must_verify,
+          },
+          goals: openGoalsInSection(state, blueprint, section.section_id),
+          seeds: unaskedSeeds(state, section),
+          // Every question asked so far. Bounded by the interview's own length
+          // (~25 short strings) and the one thing that must never be forgotten.
+          askedQuestions: state.questions.map((q) => q.text).filter(Boolean),
+          recentTurns: recentExchanges(state, RECENT_TURN_WINDOW),
+          memory: openCallbacks(state.memory, 3),
+          runtime: state.runtime,
+          sectionBudget: { asked: state.runtime.questions_in_section, ...budget },
+          nextSection: nextUp ? { title: nextUp.title, type: nextUp.type } : null,
+          timing: {
+            sectionElapsedSec,
+            sectionBudgetSec,
+            elapsedSec: input.elapsedSec,
+            remainingSec,
+            pace,
+          },
+          difficultyBrief: DIFFICULTY_BRIEF[input.difficulty ?? 'medium'],
+          lastAnswerSignal: input.answer
+            ? {
+                wordCount: input.answer.wordCount,
+                newEvidenceCount: newlyVerified.length,
+                disclaimed,
+                weak: answerWeak,
+              }
+            : null,
+          persona: input.persona,
+        },
+        context,
+      )
+    : null;
 
-    // The same post-validation the model's choice used to face. The rule layer's
-    // own top pick is legal by construction, so this only ever fires if the two
-    // disagree about difficulty bounds — but it is cheap and it keeps §4 as the
-    // single authority on what is permitted.
-    const validation = validateIntent(intent, shortlist, ruleInput);
-    if (!validation.valid) {
-      intentRejected = validation.reason;
-      intent = { ...intent, difficulty_delta: 0 };
-    }
-  }
+  /*
+   * ── 5 · Structure is enforced here, not requested in the prompt ──────────
+   *
+   * D8's rule, applied to an agent that now writes its own questions. It can
+   * choose anything; these decide whether it is allowed to have chosen it.
+   */
+  const decided = applyStructuralRules({
+    proposed: iv?.turn ?? null,
+    runtime: state.runtime,
+    coverage: state.coverage,
+    section,
+    hasNextSection: Boolean(nextUp),
+    budget,
+    seeds: section ? unaskedSeeds(state, section) : [],
+    askedQuestions: state.questions.map((q) => q.text).filter(Boolean),
+    goalsOpen: section ? openGoalsInSection(state, blueprint, section.section_id).length : 0,
+    nextSectionOpener: nextUp?.goals[0]?.question_bank[0]?.text ?? null,
+    pace,
+    remainingSec,
+    fallback: () => ruleLayerIntent(shortlist[0], answerWeak),
+  });
+
+  const intent = decided.intent;
+  const intentRejected = decided.overrideReason;
 
   if (intent.action === 'CLOSE_INTERVIEW') {
     await collectVerdicts();
+    closeOutSection(state, state.runtime.current_section_id);
     state.runtime.finished = true;
     return finish(state, newlyVerified);
   }
 
+  /*
+   * A clarification is NOT an answer.
+   *
+   * "Which Spark do you mean?" is the candidate asking what the question was,
+   * and grading it against the rubric for the question they were asking about
+   * would score them as having failed to answer something they never got a
+   * clear version of. So the previous question stops being a graded record and
+   * the turn re-asks it properly.
+   */
+  if (decided.previousWasNotAnAnswer && lastQuestion) {
+    lastQuestion.status = 'skipped';
+    state.runtime.consecutive_weak_answers = 0;
+    if (lastQuestion.goal_id) {
+      state.runtime.dont_know_by_goal[lastQuestion.goal_id] = Math.max(
+        0,
+        (state.runtime.dont_know_by_goal[lastQuestion.goal_id] ?? 0) - 1,
+      );
+    }
+  }
+
   // ── 6 · Resolve what will actually be said ───────────────────────────────
-  const chosen = matchAction(shortlist, intent);
-  const resolved = resolveQuestionText(
-    blueprint,
-    intent,
-    chosen,
-    // The section being ENTERED when this is a transition, otherwise the one we
-    // are already in.
-    (intent.action === 'TRANSITION_SECTION'
-      ? nextSectionAfter(blueprint, state.runtime.current_section_id)?.type
-      : section?.type),
-  );
-
-  const callbackItem =
-    intent.action === 'CALLBACK' && intent.callback_memory_id
-      ? state.memory.items.find((i) => i.item_id === intent.callback_memory_id)
-      : undefined;
-
   const nextSection = intent.action === 'TRANSITION_SECTION'
     ? nextSectionAfter(blueprint, state.runtime.current_section_id)
     : undefined;
@@ -452,63 +446,59 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
   }
 
   /*
-   * ── 7 · Wording it, also without a model call ────────────────────────────
+   * The section this question belongs to — the one being ENTERED on a handoff.
    *
-   * `neutralPlan` is L4's own fallback and has always been the shape L4
-   * produces — an acknowledgement from the R5 pool, a transition the blueprint
-   * author wrote, and the bank question verbatim. L4 never rewrites a bank
-   * question anyway (`enforceVerbatimQuestion`), so on the overwhelmingly common
-   * path the model was choosing between eight fixed acknowledgement phrases at a
-   * cost of up to 900ms.
-   *
-   * Where genuinely new words are needed — a dig-deeper probe grounded in what
-   * the candidate said — L4 still writes them. It does it in `/reflect`, off the
-   * critical path, with the transcript in front of it.
+   * `grading_mode` follows from it, and that matters most for the two module
+   * rounds: a transition INTO the coding or skill section is the utterance the
+   * submission is recorded against, so if it is not graded in that mode,
+   * `aggregateSession` finds no questions of it and the whole round — and the
+   * module fee paid for it — produces nothing on the report.
    */
-  const followupPlan = followup ? { utterance: followup.question } : undefined;
+  const targetSection = nextSection ?? section;
+  const activeGoal = intent.target_goal
+    ? findBlueprintGoal(blueprint, intent.target_goal)
+    : undefined;
 
-  const l4 = {
-    plan: {
-      ...neutralPlan({
-        intent,
-        questionText: followupPlan?.utterance ?? resolved.text,
-        exitTransition: section?.exit_transitions[0],
-        entryTransition: nextSection?.entry_transitions[0],
-        callbackNouns: callbackItem ? callbackNouns(callbackItem) : undefined,
-        persona: input.persona,
-        runtime: state.runtime,
-        isFirstQuestion: state.questions.length === 0,
-        missingEvidence: missingEvidenceDescriptions(blueprint, state, intent),
-      }),
-      // A deferred follow-up carries its own preface, so a second transition in
-      // front of it would say the same thing twice.
-      ...(followup ? { transition: '' } : {}),
-    },
-    fromFallback: false,
-    latencyMs: 0,
-  };
-
-  const { plan, repairs } = validateAndRepairPlan(l4.plan, state.runtime, {
-    callbackNouns: callbackItem ? callbackNouns(callbackItem) : undefined,
+  const resolved = resolveGeneratedQuestion({
+    utterance: decided.utterance,
+    goal: activeGoal,
+    targetsEvidence: intent.missing_evidence,
+    sectionType: targetSection?.type,
+    isTransition: intent.action === 'TRANSITION_SECTION',
+    seedBankId: decided.seedBankId,
   });
 
   /*
-   * Their question gets answered FIRST, in place of the acknowledgement.
+   * ── 7 · Wording ─────────────────────────────────────────────────────────
    *
-   * It goes in the acknowledgement slot rather than in front of the transition
-   * because that is what it is — the receipt for what they just said. Replacing
-   * it also stops the interviewer saying "Got it." to a question and then
-   * answering it, which reads as a machine executing two unrelated steps.
+   * Already done. The interviewer wrote the sentence, so there is no second
+   * model call to turn a decision into words — that was the whole reason D2/D3
+   * split L1 from L4, and merging them is what buys the turn its latency back.
+   *
+   * The rule layer still gets the last word on the acknowledgement: R5 bars
+   * evaluative feedback and R6 bars repeating a phrase inside four turns, and
+   * both are checked here, in code, on the way to the speaker.
    */
-  const candidateAnswer = answeringCandidate ? await answeringCandidate : null;
+  const displayedGoal = describeGoal(activeGoal, targetSection, resolved.targetsEvidence);
 
-  if (candidateAnswer?.is_question && candidateAnswer.answer.trim()) {
-    plan.acknowledgement = candidateAnswer.answer.trim();
-    // R6 bans reusing an acknowledgement within four turns, and this is not a
-    // phrase from the pool — keeping it out of the history stops it evicting
-    // three real acknowledgements from the window.
-    plan.allow_barge_in_after_ms = Math.max(plan.allow_barge_in_after_ms, 1_500);
-  }
+  const plan: UtterancePlan = {
+    acknowledgement: decided.acknowledgement,
+    // Handoffs speak the blueprint author's own line, so a section change
+    // sounds deliberate rather than abrupt (R10).
+    transition:
+      intent.action === 'TRANSITION_SECTION' ? (nextSection?.entry_transitions[0] ?? '') : '',
+    utterance: decided.utterance,
+    prosody: {
+      rate: intent.emotional_tone === 'encouraging' ? 0.95 : intent.emotional_tone === 'brisk' ? 1.05 : 1,
+      emotion: intent.emotional_tone,
+      emphasis: [],
+      pause_after_acknowledgement_ms: 250,
+    },
+    expected_duration_sec: Math.max(2, Math.min(40, decided.utterance.split(/\s+/).length / 2.6)),
+    allow_barge_in_after_ms: 800,
+  };
+
+  const { plan: repaired, repairs } = validateAndRepairPlan(plan, state.runtime);
 
   // ── 8 · Record the question and update the runtime ───────────────────────
   const questionId = `q_${String(state.questions.length + 1).padStart(2, '0')}`;
@@ -517,38 +507,47 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
     question_id: questionId,
     seq: state.questions.length + 1,
     turn: state.runtime.turn,
-    section_id: nextSection?.section_id ?? state.runtime.current_section_id,
+    section_id: targetSection?.section_id ?? state.runtime.current_section_id,
     // The intent's nullable fields become optional on the question record —
     // `undefined` is the right shape for a JSONB column, where a null would
     // serialise as an explicit null for no reason.
     goal_id: intent.target_goal ?? undefined,
+    // What the candidate was shown this question was for. See the field note.
+    displayed_goal: displayedGoal ?? undefined,
     bank_id: resolved.bankId,
     origin: resolved.origin,
-    text: plan.utterance,
-    as_spoken: [plan.acknowledgement, plan.transition, plan.utterance].filter(Boolean).join(' '),
-    targets_evidence: intent.missing_evidence.length
-      ? intent.missing_evidence
-      : (chosen?.targets_evidence ?? []),
-    skill_tags: chosen?.skill_tags ?? [],
+    text: repaired.utterance,
+    as_spoken: [repaired.acknowledgement, repaired.transition, repaired.utterance]
+      .filter(Boolean)
+      .join(' '),
+    targets_evidence: resolved.targetsEvidence,
+    skill_tags: activeGoal?.skill_tags ?? [],
     difficulty: state.runtime.current_difficulty,
     grading_mode: resolved.gradingMode,
     weight: 1,
+    // Assembled from the evidence this question aims at, so a question written
+    // thirty seconds ago is graded against a rubric written before the
+    // interview started (invariant 6).
     rubric: resolved.rubric,
     intent_snapshot: intent,
-    utterance_plan: plan,
+    utterance_plan: repaired,
     asked_at: new Date().toISOString(),
     status: 'asked',
   };
 
-  // Both blocking calls are done; the verifier has had their combined budget to
-  // land. Merging here puts its verdicts in coverage before the next turn's
-  // shortlist is built, which is the whole point of running it early.
+  // The interviewer call is done; the verifier has had that whole window to
+  // land. Merging here puts its verdicts in coverage before the next turn is
+  // decided, which is the whole point of running it early.
   await collectVerdicts();
 
   state.questions.push(record);
-  applyRuntimeUpdates(state, intent, plan, resolved, nextSection?.section_id, chosen);
+  applyRuntimeUpdates(state, intent, repaired, resolved, nextSection?.section_id);
 
-  if (callbackItem) state.memory = markCallbackSpent(state.memory, callbackItem.item_id);
+  // A goal the interviewer declared finished is closed here rather than left to
+  // time out on its own exit conditions.
+  if (intent.action === 'CLOSE_GOAL' && decided.closedGoalId) {
+    closeGoal(state, decided.closedGoalId);
+  }
 
   // ── 9 · L2 · ASYNC, never blocking (§2.3) ────────────────────────────────
   // Deliberately not awaited: memory pays off from the NEXT turn onward, and
@@ -571,200 +570,26 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
     state,
     utterance: {
       questionId,
-      plan,
-      cacheText: plan.utterance,
+      plan: repaired,
+      cacheText: repaired.utterance,
       bankId: resolved.bankId,
+      goal: displayedGoal,
     },
     finished: false,
     intent,
     diagnostics: {
-      // Both zero by design now: the turn makes no model call. Latency lives in
-      // /reflect, which is off this path entirely.
-      l1LatencyMs: 0,
-      l4LatencyMs: l4.latencyMs,
-      l1Fallback: false,
-      l4Fallback: l4.fromFallback,
+      // One model call in the turn now, not two and not zero. `l1` carries it
+      // because the field names are what the interview screen and the ops
+      // queries already read; the interviewer does both jobs.
+      l1LatencyMs: iv?.latencyMs ?? 0,
+      l4LatencyMs: 0,
+      l1Fallback: iv?.fromFallback ?? true,
+      l4Fallback: false,
       ruleRepairs: repairs,
       intentRejected,
       newlyVerified,
+      action: intent.action,
     },
-  };
-}
-
-/**
- * The slow lane · reads the answer properly and decides whether it is worth
- * coming back to.
- *
- * Runs in its OWN request, fired by the client the moment the turn resolves and
- * completing while the interviewer speaks the next question. That placement is
- * not an optimisation detail — there is no job queue here, and work started
- * inside a route handler after the response is sent is not guaranteed to finish
- * on serverless compute. A separate request has its own lifetime, so this is the
- * one arrangement that reliably completes.
- *
- * It gets what the live loop never could: the transcript. L1 is barred from
- * seeing it (§10, context creep) because it runs inside the turn budget — this
- * does not, so the probe it produces is grounded in the candidate's own words
- * instead of in a word count.
- */
-export async function reflectOnAnswer(input: {
-  sessionId: string;
-  userId: string;
-  projectId: string;
-  blueprint: Blueprint;
-  state: LiveState;
-  persona: string;
-  difficulty?: 'easy' | 'medium' | 'hard';
-  answer: { transcript: string; wordCount: number; durationSec: number };
-  /** The question that answer was given to. */
-  questionId: string;
-}): Promise<PendingFollowup | null> {
-  const context = {
-    userId: input.userId,
-    projectId: input.projectId,
-    sessionId: input.sessionId,
-  };
-
-  const state = input.state;
-  const blueprint = input.blueprint;
-  const question = state.questions.find((q) => q.question_id === input.questionId);
-  if (!question) return null;
-
-  const goal = question.goal_id
-    ? state.coverage.goals.find((g) => g.goal_id === question.goal_id)
-    : undefined;
-
-  // Nothing left to establish on this goal means nothing to dig into. The next
-  // planned question is the right move and no follow-up is produced.
-  if (!goal || goal.outstanding.length === 0) return null;
-  if (goal.status === 'satisfied' || goal.status === 'abandoned') return null;
-
-  const ruleInput: RuleInput = {
-    blueprint,
-    coverage: state.coverage,
-    runtime: state.runtime,
-    memory: openCallbacks(state.memory, 3),
-    lastQuestion: {
-      skill_tags: question.skill_tags,
-      entry_style: undefined,
-      text: question.text,
-    },
-    lastAnswerSec: input.answer.durationSec,
-    sectionElapsedSec: Math.max(0, state.runtime.elapsed_sec - state.runtime.section_started_sec),
-    difficulty: input.difficulty,
-  };
-
-  const shortlist = legalActions(ruleInput);
-  const section = blueprint.sections.find((s) => s.section_id === state.runtime.current_section_id);
-
-  const l1 = await runConversationManager(
-    {
-      shortlist,
-      coverage: state.coverage,
-      runtime: state.runtime,
-      callbacks: openCallbacks(state.memory, 3),
-      sectionTitle: section?.title ?? 'Interview',
-      goalStatements: goalStatements(blueprint),
-      sectionBudget: {
-        asked: state.runtime.questions_in_section,
-        ...SECTION_QUESTION_BUDGET[input.difficulty ?? 'medium'],
-      },
-      lastAnswerSignal: {
-        wordCount: input.answer.wordCount,
-        durationSec: input.answer.durationSec,
-        newEvidenceCount: 0,
-        disclaimed: false,
-        weak: false,
-      },
-    },
-    context,
-  ).catch(() => null);
-
-  // Only a probe is worth deferring. A decision to move on is already what the
-  // fast lane does by default, and a section change is R12's call, not L1's.
-  if (!l1 || l1.intent.action !== 'PROBE_EVIDENCE') return null;
-
-  const missing = missingEvidenceDescriptions(blueprint, state, l1.intent);
-  if (!missing || missing.length === 0) return null;
-
-  const l4 = await runDialogueStyler(
-    {
-      intent: l1.intent,
-      // Deliberately no questionText: this is the one place a genuinely new
-      // question is wanted, written against what they actually said.
-      exitTransition: undefined,
-      entryTransition: undefined,
-      persona: input.persona,
-      runtime: state.runtime,
-      lastAnswer: input.answer.transcript,
-      missingEvidence: missing,
-      deferred: { originalQuestion: question.text },
-    },
-    context,
-  ).catch(() => null);
-
-  const text = l4?.plan.utterance?.trim();
-  if (!text) return null;
-
-  return {
-    v: 2,
-    question: text,
-    fromQuestionId: question.question_id,
-    goalId: question.goal_id ?? null,
-    targetsEvidence: l1.intent.missing_evidence.slice(0, 4),
-    // A probe into their own account is experiential however the original was
-    // graded — it cannot be marked wrong.
-    gradingMode: question.grading_mode === 'factual' ? 'factual' : 'experiential',
-    createdAtTurn: state.runtime.turn,
-    difficultyDelta: l1.intent.difficulty_delta,
-    emotionalTone: l1.intent.emotional_tone,
-  };
-}
-
-/** Drops a follow-up that has waited too long to still make sense. */
-function usablePendingFollowup(
-  pending: PendingFollowup | null | undefined,
-  turn: number,
-): PendingFollowup | null {
-  if (!pending?.question?.trim()) return null;
-  return turn - pending.createdAtTurn <= FOLLOWUP_MAX_AGE_TURNS ? pending : null;
-}
-
-function neutralIntent(weak: boolean): ConversationalIntent {
-  return {
-    action: 'PROBE_EVIDENCE',
-    target_goal: null,
-    target_skill: null,
-    missing_evidence: [],
-    source_kind: 'none',
-    source_id: null,
-    transition_type: 'none',
-    emotional_tone: weak ? 'encouraging' : 'neutral',
-    callback_memory_id: null,
-    response_strategy: weak ? 'scaffold' : 'direct',
-    difficulty_delta: 0,
-    acknowledge_answer: true,
-    reason: 'Rule-layer top-ranked action (pipelined turn — no live model call).',
-    confidence: 0.6,
-  };
-}
-
-function intentFromFollowup(followup: PendingFollowup): ConversationalIntent {
-  return {
-    action: 'PROBE_EVIDENCE',
-    target_goal: followup.goalId,
-    target_skill: null,
-    missing_evidence: followup.targetsEvidence,
-    source_kind: 'generated',
-    source_id: null,
-    transition_type: 'none',
-    emotional_tone: (followup.emotionalTone as ConversationalIntent['emotional_tone']) ?? 'neutral',
-    callback_memory_id: null,
-    response_strategy: 'direct',
-    difficulty_delta: followup.difficultyDelta,
-    acknowledge_answer: true,
-    reason: `Deferred probe from ${followup.fromQuestionId}.`,
-    confidence: 0.8,
   };
 }
 
@@ -783,6 +608,460 @@ export function applyMemoryExtraction(
 // ── Internals ────────────────────────────────────────────────────────────────
 
 type BlueprintSection = Blueprint['sections'][number];
+type BlueprintGoal = BlueprintSection['goals'][number];
+
+/**
+ * How many recent exchanges the interviewer sees.
+ *
+ * The whole transcript is what §10 forbids and §12 tracks as the risk that
+ * kills a live agent by turn twenty. Four exchanges is enough to answer "which
+ * Spark do you mean" and to dig into what was just said; everything older
+ * reaches it through L2's structured memory instead, which is what that
+ * component is for.
+ */
+const RECENT_TURN_WINDOW = 4;
+
+/** Open goals in the current section, with what each still needs. */
+function openGoalsInSection(
+  state: LiveState,
+  blueprint: Blueprint,
+  sectionId: string,
+): InterviewerInput['goals'] {
+  const section = blueprint.sections.find((s) => s.section_id === sectionId);
+  if (!section) return [];
+
+  const out: InterviewerInput['goals'] = [];
+
+  for (const goal of section.goals) {
+    const cov = state.coverage.goals.find((g) => g.goal_id === goal.goal_id);
+    if (!cov || cov.status === 'satisfied' || cov.status === 'abandoned') continue;
+
+    const described = new Map(goal.evidence_required.map((e) => [e.evidence_id, e.description]));
+
+    out.push({
+      goal_id: goal.goal_id,
+      statement: goal.statement,
+      active: state.runtime.active_goal_id === goal.goal_id,
+      outstanding: cov.outstanding.map((id) => ({
+        evidence_id: id,
+        description: described.get(id) ?? id,
+      })),
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Seed questions not yet used.
+ *
+ * Filtered on the recorded TEXT as well as the bank id. The id is the primary
+ * record, but a seed only retires if the turn remembered to record it, and this
+ * is the check that does not depend on that having happened.
+ */
+function unaskedSeeds(
+  state: LiveState,
+  section: BlueprintSection,
+): Array<{ bank_id: string; text: string; goal_id: string }> {
+  const spoken = new Set(state.questions.map((q) => q.text));
+
+  return section.goals
+    .flatMap((g) => g.question_bank.map((q) => ({ q, goal_id: g.goal_id })))
+    .filter(
+      ({ q }) => !state.runtime.asked_bank_ids.includes(q.bank_id) && !spoken.has(q.text),
+    )
+    .slice(0, 3)
+    // `goal_id` rides along so a substituted seed can retarget the turn to the
+    // goal that seed actually serves. Without it the rules could swap in a
+    // question from one goal while the turn still claimed another — invisible
+    // before, and wrong on screen now that the goal is shown to the candidate.
+    .map(({ q, goal_id }) => ({ bank_id: q.bank_id, text: q.text, goal_id }));
+}
+
+/** The rolling transcript window. Oldest first. */
+function recentExchanges(state: LiveState, count: number): Array<{ question: string; answer: string }> {
+  return state.questions
+    .filter((q) => q.answer?.transcript?.trim())
+    .slice(-count)
+    .map((q) => ({
+      question: q.text,
+      // Long answers are trimmed rather than dropped: the tail is usually where
+      // the specifics are, and this has to stay a fixed-size input.
+      answer: (q.answer!.transcript ?? '').slice(0, 600),
+    }));
+}
+
+interface StructuralDecision {
+  intent: ConversationalIntent;
+  utterance: string;
+  acknowledgement: string;
+  /** Set when the interviewer declared a goal finished. */
+  closedGoalId?: string;
+  /** Set when the utterance came verbatim from a seed question. */
+  seedBankId?: string;
+  /** True when the last "answer" was really a question back at us. */
+  previousWasNotAnAnswer: boolean;
+  /** Populated when code overrode the interviewer's choice. */
+  overrideReason?: string;
+}
+
+/**
+ * §4, applied to an agent that writes its own questions.
+ *
+ * D8's split is unchanged: constraints run in code, judgement runs in the
+ * model. What changed is that there is no candidate set to pre-filter any more,
+ * so the rules that used to remove options now override outcomes instead.
+ *
+ * These are the ones that MUST hold, because each of them is the reason the
+ * interview terminates or the reason it stays fair:
+ *
+ *   R12  a section gets a bounded number of questions — the only thing that
+ *        guarantees the interview advances section by section
+ *   R9   two strikes on a goal and we stop pressing; also the distress rule
+ *   R4   difficulty never jumps more than a step
+ *
+ * The ones that softened to prompt guidance — no two similar questions in a
+ * row, vary the question kind — are noted in `rules.ts`. They were compensating
+ * for a selector picking mechanically by evidence gap, which is not what is
+ * choosing any more.
+ */
+function applyStructuralRules(args: {
+  proposed: InterviewerTurn | null;
+  runtime: SessionRuntime;
+  coverage: Coverage;
+  section: BlueprintSection | undefined;
+  hasNextSection: boolean;
+  budget: { min: number; max: number };
+  /** Unused seeds, for R1's substitution when a repeat is caught. */
+  seeds: Array<{ bank_id: string; text: string; goal_id: string }>;
+  askedQuestions: string[];
+  goalsOpen: number;
+  /**
+   * The next section's own opening question.
+   *
+   * Needed because a transition can be FORCED — by the question ceiling, by two
+   * strikes, or by the clock — and in that case the utterance the interviewer
+   * wrote belongs to the section being left. Spoken after the new section's
+   * entry line it lands as a non-sequitur: "let's move on to the coding round.
+   * How did you index that table?"
+   */
+  nextSectionOpener: string | null;
+  /** Where the section stands against the time P6 estimated for it. */
+  pace: 'ahead' | 'on_track' | 'over';
+  /** Seconds left in the whole interview. */
+  remainingSec: number;
+  fallback: () => ConversationalIntent | null;
+}): StructuralDecision {
+  const { proposed, runtime, section, hasNextSection, budget } = args;
+
+  // No interviewer at all (no section, or the call failed with no fallback).
+  if (!proposed) {
+    const rule = args.fallback();
+    return {
+      intent: rule ?? { ...ruleLayerIntent(undefined, false), action: 'CLOSE_INTERVIEW' },
+      utterance: '',
+      acknowledgement: pickAcknowledgement(runtime),
+      previousWasNotAnAnswer: false,
+      overrideReason: 'no interviewer decision available',
+    };
+  }
+
+  let action = proposed.action;
+  let utterance = proposed.utterance.trim();
+  let seedBankId: string | undefined;
+  let overrideReason: string | undefined;
+  /*
+   * Set when a rule swapped in a seed belonging to a different goal.
+   *
+   * The rules pick a substitute from every unused seed in the section, which is
+   * right — the point is to find something unasked — but it can hand back a
+   * question written for another goal while the turn still claims the one the
+   * interviewer named. That mismatch was harmless while nothing read it; it is
+   * not now that the goal is shown to the candidate and recorded for the
+   * report, so the turn follows the question rather than the other way round.
+   */
+  let retargetGoalId: string | undefined;
+
+  const asked = runtime.questions_in_section ?? 0;
+
+  /*
+   * ── R1 · the question must not be one already asked ──────────────────────
+   *
+   * Enforced here rather than requested in the prompt, and that is the whole
+   * point of D8: a repeated question is the single most obvious way an
+   * interviewer stops sounding like it listened, and a rule a model is merely
+   * asked to remember holds most of the time — with the failures landing
+   * exactly where they are noticed.
+   *
+   * The escalation is deliberate. Substituting an unused seed keeps the turn
+   * on-topic and definitely new; closing the goal admits there is nothing left
+   * to ask about it; leaving the section is the last resort. Re-asking is never
+   * one of the options.
+   */
+  const asksSomething =
+    action === 'ASK' || action === 'DEEP_DIVE' || action === 'REDIRECT' || action === 'CLOSE_GOAL';
+
+  if (asksSomething && isRepeatQuestion(utterance, args.askedQuestions)) {
+    const seed = args.seeds.find((q) => !isRepeatQuestion(q.text, args.askedQuestions));
+
+    if (seed) {
+      utterance = seed.text;
+      seedBankId = seed.bank_id;
+      retargetGoalId = seed.goal_id;
+      action = 'ASK';
+      overrideReason = 'R1: question already asked — substituted an unused seed';
+    } else if (args.goalsOpen > 1) {
+      action = 'CLOSE_GOAL';
+      overrideReason = 'R1: question already asked and no unused material on this goal';
+    } else if (hasNextSection && asked >= budget.min) {
+      action = 'NEXT_SECTION';
+      overrideReason = 'R1: section has no unasked material left';
+    } else {
+      // Nothing legal left to ask and nowhere to go. Ending beats looping.
+      action = 'END_INTERVIEW';
+      overrideReason = 'R1: no unasked material anywhere';
+    }
+  }
+
+  /*
+   * A seed spoken verbatim has to be RETIRED, however it was chosen.
+   *
+   * The interviewer is shown seeds as pitch examples and sometimes uses one as
+   * written. If that is not recorded, the seed stays in the unused pool and is
+   * offered again next turn — and the fallback, which takes the first unused
+   * seed, will return the same sentence for the rest of the interview.
+   */
+  if (!seedBankId) {
+    const spoken = args.seeds.find((q) => q.text === utterance);
+    seedBankId = spoken?.bank_id;
+    // Only when the interviewer named no goal of its own — its stated target
+    // wins over an inference drawn from which seed it happened to reuse.
+    if (spoken && !proposed.target_goal) retargetGoalId = spoken.goal_id;
+  }
+  const goalStuck =
+    runtime.active_goal_id !== null &&
+    (runtime.dont_know_by_goal[runtime.active_goal_id] ?? 0) >= 2;
+
+  // R9 · never press a third time on something they have twice said they do not
+  // know, and never keep probing after two thin answers. This protects the data
+  // as much as the person: a candidate who has failed twice yields no signal.
+  if (
+    (goalStuck || runtime.consecutive_weak_answers >= 2) &&
+    (action === 'ASK' || action === 'DEEP_DIVE')
+  ) {
+    action = hasNextSection && asked >= budget.min ? 'NEXT_SECTION' : 'CLOSE_GOAL';
+    overrideReason = goalStuck
+      ? 'R9: two strikes on this goal'
+      : 'R9: two consecutive thin answers';
+  }
+
+  // R12 ceiling · the section is out of questions. This is the rule that makes
+  // the interview terminate section by section, so it overrides everything.
+  if (asked >= budget.max && action !== 'END_INTERVIEW') {
+    action = hasNextSection ? 'NEXT_SECTION' : 'END_INTERVIEW';
+    overrideReason = 'R12: section question ceiling reached';
+  }
+
+  /*
+   * Holding a section open needs a QUESTION, not just a verdict.
+   *
+   * When the interviewer chooses NEXT_SECTION its utterance is a handoff line —
+   * "let's move on to the coding round". Flipping the action to ASK and leaving
+   * that text in place makes the interview announce a move it then does not
+   * make, and the candidate is asked nothing. So a forced stay substitutes an
+   * unused seed and only holds when one exists; with nothing left to ask, the
+   * honest thing is to let the section end early.
+   */
+  const holdInSection = (reason: string): boolean => {
+    const seed = args.seeds.find((q) => !isRepeatQuestion(q.text, args.askedQuestions));
+    if (!seed) return false;
+    action = 'ASK';
+    utterance = seed.text;
+    seedBankId = seed.bank_id;
+    retargetGoalId = seed.goal_id;
+    overrideReason = reason;
+    return true;
+  };
+
+  // R12 floor · leaving early is not allowed while there is still material,
+  // except in sections whose natural length is short.
+  const hasFloor = section !== undefined && !NO_FLOOR_SECTIONS.has(section.type);
+  if (action === 'NEXT_SECTION' && hasFloor && asked < budget.min) {
+    holdInSection('R12: below the section question floor');
+  }
+
+  /*
+   * ── R14 · the section's own clock ────────────────────────────────────────
+   *
+   * R12 counts questions; this counts minutes, and they are not the same thing.
+   * A candidate who gives ninety-second answers blows a four-minute section
+   * apart in three questions, and one who answers in ten words leaves it barely
+   * started at the question ceiling. Enforced in code for exactly the reason
+   * every other rule here is: the interviewer is TOLD the pace and asked to
+   * respect it, which it mostly does — and "mostly" is how the last two
+   * sections of an interview get eaten.
+   *
+   * Over the section ceiling wins over everything except an interviewer that
+   * had already decided to leave. Below the question floor is not a defence: a
+   * section that has spent its time has spent it.
+   */
+  if (
+    args.pace === 'over' &&
+    hasNextSection &&
+    (action === 'ASK' || action === 'DEEP_DIVE' || action === 'REDIRECT')
+  ) {
+    action = 'NEXT_SECTION';
+    overrideReason = 'R14: section is over its estimated time';
+  }
+
+  /*
+   * The mirror of it. Leaving a section with time still on it and goals still
+   * open is how an interview finishes ten minutes early having established
+   * nothing — the candidate paid for those minutes and the report is thinner
+   * without them. The question ceiling still overrules this, just above.
+   */
+  if (
+    action === 'NEXT_SECTION' &&
+    args.pace === 'ahead' &&
+    args.goalsOpen > 0 &&
+    asked < budget.max &&
+    // Same exemption R12's floor takes. The warm-up should close the moment the
+    // candidate is talking, and the closing is a goodbye — holding either one
+    // open because there are minutes left turns a courtesy into an
+    // interrogation.
+    hasFloor &&
+    // Never undo R1, R9 or R12: those left the section for a reason that has
+    // nothing to do with the clock, and re-entering it would loop.
+    overrideReason === undefined
+  ) {
+    holdInSection('R14: section still has time and open goals — staying');
+  }
+
+  // Nowhere left to go.
+  if (action === 'NEXT_SECTION' && !hasNextSection) {
+    action = 'END_INTERVIEW';
+    overrideReason = 'no section remaining';
+  }
+
+  /*
+   * A forced handoff must speak the NEW section's question, not the old one's.
+   *
+   * `overrideReason` is the tell: an interviewer that chose to move on wrote a
+   * handoff line to go with it, and that is left alone. One that was moved on
+   * by a rule wrote a question for the section it is being taken out of.
+   */
+  if (action === 'NEXT_SECTION' && overrideReason !== undefined && args.nextSectionOpener) {
+    utterance = args.nextSectionOpener;
+    seedBankId = undefined;
+  }
+
+  // R4 · difficulty moves one step at a time, never after a weak answer, and
+  // never straight back up after a drop.
+  let delta = Math.max(-1, Math.min(1, proposed.difficulty_delta));
+  if (delta === 1 && (runtime.consecutive_weak_answers > 0 || runtime.turns_since_difficulty_drop < 2)) {
+    delta = 0;
+  }
+  if (delta === -1 && runtime.consecutive_weak_answers < 1) delta = 0;
+
+  /*
+   * A clarification or a question back at us means the previous question was
+   * never actually answered — so it must not be graded, and this turn does not
+   * count against the section budget. Charging someone a question for asking
+   * what the question meant is how an interview runs out of time being polite.
+   */
+  const previousWasNotAnAnswer = action === 'CLARIFY' || action === 'ANSWER_QUESTION';
+
+  return {
+    intent: {
+      action: INTENT_ACTION[action],
+      // `||` not `??`: the interviewer returns "" for "no goal", and an empty
+      // string stored as a goal_id is an id that resolves to nothing.
+      target_goal: retargetGoalId ?? (proposed.target_goal || null),
+      target_skill: null,
+      missing_evidence: proposed.targets_evidence.slice(0, 4),
+      source_kind: 'generated',
+      source_id: null,
+      transition_type: action === 'NEXT_SECTION' ? 'section_change' : 'none',
+      emotional_tone: proposed.emotional_tone,
+      callback_memory_id: null,
+      response_strategy:
+        action === 'DEEP_DIVE' ? 'narrow' : action === 'CLARIFY' ? 'rephrase' : 'direct',
+      difficulty_delta: delta,
+      acknowledge_answer: proposed.acknowledgement.trim().length > 0,
+      reason: proposed.reason,
+      confidence: 0.8,
+    },
+    utterance,
+    acknowledgement: proposed.acknowledgement.trim(),
+    seedBankId,
+    closedGoalId: action === 'CLOSE_GOAL' ? (proposed.target_goal || runtime.active_goal_id) ?? undefined : undefined,
+    previousWasNotAnAnswer,
+    overrideReason,
+  };
+}
+
+/**
+ * The intent recorded when the interviewer produced nothing usable.
+ *
+ * The rule layer is still enumerated every turn precisely for this: it costs
+ * about a millisecond and it means a failed model call has a legal, on-topic
+ * question to fall back to rather than a dead turn. Invariant 12 — degrade
+ * texture, never terminate.
+ */
+function ruleLayerIntent(
+  action: CandidateAction | undefined,
+  weak: boolean,
+): ConversationalIntent {
+  return {
+    action: action?.action ?? 'TRANSITION_SECTION',
+    target_goal: action?.goal_id ?? null,
+    target_skill: action?.skill_tags[0] ?? null,
+    missing_evidence: action?.targets_evidence.slice(0, 4) ?? [],
+    source_kind: 'generated',
+    source_id: null,
+    transition_type: action?.action === 'TRANSITION_SECTION' ? 'section_change' : 'none',
+    emotional_tone: weak ? 'encouraging' : 'neutral',
+    callback_memory_id: null,
+    response_strategy: weak ? 'scaffold' : 'direct',
+    difficulty_delta: 0,
+    acknowledge_answer: true,
+    reason: 'Fallback: rule-layer action (interviewer unavailable).',
+    confidence: 0.4,
+  };
+}
+
+/**
+ * The interviewer's action, in the vocabulary the question record already uses.
+ *
+ * Kept as a mapping rather than by renaming the recorded enum, because
+ * `intent_snapshot` is what makes a turn replayable (invariant 14) and past
+ * sessions were written with these names.
+ */
+const INTENT_ACTION: Record<InterviewerTurn['action'], ConversationalIntent['action']> = {
+  ASK: 'NEW_GOAL_QUESTION',
+  DEEP_DIVE: 'PROBE_EVIDENCE',
+  CLARIFY: 'PROBE_EVIDENCE',
+  ANSWER_QUESTION: 'PROBE_EVIDENCE',
+  REDIRECT: 'PROBE_EVIDENCE',
+  CLOSE_GOAL: 'CLOSE_GOAL',
+  NEXT_SECTION: 'TRANSITION_SECTION',
+  END_INTERVIEW: 'CLOSE_INTERVIEW',
+};
+
+/** Marks a goal the interviewer declared finished, without ending the section. */
+function closeGoal(state: LiveState, goalId: string): void {
+  const goal = state.coverage.goals.find((g) => g.goal_id === goalId);
+  if (!goal || goal.status === 'satisfied' || goal.status === 'abandoned') return;
+
+  // Satisfied only when the evidence actually says so. Otherwise abandoned,
+  // which §9.6 scores on what was gathered rather than as a zero.
+  goal.status = goal.outstanding.length === 0 ? 'satisfied' : 'abandoned';
+
+  if (state.runtime.active_goal_id === goalId) {
+    state.runtime.active_goal_id = null;
+    state.runtime.turns_on_active_goal = 0;
+  }
+}
 
 /**
  * Fires the evidence verifier for the answer just given.
@@ -922,126 +1201,158 @@ function findBlueprintGoal(blueprint: Blueprint, goalId: string) {
   return undefined;
 }
 
-/**
- * What the interviewer still needs from the active goal, in the words the
- * blueprint author wrote. Handed to L4 so a generated probe aims at something
- * real instead of nudging.
- */
-function missingEvidenceDescriptions(
-  blueprint: Blueprint,
-  state: LiveState,
-  intent: ConversationalIntent,
-): string[] | undefined {
-  const goalId = intent.target_goal ?? state.runtime.active_goal_id;
-  if (!goalId) return undefined;
 
-  const bpGoal = findBlueprintGoal(blueprint, goalId);
-  const goalState = state.coverage.goals.find((g) => g.goal_id === goalId);
-  if (!bpGoal || !goalState) return undefined;
 
-  // The intent's own targets first when it named any — that is what L1 decided
-  // to chase — falling back to whatever the goal still has open.
-  const wanted = intent.missing_evidence.length ? intent.missing_evidence : goalState.outstanding;
-
-  return wanted
-    .map((id) => bpGoal.evidence_required.find((e) => e.evidence_id === id)?.description)
-    .filter((d): d is string => Boolean(d))
-    .slice(0, 3);
-}
-
-function goalStatements(blueprint: Blueprint): Record<string, string> {
-  const map: Record<string, string> = {};
-  for (const section of blueprint.sections) {
-    for (const goal of section.goals) map[goal.goal_id] = goal.statement;
-  }
-  return map;
-}
-
-function matchAction(
-  shortlist: CandidateAction[],
-  intent: ConversationalIntent,
-): CandidateAction | undefined {
-  return (
-    shortlist.find(
-      (c) => c.source_kind === intent.source_kind && c.source_id === intent.source_id,
-    ) ?? shortlist.find((c) => c.action === intent.action)
-  );
-}
 
 interface ResolvedQuestion {
-  text?: string;
   bankId?: string;
   rubric?: unknown;
+  targetsEvidence: string[];
   gradingMode: QuestionRecord['grading_mode'];
   origin: QuestionRecord['origin'];
-  entryStyle?: CandidateAction['entry_style'];
 }
 
 /**
- * Pulls the verbatim question text and its plan-time rubric out of the
- * blueprint. The rubric travels with the question because it must grade the
- * exact words that were asked (invariant 6).
+ * Works out how the question the interviewer just wrote should be graded.
+ *
+ * ── The join that replaces the bank lookup ───────────────────────────────────
+ * Nothing is looked up by id any more, because the interviewer wrote the
+ * sentence. What is looked up is the EVIDENCE it says it was aiming at — and
+ * that is what supplies both the rubric and the grading mode, so a question
+ * invented thirty seconds ago is still graded against signals written before
+ * the interview started (invariant 6) in a mode fixed at plan time
+ * (invariant 9).
+ *
+ * A question claiming evidence that does not exist in its goal is not trusted
+ * with the claim: `buildRubric` falls back to the goal's full evidence set
+ * rather than producing an empty rubric, because an empty rubric is what makes
+ * an answer ungradeable.
  */
-function resolveQuestionText(
-  blueprint: Blueprint,
-  intent: ConversationalIntent,
-  chosen: CandidateAction | undefined,
-  sectionType?: Blueprint['sections'][number]['type'],
-): ResolvedQuestion {
-  if (intent.action === 'TRANSITION_SECTION') {
-    /*
-     * A transition INTO the coding section is the question the submission gets
-     * attached to, so it has to be graded as coding.
-     *
-     * It defaulted to experiential, which is why the report never showed a
-     * coding score: `aggregateSession` selects coding questions by
-     * `mode === 'coding'`, found none, and left the dimension null — so the
-     * whole Judge0 round, and the module fee paid for it, produced nothing on
-     * the report.
-     */
+function resolveGeneratedQuestion(args: {
+  utterance: string;
+  goal: BlueprintGoal | undefined;
+  targetsEvidence: string[];
+  sectionType?: BlueprintSection['type'];
+  isTransition: boolean;
+  seedBankId?: string;
+}): ResolvedQuestion {
+  /*
+   * A handoff INTO the coding section is the utterance the submission gets
+   * attached to, so it has to be graded as coding.
+   *
+   * This defaulted to experiential once, and the report never showed a coding
+   * score: `aggregateSession` selects coding questions by `mode === 'coding'`,
+   * found none, and left the dimension null — so the whole Judge0 round, and
+   * the module fee paid for it, produced nothing.
+   */
+  if (args.isTransition) {
     return {
-      gradingMode: sectionType === 'coding' ? 'coding' : 'experiential',
+      targetsEvidence: [],
+      gradingMode:
+        args.sectionType === 'coding'
+          ? 'coding'
+          : args.sectionType === 'skill_challenge'
+            ? 'skill'
+            : 'experiential',
       origin: 'closing',
     };
   }
 
-  if (intent.source_kind === 'bank' && intent.source_id) {
-    for (const section of blueprint.sections) {
-      for (const goal of section.goals) {
-        const q = goal.question_bank.find((b) => b.bank_id === intent.source_id);
-        if (q) {
-          return {
-            text: q.text,
-            bankId: q.bank_id,
-            rubric: q.rubric,
-            gradingMode: q.grading_mode,
-            origin: 'bank',
-            entryStyle: q.entry_style,
-          };
-        }
-      }
-    }
+  if (!args.goal) {
+    return { targetsEvidence: [], gradingMode: 'experiential', origin: 'generated' };
   }
 
-  if (intent.source_kind === 'followup_bank' && intent.source_id) {
-    for (const section of blueprint.sections) {
-      for (const goal of section.goals) {
-        const f = goal.followup_bank.find((b) => b.followup_id === intent.source_id);
-        if (f) {
-          // A follow-up inherits the grading mode of its goal's bank, so a probe
-          // into someone's own project is never graded as a factual question.
-          const mode = goal.question_bank[0]?.grading_mode ?? 'experiential';
-          return { text: f.text, rubric: undefined, gradingMode: mode, origin: 'followup' };
-        }
-      }
-    }
+  const known = new Set(args.goal.evidence_required.map((e) => e.evidence_id));
+  const claimed = args.targetsEvidence.filter((id) => known.has(id));
+  const effective = claimed.length > 0 ? claimed : args.goal.evidence_required.map((e) => e.evidence_id);
+
+  /*
+   * Grading mode comes from the evidence, and the strictest one wins.
+   *
+   * A question that touches both "describe what you built" and "explain what a
+   * readiness probe is for" is answerable factually, and grading the whole
+   * thing as experiential would mean a wrong explanation could never be marked
+   * wrong. Experiential is the safer default in the other direction — it can
+   * never mark an account of someone's own work as incorrect.
+   */
+  /*
+   * In the behavioural section, the SECTION decides — not the evidence.
+   *
+   * `factual` outranks `behavioral` below, and that ordering is right
+   * everywhere else: a question that touches both a claim and a mechanism must
+   * be markable wrong on the mechanism. In the behavioural round it was the
+   * bug. One evidence item tagged factual by P6 was enough to make every
+   * question in the section grade factual, E4 never filled in the STAR fields
+   * `scoreBehavioral` reads, `aggregateSession` averaged an empty set to null,
+   * and `computeReadiness` rendered that null as a flat 0 on the report.
+   *
+   * P6 now writes `behavioral` on every evidence item in these sections and
+   * `normaliseBlueprint` forces it — this is the third lock, at the point of
+   * use, because the two upstream ones are on data that a resumed session may
+   * have been checkpointed before.
+   */
+  if (args.sectionType === 'behavioral') {
+    return {
+      bankId: args.seedBankId,
+      rubric: buildRubric(args.goal, effective),
+      targetsEvidence: effective,
+      gradingMode: 'behavioral',
+      origin: args.seedBankId ? 'bank' : 'generated',
+    };
   }
 
-  if (intent.action === 'CALLBACK') {
-    return { text: chosen?.text, gradingMode: 'experiential', origin: 'callback' };
-  }
+  const modes = new Set(
+    args.goal.evidence_required.filter((e) => effective.includes(e.evidence_id)).map((e) => e.grading_mode),
+  );
+  const gradingMode: QuestionRecord['grading_mode'] = modes.has('coding')
+    ? 'coding'
+    : modes.has('skill')
+      ? 'skill'
+      : modes.has('factual')
+        ? 'factual'
+        : modes.has('behavioral')
+          ? 'behavioral'
+          : 'experiential';
 
-  return { text: chosen?.text, gradingMode: 'experiential', origin: 'bank' };
+  return {
+    bankId: args.seedBankId,
+    rubric: buildRubric(args.goal, effective),
+    targetsEvidence: effective,
+    gradingMode,
+    origin: args.seedBankId ? 'bank' : 'generated',
+  };
+}
+
+/**
+ * The goal line shown beside a question, and stored with it.
+ *
+ * `activeGoal` is whatever the interviewer aimed at. On a handoff there is
+ * often no goal — the utterance is a transition — so the section being entered
+ * supplies its first goal instead, which is what the next question will pursue
+ * anyway. Both cases beat showing nothing: a question with no visible purpose
+ * is the thing that made the interview feel like a quiz.
+ *
+ * `pursuing` is deliberately narrowed to the evidence this question targets,
+ * not the goal's whole list. The goal says where the conversation is going; this
+ * says what THIS question is reaching for.
+ */
+function describeGoal(
+  activeGoal: BlueprintGoal | undefined,
+  targetSection: BlueprintSection | undefined,
+  targetsEvidence: string[],
+): NonNullable<TurnOutput['utterance']>['goal'] {
+  const goal = activeGoal ?? targetSection?.goals[0];
+  if (!goal) return null;
+
+  const aimed = new Set(targetsEvidence);
+  const pursuing = goal.evidence_required
+    // When the question named no evidence — a transition, a clarification — the
+    // goal's own required evidence is the honest answer to "what is this for".
+    .filter((ev) => aimed.size === 0 || aimed.has(ev.evidence_id))
+    .map((ev) => ev.description)
+    .slice(0, 3);
+
+  return { goal_id: goal.goal_id, statement: goal.statement, pursuing };
 }
 
 function applyRuntimeUpdates(
@@ -1050,34 +1361,26 @@ function applyRuntimeUpdates(
   plan: UtterancePlan,
   resolved: ResolvedQuestion,
   nextSectionId: string | undefined,
-  chosen: CandidateAction | undefined,
 ): void {
   const rt = state.runtime;
 
   if (resolved.bankId) rt.asked_bank_ids.push(resolved.bankId);
-  if (intent.source_kind === 'followup_bank' && intent.source_id) {
-    rt.asked_followup_ids.push(intent.source_id);
-  }
 
-  // Only pooled acknowledgements enter the R6 history. An answer to the
-  // candidate's own question occupies the same slot but is not a phrase that can
-  // repeat, and recording it would evict real entries from the four-turn window.
+  /*
+   * R6's window records only ACKNOWLEDGEMENTS, and only pooled ones.
+   *
+   * The interviewer writes its own phrases now, so most of what lands here is
+   * not from the pool. Recording those too would evict real entries from the
+   * four-turn window and let a genuine repeat slip through, so the check stays:
+   * the rule is about phrases that can repeat, and a sentence written fresh
+   * each turn is not one of them.
+   */
   if (plan.acknowledgement && ACKNOWLEDGEMENT_POOL.includes(plan.acknowledgement.trim())) {
     rt.recent_acknowledgements = [...rt.recent_acknowledgements, plan.acknowledgement.trim()].slice(-8);
   }
-  if (chosen?.skill_tags.length) {
-    rt.recent_skill_tags = [...rt.recent_skill_tags, ...chosen.skill_tags].slice(-8);
-  }
-  if (resolved.entryStyle) {
-    rt.recent_entry_styles = [...rt.recent_entry_styles, resolved.entryStyle].slice(-4);
-  }
-  // R13's input: what KIND of question this was, so the next turn can prefer a
-  // different one and the mix of skill-check / resume / behavioural actually
-  // reaches the candidate instead of only existing in the blueprint.
+  // What KIND of question this was, so the interviewer can be told when it has
+  // asked the same kind twice running.
   rt.recent_grading_modes = [...rt.recent_grading_modes, resolved.gradingMode].slice(-6);
-
-  if (intent.action === 'CALLBACK') rt.last_callback_turn = rt.turn;
-  if (intent.action === 'CORRECT_AND_CONTINUE') rt.corrections_used += 1;
 
   if (nextSectionId) {
     // This question belongs to the section being entered, so the new section's
@@ -1117,26 +1420,6 @@ function applyRuntimeUpdates(
   }
 }
 
-function intentFromAction(
-  action: CandidateAction | undefined,
-  original: ConversationalIntent,
-): ConversationalIntent {
-  if (!action) return { ...original, action: 'TRANSITION_SECTION', transition_type: 'section_change' };
-
-  return {
-    ...original,
-    action: action.action,
-    target_goal: action.goal_id ?? null,
-    target_skill: action.skill_tags[0] ?? null,
-    missing_evidence: action.targets_evidence.slice(0, 4),
-    source_kind: action.source_kind,
-    source_id: action.source_id ?? null,
-    transition_type: action.action === 'TRANSITION_SECTION' ? 'section_change' : 'none',
-    difficulty_delta: 0,
-    callback_memory_id: action.action === 'CALLBACK' ? (action.source_id ?? null) : null,
-    reason: 'Rule-layer fallback after post-validation rejected the model intent.',
-  };
-}
 
 function finish(state: LiveState, newlyVerified: string[]): TurnOutput {
   state.runtime.finished = true;

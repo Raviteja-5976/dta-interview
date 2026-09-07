@@ -127,7 +127,7 @@ export async function runProjectPrep(
           maxMinutes: DIFFICULTY_BANDS.medium.max,
           difficulty: 'medium',
           coding: false,
-          systemDesign: false,
+          skillChallenge: false,
         },
       },
       context,

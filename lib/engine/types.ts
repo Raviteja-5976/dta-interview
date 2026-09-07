@@ -9,7 +9,13 @@
 import type { ConversationalIntent, UtterancePlan } from '../agents/schemas';
 
 export type DepthLevel = 'surface' | 'working' | 'implementation' | 'design';
-export type GradingMode = 'factual' | 'experiential' | 'behavioral' | 'coding';
+/**
+ * Mirrors `gradingMode` in ../agents/schemas.ts. `skill` is the skill-challenge
+ * round — something built or fixed in the editor and judged against
+ * requirements written at plan time, as distinct from `coding`, which has a
+ * sandbox and a measured pass rate behind it.
+ */
+export type GradingMode = 'factual' | 'experiential' | 'behavioral' | 'coding' | 'skill';
 export type EntryStyle = 'direct' | 'story' | 'hypothetical' | 'comparative';
 
 export const DEPTH_ORDER: DepthLevel[] = ['surface', 'working', 'implementation', 'design'];
@@ -226,8 +232,32 @@ export interface QuestionRecord {
   turn: number;
   section_id: string;
   goal_id?: string;
+  /**
+   * The goal as it was SHOWN to the candidate beside this question.
+   *
+   * Deliberately separate from `goal_id`, which drives coverage, the two-strike
+   * counter and goal closure — rewriting that to fill a display gap would change
+   * how the interview runs. This is a record of what the candidate was told the
+   * question was for, captured at the moment it was asked, and it is what the
+   * report's goal outcomes are written against. On a handoff `goal_id` is often
+   * absent while this is not, because the section being entered supplies it.
+   */
+  displayed_goal?: {
+    goal_id: string;
+    statement: string;
+    pursuing: string[];
+  };
   bank_id?: string;
-  origin: 'bank' | 'followup' | 'callback' | 'closing' | 'correction' | 'intro';
+  /**
+   * Where the question came from.
+   *
+   * `generated` means it was written during the interview against what the
+   * candidate said, rather than taken from P6's plan-time bank. It is the flag
+   * that decides whether this session's question scores can be compared to
+   * another session's — see S1's `reproducibility` block. A deferred probe used
+   * to be recorded as `bank`, which made a generated question look planned.
+   */
+  origin: 'bank' | 'followup' | 'callback' | 'closing' | 'correction' | 'intro' | 'generated';
   text: string;
   as_spoken: string;
   targets_evidence: string[];

@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@ai-sdk/google": "^4.0.39",
+    "@ai-sdk/groq": "^4.0.30",
     "@ai-sdk/openai": "^4.0.36",
     "@ai-sdk/xai": "^4.0.33",
     "@monaco-editor/react": "^4.7.0",

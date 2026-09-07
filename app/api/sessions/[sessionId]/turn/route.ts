@@ -16,21 +16,23 @@ import type { NextRequest } from 'next/server';
 
 import { createSupabaseServerClient, requireUser } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import {
-  looksLikeCandidateQuestion,
-  runTurn,
-  type LiveState,
-  type PendingFollowup,
-} from '@/lib/pipelines/turn';
+import { runTurn, type LiveState } from '@/lib/pipelines/turn';
 import { CREDITS_PER_MINUTE, billableMinutes, voiceCredits } from '@/lib/credits';
-import type { Blueprint, CodingChallenge } from '@/lib/agents/schemas';
+import type { Blueprint, CodingChallenge, SkillChallenge } from '@/lib/agents/schemas';
 import type { ChallengeSet } from '@/lib/agents/p7-challenge';
 import type { VoiceAssetIndex } from '@/lib/pipelines/session-prep';
 import { failure, handleRouteError, notFound, ok } from '@/lib/api/respond';
 
 export const maxDuration = 60;
 
-/** Upper bound on reported editor time — see where it is applied. */
+/**
+ * Upper bound on reported editor time — see where it is applied.
+ *
+ * Covers both editor rounds: the DSA problems and the skill challenge share one
+ * accumulator on the client, because from billing's point of view they are the
+ * same thing — minutes where nobody is talking and the flat module fee has
+ * already been paid.
+ */
 const MAX_CODING_SEC = 45 * 60;
 
 interface TurnBody {
@@ -46,10 +48,11 @@ interface TurnBody {
   };
   elapsedSec: number;
   /**
-   * Seconds spent inside the code editor, accumulated by the client.
+   * Seconds spent inside the code editor, accumulated by the client across
+   * BOTH editor rounds — the DSA problems and the skill challenge.
    *
-   * Excluded from per-minute billing: the coding round is already paid for by
-   * its flat module fee, and charging voice credits for time nobody is talking
+   * Excluded from per-minute billing: each round is already paid for by its
+   * flat module fee, and charging voice credits for time nobody is talking
    * would bill the same minutes twice.
    */
   codingSec?: number;
@@ -69,7 +72,9 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
     const supabase = await createSupabaseServerClient();
     const { data: session } = await supabase
       .from('sessions')
-      .select('id, user_id, project_id, status, config, blueprint, live_state, voice_assets, coding_challenge, started_at, pending_followup')
+      .select(
+        'id, user_id, project_id, status, config, blueprint, live_state, voice_assets, coding_challenge, skill_challenge, started_at',
+      )
       .eq('id', sessionId)
       .maybeSingle();
 
@@ -139,13 +144,6 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
     // without inflating the clock the candidate is billed against.
     const elapsedSec = Math.max(0, Math.min(body.elapsedSec, maxDurationSec));
 
-    // Loaded only when the candidate appears to have asked something back, so a
-    // normal turn pays neither this query nor the L6 call behind it.
-    const employer =
-      body.answer && looksLikeCandidateQuestion(body.answer.transcript, state.questions.at(-1)?.text ?? '')
-        ? await loadEmployerContext(supabase, session.project_id)
-        : undefined;
-
     const result = await runTurn({
       sessionId,
       userId: user.id,
@@ -158,10 +156,6 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
       maxDurationSec,
       // Sets how many questions each section gets (R12).
       difficulty: config.difficulty ?? 'medium',
-      employer,
-      // Prepared by /reflect from an earlier answer while the interviewer was
-      // speaking. Consumed here and cleared below.
-      pendingFollowup: session.pending_followup as PendingFollowup | null,
     });
 
     // The interview is over — settle the credits, then hand off to evaluation.
@@ -208,9 +202,6 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
         status: 'live',
         live_state: result.state,
         started_at: session.started_at ?? new Date().toISOString(),
-        // Cleared unconditionally: a follow-up that was too stale to use is one
-        // that must not resurface two turns later.
-        pending_followup: null,
       })
       .eq('id', sessionId);
 
@@ -233,6 +224,16 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
         title: blueprint.sections.find((s) => s.section_id === result.state.runtime.current_section_id)?.title,
       },
       /*
+       * What this question is trying to establish.
+       *
+       * Resolved inside the turn from objects already in memory — no extra
+       * model call, no extra round trip, nothing added to the silence the
+       * candidate waits through. Shown on screen beside the question so it is
+       * clear what is being asked and why, and stored on the question record so
+       * the report's goal outcomes quote the same statement.
+       */
+      goal: result.utterance!.goal,
+      /*
        * Coding mode. The section TYPE decides it, not the question text — the
        * blueprint assigns type at plan time, so this cannot drift.
        *
@@ -244,6 +245,21 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
         blueprint,
         result.state.runtime.current_section_id,
         session.coding_challenge as ChallengeSet<CodingChallenge> | null,
+        result.state,
+      ),
+      /*
+       * The skill round's task, when the interview has reached that section.
+       *
+       * A separate field rather than a shape inside `challenge` because the two
+       * rounds are two different screens: one has a test runner and a language
+       * picker, the other has neither. Collapsing them into one payload would
+       * make every consumer branch on a discriminator to find out which half of
+       * the object is populated.
+       */
+      skillChallenge: skillPayload(
+        blueprint,
+        result.state.runtime.current_section_id,
+        session.skill_challenge as ChallengeSet<SkillChallenge> | null,
         result.state,
       ),
       progress: {
@@ -260,61 +276,6 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
   }
 }
 
-/**
- * What the interviewer can honestly say about the role, when the candidate asks.
- *
- * Trimmed hard: L6 needs the responsibilities, the skills the posting asks for,
- * and what the company does — not the full parsed artifacts, which run to
- * thousands of tokens of provenance and confidence scores that would only make
- * the reply vaguer.
- */
-async function loadEmployerContext(
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
-  projectId: string,
-): Promise<{ roleTitle: string; companyName: string; jdContext?: string; companyContext?: string } | undefined> {
-  const { data } = await supabase
-    .from('projects')
-    .select('role_title, company_name, jd_profile, company_profile')
-    .eq('id', projectId)
-    .maybeSingle();
-
-  if (!data) return undefined;
-
-  const jd = data.jd_profile as {
-    responsibilities?: string[];
-    required_skills?: Array<{ skill: string }>;
-    seniority?: string;
-  } | null;
-
-  const company = data.company_profile as {
-    one_liner?: string;
-    products?: string[];
-    tech_stack?: Array<{ technology: string }>;
-    engineering_culture?: Array<{ signal: string }>;
-    values?: string[];
-  } | null;
-
-  return {
-    roleTitle: data.role_title ?? 'this role',
-    companyName: data.company_name ?? 'the company',
-    jdContext: jd
-      ? JSON.stringify({
-          seniority: jd.seniority,
-          responsibilities: jd.responsibilities?.slice(0, 10),
-          required_skills: jd.required_skills?.slice(0, 12).map((s) => s.skill),
-        })
-      : undefined,
-    companyContext: company
-      ? JSON.stringify({
-          one_liner: company.one_liner,
-          products: company.products?.slice(0, 6),
-          tech_stack: company.tech_stack?.slice(0, 12).map((t) => t.technology),
-          engineering_culture: company.engineering_culture?.slice(0, 5).map((c) => c.signal),
-          values: company.values?.slice(0, 6),
-        })
-      : undefined,
-  };
-}
 
 /** The blueprint's type for the section currently being asked. */
 function currentSectionType(blueprint: Blueprint, sectionId: string): string {
@@ -362,7 +323,10 @@ function codingPayload(
     index,
     total: set.challenges.length,
     title: challenge.title,
+    topic: challenge.topic,
+    level: challenge.level,
     problem_statement: challenge.problem_statement,
+    constraints: challenge.constraints,
     input_format: challenge.input_format,
     output_format: challenge.output_format,
     examples: challenge.examples,
@@ -370,6 +334,60 @@ function codingPayload(
     visible_tests: challenge.visible_tests,
     target_complexity: challenge.target_complexity,
     hidden_test_count: challenge.hidden_tests.length,
+  };
+}
+
+/**
+ * The skill task the editor should open, when the interview has reached the
+ * skill-challenge section.
+ *
+ * Three fields of the stored challenge are deliberately absent from this
+ * payload, and one of them matters a great deal: `bug_summary` names the fault
+ * planted in a debug task. Sending it to the browser would put the answer one
+ * devtools panel away from the candidate being tested on finding it.
+ * `reference_solution` and `requirements` are withheld for the same reason —
+ * the requirements ARE the mark scheme, and a candidate reading them is
+ * completing a checklist rather than doing the task.
+ */
+function skillPayload(
+  blueprint: Blueprint,
+  sectionId: string,
+  set: ChallengeSet<SkillChallenge> | null,
+  state: LiveState,
+): unknown {
+  if (currentSectionType(blueprint, sectionId) !== 'skill_challenge') return null;
+  if (!set?.challenges?.length) return null;
+
+  const submitted = Array.isArray((state as unknown as { skill_submissions?: unknown[] }).skill_submissions)
+    ? (state as unknown as { skill_submissions: unknown[] }).skill_submissions.length
+    : 0;
+
+  // Every task submitted — hand the floor back to the conversation so the
+  // interviewer can ask its discussion probes. Same reasoning as codingPayload.
+  if (submitted >= set.challenges.length) return null;
+
+  const index = submitted;
+  const challenge = set.challenges[index];
+
+  return {
+    index,
+    total: set.challenges.length,
+    skill: challenge.skill,
+    format: challenge.format,
+    title: challenge.title,
+    prompt: challenge.prompt,
+    context: challenge.context,
+    editor_language: challenge.editor_language,
+    starter_code: challenge.starter_code,
+    estimated_minutes: challenge.estimated_minutes,
+    /*
+     * The COUNT of requirements, not the requirements.
+     *
+     * A candidate should know how many things are being looked for — that is
+     * scoping information a real interviewer gives out loud — without being
+     * handed the mark scheme itself.
+     */
+    requirement_count: challenge.requirements.length,
   };
 }
 

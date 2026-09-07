@@ -31,7 +31,7 @@ export interface Profile {
       difficulty?: 'easy' | 'medium' | 'hard';
       duration_min?: number;
       coding?: boolean;
-      system_design?: boolean;
+      skill_challenge?: boolean;
     };
   };
   onboarding: Record<string, unknown>;
@@ -60,7 +60,7 @@ export interface Project {
     technical?: number;
     behavioral?: number;
     coding?: number;
-    system_design?: number;
+    skill_challenge?: number;
     computed_at?: string;
     history?: Array<{ session_id: string; overall: number; at: string }>;
   };
@@ -116,7 +116,7 @@ export const MOCK_PROFILE: Profile = {
       difficulty: 'medium',
       duration_min: 15,
       coding: true,
-      system_design: false,
+      skill_challenge: false,
     },
   },
   onboarding: {},

@@ -11,7 +11,7 @@
 
 import type { Grading } from '../agents/schemas';
 import type { Blueprint } from '../agents/schemas';
-import type { Coverage, GradingMode } from './types';
+import type { Coverage, GradingMode, QuestionRecord } from './types';
 import { bandsFor, type SpeechMetrics, type WpmBands } from './e2-speech';
 
 // ── §9.1 Accuracy (factual mode) ─────────────────────────────────────────────
@@ -202,6 +202,84 @@ export function scoreCoding(input: CodingInputs): number {
   );
 }
 
+// ── Skill challenge ──────────────────────────────────────────────────────────
+
+/**
+ * One requirement, as SV found it in the submission.
+ *
+ * `met` is the model's observation; the weight came from P7 and was written
+ * before the interview. Nothing here is a score — `skillRequirementCoverage`
+ * below is what turns the pair into one.
+ */
+export interface SkillRequirementOutcome {
+  met: 'yes' | 'partial' | 'no';
+  /** P7's weight for this requirement, 1-3. */
+  weight: number;
+}
+
+/** Partial credit is half. A requirement half-met is genuinely half the work. */
+const MET_CREDIT: Record<SkillRequirementOutcome['met'], number> = {
+  yes: 1,
+  partial: 0.5,
+  no: 0,
+};
+
+/**
+ * The fraction of the challenge's requirements the submission met, weighted.
+ *
+ * This is the skill round's answer to `testPassRate` and it plays the same
+ * structural role: the largest single term, and the one computed rather than
+ * asked for. SV reports met / partial / no per requirement; the arithmetic
+ * happens here, so the weights can be retuned without re-running a model and
+ * two candidates who met the same requirements get the same number.
+ *
+ * Returns null when there is nothing to divide by — a validation that came back
+ * with no requirement verdicts at all. Null propagates to "not scored" rather
+ * than to zero, because a validator that returned nothing says nothing about
+ * the candidate (§9.6).
+ */
+export function skillRequirementCoverage(outcomes: SkillRequirementOutcome[]): number | null {
+  const total = outcomes.reduce((sum, o) => sum + Math.max(1, o.weight), 0);
+  if (total === 0) return null;
+
+  const earned = outcomes.reduce((sum, o) => sum + MET_CREDIT[o.met] * Math.max(1, o.weight), 0);
+  return earned / total;
+}
+
+export interface SkillInputs {
+  /** 0-1, from `skillRequirementCoverage`. The measured-ish half. */
+  requirementCoverage: number;
+  /** 0-10 from SV: would this actually do the job. */
+  correctness: number;
+  /** 0-10 from SV: idiom and structure for this technology. */
+  codeQuality: number;
+  /** 0-10 from E4, read off the transcript: did they explain it as they worked. */
+  verbalReasoning: number;
+}
+
+/**
+ * The skill round's score.
+ *
+ * Weighted like `scoreCoding` and for the same reasons, with one deliberate
+ * difference: requirement coverage carries 45% rather than the coding round's
+ * 50% on test pass rate. A sandbox verdict is a fact; a reading of whether a
+ * requirement is met is a judgement, however good the reader — so it gets a
+ * slightly smaller share, and `correctness` picks up the difference by asking
+ * the same question a second way.
+ *
+ * Verbal reasoning keeps its 15%. The round is still an interview: someone who
+ * writes a perfect component in silence has not shown they can work with anyone.
+ */
+export function scoreSkill(input: SkillInputs): number {
+  return round1(
+    (0.45 * input.requirementCoverage +
+      0.25 * (input.correctness / 10) +
+      0.15 * (input.codeQuality / 10) +
+      0.15 * (input.verbalReasoning / 10)) *
+      10,
+  );
+}
+
 // ── Per-question dispatch ────────────────────────────────────────────────────
 
 export interface QuestionScores {
@@ -222,6 +300,7 @@ export function scoreQuestion(args: {
   language: string;
   partiallyHeard?: boolean;
   coding?: CodingInputs;
+  skill?: SkillInputs;
 }): QuestionScores {
   const fluency = args.metrics ? scoreFluency(args.metrics, args.language) : null;
 
@@ -246,7 +325,193 @@ export function scoreQuestion(args: {
         : scoreDepth(args.grading, args.signals);
       return { accuracy: null, depth: null, behavioral: null, fluency, primary: coding, mode: args.mode };
     }
+    case 'skill': {
+      /*
+       * Falls back to `scoreDepth` on the same terms the coding branch does: a
+       * skill question that was talked about rather than submitted — the turns
+       * AFTER the editor closes, where the interviewer asks why they did it
+       * that way — has a transcript and a rubric but no artifact, and grading
+       * that as an experiential answer is exactly right.
+       */
+      const skill = args.skill ? scoreSkill(args.skill) : scoreDepth(args.grading, args.signals);
+      return { accuracy: null, depth: null, behavioral: null, fluency, primary: skill, mode: args.mode };
+    }
   }
+}
+
+/**
+ * Whether a question can produce a real number at all.
+ *
+ * ── Why this exists ──────────────────────────────────────────────────────────
+ * `scoreAccuracy` and `scoreDepth` both open with `if (signals.length === 0)
+ * return 0`, and a zero is indistinguishable from a genuinely bad answer once
+ * it reaches an average. So a question with no rubric does not score badly — it
+ * scores FALSELY, and then counts in the denominator while doing it.
+ *
+ * That was live: `resolveQuestionText` returns no rubric for a generated probe,
+ * a memory callback, or a follow-up-bank entry, and grades all three as
+ * experiential. Every `/reflect` probe and every callback in every interview
+ * was therefore scored 0 out of 10 and averaged in — the more attentive the
+ * interviewer was, the worse the candidate's report looked.
+ *
+ * §9.6's rule is that ungraded questions are excluded from all denominators,
+ * never scored as zero. This is that rule, stated once, where the formulas live.
+ *
+ * Note the two modes that do NOT need signals. Behavioral is scored on STAR
+ * structure read out of the answer itself, and coding on a measured pass rate
+ * from the sandbox — neither consults the rubric, so neither is ungradeable for
+ * want of one.
+ */
+export function isGradeable(args: {
+  mode: GradingMode;
+  signals: RubricSignal[];
+  /** True when the sandbox actually returned a pass rate for this question. */
+  hasCodingResult?: boolean;
+  /** True when SV actually returned requirement verdicts for this question. */
+  hasSkillResult?: boolean;
+}): boolean {
+  switch (args.mode) {
+    case 'factual':
+    case 'experiential':
+      return args.signals.length > 0;
+    case 'behavioral':
+      return true;
+    case 'coding':
+      return Boolean(args.hasCodingResult) || args.signals.length > 0;
+    /*
+     * A skill submission that SV could not review is NOT scored, and is not
+     * scored as zero either — a validator that timed out says nothing about the
+     * candidate. The same rule the coding round has when Judge0 is unavailable.
+     */
+    case 'skill':
+      return Boolean(args.hasSkillResult) || args.signals.length > 0;
+  }
+}
+
+// ── Evidence coverage · the reproducible unit ────────────────────────────────
+
+export interface EvidenceCoverageScore {
+  /** 0–10, weighted by evidence tier. Comparable across sessions. */
+  score: number;
+  required: number;
+  verified: number;
+  partial: number;
+  missing: number;
+}
+
+export interface EvidenceRollup extends EvidenceCoverageScore {
+  by_goal: Array<EvidenceCoverageScore & { goal_id: string; status: string }>;
+  by_skill: Array<EvidenceCoverageScore & { skill: string }>;
+}
+
+/**
+ * Scores what the interview ESTABLISHED, from L3's coverage ledger.
+ *
+ * ── Why this is the number screening mode compares on ────────────────────────
+ * A question score answers "how well did they answer THAT question", and when
+ * the interviewer generates its own questions, two sessions never ask the same
+ * ones — so question scores are not comparable run to run, and averaging them
+ * across sessions compares different measurements.
+ *
+ * Evidence is comparable, because the evidence items come from the blueprint
+ * and the blueprint is generated once per project from fixed inputs. "Did they
+ * establish that they authored the manifests" has the same meaning in every
+ * session, whichever question got them there. That is the whole point of D5 and
+ * of the coverage tracker: a goal is a destination, and destinations are
+ * stable even when routes are not.
+ *
+ * Deterministic — the ledger is already written, this only weights it.
+ */
+export function scoreEvidenceCoverage(
+  coverage: Coverage,
+  blueprint: Blueprint,
+): EvidenceRollup {
+  const tierWeight = { must_have: 3, good_to_have: 2, bonus: 1 } as const;
+  const credit = { verified: 1.0, partial: 0.5, missing: 0.0 } as const;
+
+  const byGoal: EvidenceRollup['by_goal'] = [];
+  const bySkill = new Map<string, { earned: number; possible: number; counts: number[] }>();
+
+  let totalEarned = 0;
+  let totalPossible = 0;
+  const totals = { required: 0, verified: 0, partial: 0, missing: 0 };
+
+  for (const section of blueprint.sections) {
+    for (const goal of section.goals) {
+      const state = coverage.goals.find((g) => g.goal_id === goal.goal_id);
+      if (!state) continue;
+
+      let earned = 0;
+      let possible = 0;
+      const counts = { required: 0, verified: 0, partial: 0, missing: 0 };
+
+      for (const required of goal.evidence_required) {
+        const observed = state.evidence.find((e) => e.evidence_id === required.evidence_id);
+        const status = observed?.status ?? 'missing';
+        // The blueprint's own weight when it set one, else the tier default.
+        const weight = required.weight || tierWeight[required.tier];
+
+        earned += weight * (credit[status as keyof typeof credit] ?? 0);
+        possible += weight;
+
+        counts.required += 1;
+        if (status === 'verified') counts.verified += 1;
+        else if (status === 'partial') counts.partial += 1;
+        else counts.missing += 1;
+      }
+
+      if (possible === 0) continue;
+
+      /*
+       * A goal nobody reached is NOT scored zero — it is left out entirely.
+       *
+       * §9.6's rule for abandoned goals, applied here: an interview that ran
+       * out of time before a section is a shorter measurement, not a worse
+       * candidate. Scoring the unreached as zero would make ending early look
+       * like failing.
+       */
+      if (state.status === 'not_started') continue;
+
+      byGoal.push({
+        goal_id: goal.goal_id,
+        status: state.status,
+        score: round1((earned / possible) * 10),
+        ...counts,
+      });
+
+      totalEarned += earned;
+      totalPossible += possible;
+      totals.required += counts.required;
+      totals.verified += counts.verified;
+      totals.partial += counts.partial;
+      totals.missing += counts.missing;
+
+      for (const skill of goal.skill_tags) {
+        const entry = bySkill.get(skill) ?? { earned: 0, possible: 0, counts: [0, 0, 0, 0] };
+        entry.earned += earned;
+        entry.possible += possible;
+        entry.counts[0] += counts.required;
+        entry.counts[1] += counts.verified;
+        entry.counts[2] += counts.partial;
+        entry.counts[3] += counts.missing;
+        bySkill.set(skill, entry);
+      }
+    }
+  }
+
+  return {
+    score: totalPossible > 0 ? round1((totalEarned / totalPossible) * 10) : 0,
+    ...totals,
+    by_goal: byGoal,
+    by_skill: [...bySkill.entries()].map(([skill, e]) => ({
+      skill,
+      score: e.possible > 0 ? round1((e.earned / e.possible) * 10) : 0,
+      required: e.counts[0],
+      verified: e.counts[1],
+      partial: e.counts[2],
+      missing: e.counts[3],
+    })),
+  };
 }
 
 // ── §9.6 Goal and section aggregation ────────────────────────────────────────
@@ -267,12 +532,52 @@ export interface SessionScores {
   depth: number | null;
   behavioral: number | null;
   coding: number | null;
+  /**
+   * The skill-challenge round: a React component, a SQL query, a fixed bug.
+   *
+   * Kept apart from `coding` rather than averaged into it, because the two are
+   * measured by different instruments — a sandbox pass rate against a model
+   * reading requirements — and a candidate reading a report deserves to know
+   * which of the two a number came from.
+   */
+  skill: number | null;
   /** Reported separately from competence and kept OUT of `overall` (§9.4). */
   fluency: number | null;
   by_section: Array<{ section_id: string; score: number; incomplete: boolean }>;
   by_goal: Array<{ goal_id: string; score: number; status: string; incomplete: boolean }>;
   questions_scored: number;
   questions_excluded: number;
+
+  /**
+   * What the interview established, weighted by evidence tier.
+   *
+   * The cross-session unit. Question scores measure how an answer went;
+   * this measures what is now known about the candidate, which is the thing
+   * that means the same in every session.
+   */
+  evidence: EvidenceRollup;
+
+  /**
+   * How comparable this session's numbers are to another session's.
+   *
+   * Surfaced rather than assumed, because it changes with how the interview was
+   * run: an interviewer that writes its own questions produces question scores
+   * that are honest about THIS conversation and not directly comparable to the
+   * next one, while `evidence.score` stays comparable either way.
+   */
+  reproducibility: {
+    mode: 'practice' | 'screening';
+    /** Where the questions came from. */
+    question_source: 'planned' | 'generated' | 'mixed';
+    /** The field to compare across sessions. Always evidence-based. */
+    comparable_on: 'evidence.score';
+    /**
+     * False when the questions varied, i.e. `overall` reflects a conversation
+     * that will not repeat. It does not mean the score is wrong — it means
+     * ranking two candidates on it compares two different interviews.
+     */
+    question_scores_comparable: boolean;
+  };
 }
 
 /**
@@ -283,7 +588,11 @@ export function aggregateSession(
   questions: ScoredQuestion[],
   coverage: Coverage,
   blueprint: Blueprint,
-  opts: { mode?: 'practice' | 'screening' } = {},
+  opts: {
+    mode?: 'practice' | 'screening';
+    /** Where each question came from, for the reproducibility verdict. */
+    origins?: QuestionRecord['origin'][];
+  } = {},
 ): SessionScores {
   const included = questions.filter((q) => !q.excluded);
 
@@ -344,6 +653,9 @@ export function aggregateSession(
   const coding = meanOf(
     included.filter((q) => q.scores.mode === 'coding').map((q) => q.scores.primary),
   );
+  const skill = meanOf(
+    included.filter((q) => q.scores.mode === 'skill').map((q) => q.scores.primary),
+  );
   const fluency = meanOf(included.filter((q) => q.scores.fluency !== null).map((q) => q.scores.fluency!));
 
   // accuracy_total is the weighted mean over factual + experiential.
@@ -354,7 +666,7 @@ export function aggregateSession(
   );
 
   const overall = computeOverall(
-    { accuracy: accuracyTotal, coding, behavioral },
+    { accuracy: accuracyTotal, coding, skill, behavioral },
     opts.mode ?? 'practice',
   );
 
@@ -364,6 +676,7 @@ export function aggregateSession(
     depth: depth !== null ? round1(depth) : null,
     behavioral: behavioral !== null ? round1(behavioral) : null,
     coding: coding !== null ? round1(coding) : null,
+    skill: skill !== null ? round1(skill) : null,
     fluency: fluency !== null ? round1(fluency) : null,
     by_section: bySection.map((s) => ({
       section_id: s.section_id,
@@ -373,26 +686,70 @@ export function aggregateSession(
     by_goal: byGoal,
     questions_scored: included.length,
     questions_excluded: questions.length - included.length,
+    evidence: scoreEvidenceCoverage(coverage, blueprint),
+    reproducibility: describeReproducibility(opts.mode ?? 'practice', opts.origins ?? []),
   };
 }
 
 /**
- * overall (practice)  = 0.55×accuracy + 0.30×coding + 0.15×behavioral
- * overall (screening) = 0.50×accuracy + 0.25×coding + 0.15×behavioral + 0.10×communication
+ * States plainly which numbers survive being compared to another session.
+ *
+ * `generated` and `callback` questions are written during the interview against
+ * what the candidate actually said, so they differ between two runs of the same
+ * blueprint. A `bank` question does not — P6 wrote it once, before either run.
+ */
+function describeReproducibility(
+  mode: 'practice' | 'screening',
+  origins: QuestionRecord['origin'][],
+): SessionScores['reproducibility'] {
+  const varying = origins.filter((o) => o === 'generated' || o === 'callback').length;
+  const planned = origins.filter((o) => o === 'bank' || o === 'followup').length;
+
+  const source: SessionScores['reproducibility']['question_source'] =
+    varying === 0 ? 'planned' : planned === 0 ? 'generated' : 'mixed';
+
+  return {
+    mode,
+    question_source: source,
+    comparable_on: 'evidence.score',
+    question_scores_comparable: source === 'planned',
+  };
+}
+
+/**
+ * overall (practice)  = 0.55×accuracy + 0.30×coding + 0.20×skill + 0.15×behavioral
+ * overall (screening) = 0.50×accuracy + 0.25×coding + 0.20×skill + 0.15×behavioral
  *
  * Fluency is deliberately absent from the practice formula. §9.4 constraint 2:
  * report it separately from competence and keep it out of the headline number.
  * Weights are renormalised over whichever dimensions actually ran, so a session
  * without a coding round is not silently penalised for the missing 30%.
+ *
+ * ── Why `skill` was added without touching the other three ───────────────────
+ * Only the RATIOS between present dimensions matter, because of that
+ * renormalisation. Adding a fourth weight rather than carving the new one out
+ * of the existing three means a session with no skill round scores exactly what
+ * it scored before this dimension existed — which is the difference between
+ * shipping a feature and silently re-marking every past report.
+ *
+ * It sits between coding and behavioral on purpose: the skill round is a
+ * hands-on test of what the job actually needs, so it outweighs the STAR
+ * questions, and it is judged rather than executed, so it does not outweigh the
+ * round with a sandbox behind it.
  */
 function computeOverall(
-  dims: { accuracy: number | null; coding: number | null; behavioral: number | null },
+  dims: {
+    accuracy: number | null;
+    coding: number | null;
+    skill: number | null;
+    behavioral: number | null;
+  },
   mode: 'practice' | 'screening',
 ): number {
   const weights =
     mode === 'practice'
-      ? { accuracy: 0.55, coding: 0.3, behavioral: 0.15 }
-      : { accuracy: 0.5, coding: 0.25, behavioral: 0.15 };
+      ? { accuracy: 0.55, coding: 0.3, skill: 0.2, behavioral: 0.15 }
+      : { accuracy: 0.5, coding: 0.25, skill: 0.2, behavioral: 0.15 };
 
   let total = 0;
   let weightSum = 0;
@@ -417,7 +774,15 @@ export interface Readiness {
   technical: number;
   behavioral: number;
   coding: number;
-  system_design: number;
+  /**
+   * The skill-challenge dimension.
+   *
+   * Replaces `system_design`, which was carried on this type for months and
+   * never once written to — every session copied the previous value forward
+   * from a field nothing set, so it read 0 for every project that ever existed.
+   * This one is computed from the history like the others.
+   */
+  skill_challenge: number;
   computed_at: string;
   /**
    * One entry per completed session, newest last.
@@ -433,6 +798,7 @@ export interface Readiness {
     technical?: number | null;
     behavioral?: number | null;
     coding?: number | null;
+    skill?: number | null;
   }>;
 }
 
@@ -463,8 +829,9 @@ export function computeReadiness(args: {
   const sessionTechnical = toPct(args.scores.accuracy);
   const sessionBehavioral = toPct(args.scores.behavioral);
   const sessionCoding = toPct(args.scores.coding);
+  const sessionSkill = toPct(args.scores.skill);
 
-  const sessionParts = [sessionTechnical, sessionBehavioral, sessionCoding].filter(
+  const sessionParts = [sessionTechnical, sessionBehavioral, sessionCoding, sessionSkill].filter(
     (p): p is number => p !== null,
   );
   const sessionOverall = sessionParts.length
@@ -480,6 +847,7 @@ export function computeReadiness(args: {
       technical: sessionTechnical,
       behavioral: sessionBehavioral,
       coding: sessionCoding,
+      skill: sessionSkill,
     },
   ].slice(-20);
 
@@ -501,12 +869,12 @@ export function computeReadiness(args: {
   const technical = meanOverHistory((h) => h.technical);
   const behavioral = meanOverHistory((h) => h.behavioral);
   const coding = meanOverHistory((h) => h.coding);
-  const systemDesign = prev?.system_design ?? 0;
+  const skillChallenge = meanOverHistory((h) => h.skill);
   const resumeMatch = args.resumeMatch ?? prev?.resume_match ?? 0;
 
   // Entries written before per-dimension history existed carry only `overall`;
   // averaging that keeps older projects meaningful instead of resetting them.
-  const dimensions = [technical, behavioral, coding, resumeMatch].filter((p) => p > 0);
+  const dimensions = [technical, behavioral, coding, skillChallenge, resumeMatch].filter((p) => p > 0);
   const overall = dimensions.length
     ? Math.round(dimensions.reduce((a, b) => a + b, 0) / dimensions.length)
     : meanOverHistory((h) => h.overall);
@@ -517,7 +885,7 @@ export function computeReadiness(args: {
     technical,
     behavioral,
     coding,
-    system_design: systemDesign,
+    skill_challenge: skillChallenge,
     computed_at: new Date().toISOString(),
     history,
   };

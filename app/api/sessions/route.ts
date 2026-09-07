@@ -4,7 +4,7 @@
  * sitemap-workflow.md §8:
  *   spend_credits(amount, session_id)   ← atomic, fails closed on insufficient balance
  *   insert sessions (status = 'preparing')
- *   enqueue P6 blueprint → P7 coding → P8 voice pre-synthesis
+ *   enqueue P6 blueprint → P7 coding & skill challenges → P8 voice pre-synthesis
  *   redirect to /interview/[sessionId]
  *
  * `spend_credits` reads `auth.uid()`, so it MUST be called through the user's
@@ -16,9 +16,9 @@ import { createSupabaseServerClient, requireUser } from '@/lib/supabase/server';
 import {
   CODING_MODULE_CREDITS,
   CREDITS_PER_MINUTE,
-  SYSTEM_DESIGN_MODULE_CREDITS,
+  SKILL_CHALLENGE_MODULE_CREDITS,
   codingQuestionCount,
-  designQuestionCount,
+  skillQuestionCount,
   planSession,
   type Difficulty,
 } from '@/lib/credits';
@@ -28,7 +28,8 @@ interface CreateSessionBody {
   projectId: string;
   difficulty?: Difficulty;
   coding?: boolean;
-  systemDesign?: boolean;
+  /** The hands-on round in a required technology. Was `systemDesign`. */
+  skillChallenge?: boolean;
   focusSkills?: string[];
 }
 
@@ -66,7 +67,7 @@ export async function POST(request: Request) {
     const difficulty: Difficulty = body.difficulty ?? prefs.defaults?.difficulty ?? 'medium';
     const modules = {
       coding: body.coding ?? false,
-      system_design: body.systemDesign ?? false,
+      skill_challenge: body.skillChallenge ?? false,
       behavioral: true,
     };
 
@@ -151,7 +152,7 @@ export async function POST(request: Request) {
           reason: 'modules',
           breakdown: {
             coding: modules.coding ? CODING_MODULE_CREDITS : 0,
-            system_design: modules.system_design ? SYSTEM_DESIGN_MODULE_CREDITS : 0,
+            skill_challenge: modules.skill_challenge ? SKILL_CHALLENGE_MODULE_CREDITS : 0,
           },
           difficulty,
         },
@@ -191,8 +192,8 @@ export async function POST(request: Request) {
       codingQuestions: modules.coding
         ? codingQuestionCount(difficulty, plan.ceilingMinutes)
         : 0,
-      designQuestions: modules.system_design
-        ? designQuestionCount(difficulty, plan.ceilingMinutes)
+      skillQuestions: modules.skill_challenge
+        ? skillQuestionCount(difficulty, plan.ceilingMinutes)
         : 0,
     });
   } catch (err) {

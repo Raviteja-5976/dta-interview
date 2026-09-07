@@ -22,9 +22,9 @@ import {
   CODING_MODULE_CREDITS,
   DIFFICULTY_BANDS,
   CREDITS_PER_MINUTE,
-  SYSTEM_DESIGN_MODULE_CREDITS,
+  SKILL_CHALLENGE_MODULE_CREDITS,
   codingQuestionCount,
-  designQuestionCount,
+  skillQuestionCount,
   planSession,
   type Difficulty,
 } from '@/lib/credits';
@@ -59,18 +59,18 @@ function InterviewSetupContent() {
 
   const [difficulty, setDifficulty] = useState<Difficulty>('medium');
   const [coding, setCoding] = useState(false);
-  const [systemDesign, setSystemDesign] = useState(false);
+  const [skillChallenge, setSkillChallenge] = useState(false);
   const [focusSkills, setFocusSkills] = useState<string[]>(
     search.get('focus')?.split(',').filter(Boolean) ?? [],
   );
 
   // Length follows difficulty, then gets capped by what the balance affords.
   // There is no duration picker — see lib/credits.ts for why.
-  const plan = planSession(difficulty, { coding, system_design: systemDesign }, balance);
+  const plan = planSession(difficulty, { coding, skill_challenge: skillChallenge }, balance);
   const canAfford = plan.canStart;
 
   const codingQs = codingQuestionCount(difficulty, plan.ceilingMinutes);
-  const designQs = designQuestionCount(difficulty, plan.ceilingMinutes);
+  const skillQs = skillQuestionCount(difficulty, plan.ceilingMinutes);
 
   // ── Mic pre-flight ─────────────────────────────────────────────────────────
   const [micState, setMicState] = useState<'idle' | 'granted' | 'denied'>('idle');
@@ -131,14 +131,20 @@ function InterviewSetupContent() {
       setAvailableSkills(((skills as Array<{ skill: string }>) ?? []).map((s) => s.skill));
 
       const prefs = (profile?.prefs ?? {}) as {
-        defaults?: { difficulty?: Difficulty; duration_min?: number; coding?: boolean; system_design?: boolean };
+        defaults?: { difficulty?: Difficulty; duration_min?: number; coding?: boolean; skill_challenge?: boolean };
       };
       if (prefs.defaults?.difficulty) setDifficulty(prefs.defaults.difficulty);
       if (prefs.defaults?.coding !== undefined) setCoding(prefs.defaults.coding);
 
-      // System design defaults off below mid seniority (§8).
+      /*
+       * The skill challenge defaults off below senior, and that is a change of
+       * meaning worth noting: the old system design module was off for juniors
+       * because architecture questions are not what a junior interview is for.
+       * A React or SQL task is exactly what a junior interview is for — but it
+       * costs credits, so it stays opt-in and the preference decides.
+       */
       const senior = ['senior', 'staff', 'principal'].includes(project?.seniority ?? '');
-      setSystemDesign(senior && (prefs.defaults?.system_design ?? false));
+      setSkillChallenge(senior && (prefs.defaults?.skill_challenge ?? false));
 
       setLoading(false);
     })();
@@ -152,7 +158,7 @@ function InterviewSetupContent() {
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId, difficulty, coding, systemDesign, focusSkills }),
+        body: JSON.stringify({ projectId, difficulty, coding, skillChallenge, focusSkills }),
       });
       const data = await res.json();
 
@@ -217,10 +223,24 @@ function InterviewSetupContent() {
               <Pill active={coding} onClick={() => setCoding(!coding)}>
                 Coding round {coding ? '✓' : ''}
               </Pill>
-              <Pill active={systemDesign} onClick={() => setSystemDesign(!systemDesign)}>
-                System design {systemDesign ? '✓' : ''}
+              <Pill active={skillChallenge} onClick={() => setSkillChallenge(!skillChallenge)}>
+                Skill challenge {skillChallenge ? '✓' : ''}
               </Pill>
             </Choice>
+
+            {/* What the two rounds actually are. Without this the difference
+                between them is a guess, and they are charged separately. */}
+            <div className="-mt-2 mb-5 space-y-1.5 text-sm text-[#1B1F3B]/70">
+              <p>
+                <strong className="text-[#1B1F3B]">Coding round</strong> — LeetCode-style algorithm
+                problems in an editor, run against hidden tests.
+              </p>
+              <p>
+                <strong className="text-[#1B1F3B]">Skill challenge</strong> — a hands-on task in a
+                technology this role asks for: build a component, write the query, or find the bug in
+                code we give you. Reviewed after the interview, not by a test suite.
+              </p>
+            </div>
 
             {availableSkills.length > 0 && (
               <Choice label="Focus skills (optional)">
@@ -283,9 +303,9 @@ function InterviewSetupContent() {
                 as your answer.
               </p>
               <p>Find somewhere quiet. Background conversation confuses the transcript.</p>
-              {coding && (
+              {(coding || skillChallenge) && (
                 <p className="text-[#1B1F3B]">
-                  <strong>Coding rounds are much better on a laptop</strong> than a phone.
+                  <strong>Rounds with an editor are much better on a laptop</strong> than a phone.
                 </p>
               )}
             </div>
@@ -321,15 +341,15 @@ function InterviewSetupContent() {
 
                 <div className="flex justify-between">
                   <span className="text-[#1B1F3B]/70">
-                    System design
-                    {systemDesign && (
+                    Skill challenge
+                    {skillChallenge && (
                       <span className="block text-[11px] text-[#1B1F3B]/45">
-                        {designQs} scenario{designQs === 1 ? '' : 's'}
+                        {skillQs} task{skillQs === 1 ? '' : 's'}
                       </span>
                     )}
                   </span>
                   <span className="tabular-nums font-bold">
-                    {systemDesign ? SYSTEM_DESIGN_MODULE_CREDITS : '—'}
+                    {skillChallenge ? SKILL_CHALLENGE_MODULE_CREDITS : '—'}
                   </span>
                 </div>
 

@@ -23,7 +23,7 @@ import {
   CODING_MODULE_CREDITS,
   CREDITS_PER_MINUTE,
   CREDIT_PACKS,
-  SYSTEM_DESIGN_MODULE_CREDITS,
+  SKILL_CHALLENGE_MODULE_CREDITS,
 } from '@/lib/credits';
 import { supabase } from '@/lib/supabase/client';
 
@@ -213,7 +213,7 @@ function CreditsContent() {
             )}
 
             {/* Packs */}
-            <SectionTitle sub={`${CREDITS_PER_MINUTE} credits per minute, billed after the interview · coding round ${CODING_MODULE_CREDITS} upfront · system design ${SYSTEM_DESIGN_MODULE_CREDITS} upfront`}>
+            <SectionTitle sub={`${CREDITS_PER_MINUTE} credits per minute, billed after the interview · coding round ${CODING_MODULE_CREDITS} upfront · skill challenge ${SKILL_CHALLENGE_MODULE_CREDITS} upfront`}>
               Buy credits
             </SectionTitle>
 

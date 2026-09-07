@@ -8,7 +8,7 @@
  * ── How an interview is paid for ─────────────────────────────────────────────
  * Two different things, billed two different ways:
  *
- *   Modules (coding, system design)  — charged UPFRONT, flat.
+ *   Modules (coding, skill challenge) — charged UPFRONT, flat.
  *     They are generated during preparation, before a word is spoken. The AI
  *     spend is already incurred by the time the interview starts, so there is
  *     nothing to pro-rate.
@@ -27,7 +27,15 @@
 
 export const CREDITS_PER_MINUTE = 5;
 export const CODING_MODULE_CREDITS = 20;
-export const SYSTEM_DESIGN_MODULE_CREDITS = 30;
+/**
+ * The skill challenge — a task in the technology the role requires, reviewed
+ * after the interview by a deep-tier model rather than by a sandbox.
+ *
+ * Dearer than the coding round because it costs more to run: P7 authors it AND
+ * SV reads the submission back on the deep tier, where the coding round's
+ * verdict comes from Judge0 for nothing.
+ */
+export const SKILL_CHALLENGE_MODULE_CREDITS = 30;
 
 /** No interview may carry more than three of either challenge type. */
 export const MAX_MODULE_QUESTIONS = 3;
@@ -49,7 +57,7 @@ export const DIFFICULTY_BANDS: Record<Difficulty, DurationBand> = {
 
 export interface SessionModules {
   coding: boolean;
-  system_design: boolean;
+  skill_challenge: boolean;
 }
 
 // ── Planning a session ───────────────────────────────────────────────────────
@@ -57,7 +65,7 @@ export interface SessionModules {
 export function moduleCredits(modules: SessionModules): number {
   return (
     (modules.coding ? CODING_MODULE_CREDITS : 0) +
-    (modules.system_design ? SYSTEM_DESIGN_MODULE_CREDITS : 0)
+    (modules.skill_challenge ? SKILL_CHALLENGE_MODULE_CREDITS : 0)
   );
 }
 
@@ -171,8 +179,12 @@ export function codingQuestionCount(difficulty: Difficulty, ceilingMinutes: numb
   return clampCount(Math.min(byDifficulty, byDuration));
 }
 
-/** System design scenarios are slower to work through, so they need more room. */
-export function designQuestionCount(difficulty: Difficulty, ceilingMinutes: number): number {
+/**
+ * Skill challenges are slower to work through than a DSA problem — reading a
+ * schema, or unfamiliar broken code, before writing anything — so they get
+ * fewer slots at the same interview length.
+ */
+export function skillQuestionCount(difficulty: Difficulty, ceilingMinutes: number): number {
   const byDifficulty = { easy: 1, medium: 1, hard: 2 }[difficulty];
   const byDuration = ceilingMinutes < 20 ? 1 : ceilingMinutes < 30 ? 2 : 3;
   return clampCount(Math.min(byDifficulty, byDuration));

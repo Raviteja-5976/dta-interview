@@ -1,5 +1,5 @@
 /**
- * Phase 1 (session half) · P5' → P6 → P7 → P8.
+ * Phase 1 (session half) · P5' → (P6 ∥ P7) → P8.
  *
  * Runs per session and takes seconds rather than the ~60s of project prep,
  * because P1–P4 already ran once and are reused. That is the entire payoff of
@@ -18,8 +18,8 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { runStrategy } from '../agents/p5-strategy';
 import { runBlueprint } from '../agents/p6-blueprint';
-import { runCodingChallengeSet, runDesignChallengeSet } from '../agents/p7-challenge';
-import { codingQuestionCount, designQuestionCount } from '../credits';
+import { runCodingChallengeSet, runSkillChallengeSet } from '../agents/p7-challenge';
+import { codingQuestionCount, skillQuestionCount } from '../credits';
 import type {
   Blueprint,
   CompanyProfile,
@@ -43,7 +43,7 @@ export interface SessionConfig {
   target_max_minutes: number;
   language: string;
   persona: string;
-  modules: { coding: boolean; system_design: boolean; behavioral: boolean };
+  modules: { coding: boolean; skill_challenge: boolean; behavioral: boolean };
   focus_skills: string[];
 }
 
@@ -58,9 +58,9 @@ export interface SessionPrepResult {
  * Publishes progress to `sessions.progress`, which the interview screen watches
  * over realtime.
  *
- * P6 alone can take a minute of genuine work. Without this the screen has
- * nothing to show and a slow-but-healthy prep is indistinguishable from a hang —
- * which is exactly how a working system gets reported as broken.
+ * Prep is tens of seconds of genuine work. Without this the screen has nothing
+ * to show and a slow-but-healthy prep is indistinguishable from a hang — which
+ * is exactly how a working system gets reported as broken.
  *
  * Never allowed to fail the pipeline: a missed progress write costs a UI update,
  * not a session.
@@ -154,34 +154,45 @@ export async function runSessionPrep(
           maxMinutes: config.target_max_minutes ?? config.duration_min,
           difficulty: config.difficulty,
           coding: config.modules.coding,
-          systemDesign: config.modules.system_design,
+          skillChallenge: config.modules.skill_challenge,
           focusSkills: config.focus_skills,
         },
       },
       context,
     );
 
-    // ── P6 ───────────────────────────────────────────────────────────────────
-    await publishProgress(supabase, sessionId, 'blueprint', undefined, clock);
-    const blueprint = await runBlueprint(
-      {
-        strategy,
-        gap: project.gap_report as GapReport,
-        resume: resumeProfile,
-        company: project.company_profile as CompanyProfile | null,
-        roleTitle: project.role_title,
-        companyName: project.company_name,
-        seniority: project.seniority ?? 'mid',
-        difficulty: config.difficulty,
-      },
-      context,
-    );
+    // ── P6 and P7, concurrently ──────────────────────────────────────────────
+    //
+    // P7 reads the strategy, the JD and the config. It has never read the
+    // blueprint, so waiting for one before starting the other was pure serial
+    // latency — on a session with both modules enabled that was the coding and
+    // skill challenges, up to six deep-tier calls, queued behind the single
+    // slowest thing in preparation for no reason at all.
+    const jd = project.jd_profile as JdProfile;
 
-    // ── P7 (only for enabled modules) ────────────────────────────────────────
     const challengeInput = {
       roleTitle: project.role_title,
       seniority: project.seniority ?? 'mid',
       prioritySkills: strategy.priority_skills,
+      /*
+       * What the JOB requires, most important first — which is not the same
+       * list as `priority_skills`.
+       *
+       * `priority_skills` is what this interview decided to investigate, and
+       * that is weighted towards gaps: the things the resume does not evidence.
+       * The skill challenge is the "can you do the work" round, so it is
+       * anchored to the role's actual requirements. A React role gets a React
+       * task even when React was not the thing in doubt.
+       *
+       * `derived_from` rides along — it is the phrase in the posting the skill
+       * was extracted from, and it is the difference between a task about
+       * Kotlin and a task about what this job does with Kotlin.
+       */
+      requirements: [...jd.required_skills]
+        .sort((a, b) => b.importance - a.importance)
+        .map((s) => ({ skill: s.skill, derivedFrom: s.derived_from })),
+      responsibilities: jd.responsibilities,
+      domainKnowledge: jd.domain_knowledge,
       difficulty: config.difficulty,
       strategy,
     };
@@ -192,38 +203,101 @@ export async function runSessionPrep(
     const codingCount = config.modules.coding
       ? codingQuestionCount(config.difficulty, config.duration_min)
       : 0;
-    const designCount = config.modules.system_design
-      ? designQuestionCount(config.difficulty, config.duration_min)
+    const skillCount = config.modules.skill_challenge
+      ? skillQuestionCount(config.difficulty, config.duration_min)
       : 0;
 
 
-    if (codingCount > 0 || designCount > 0) {
-      await publishProgress(
-        supabase,
-        sessionId,
-        'challenges',
-        `${codingCount} coding, ${designCount} design`,
-        clock,
-      );
-    }
+    /*
+     * P7 is launched first and awaited last.
+     *
+     * The dependency graph is P5 → P6 → P8 for the blueprint and its voice
+     * clips, with P7 hanging off P5 alone. Awaiting the challenges next to the
+     * blueprint made P8 wait for them too, so a slow challenge round delayed
+     * work that had nothing to do with it — on the run that prompted this, the
+     * blueprint was ready at 56s and voice synthesis did not start until 120s.
+     *
+     * Neither set rejects: both use allSettled internally and return a possibly
+     * empty set, so this promise cannot become an unhandled rejection while the
+     * blueprint is still being built.
+     */
+    await publishProgress(
+      supabase,
+      sessionId,
+      'blueprint',
+      codingCount > 0 || skillCount > 0
+        ? `questions + ${codingCount} coding, ${skillCount} skill`
+        : undefined,
+      clock,
+    );
 
-    const [codingChallenge, designChallenge] = await Promise.all([
+    const challenges = Promise.all([
       codingCount > 0
         ? runCodingChallengeSet(challengeInput, codingCount, context)
         : Promise.resolve(null),
-      designCount > 0
-        ? runDesignChallengeSet(challengeInput, designCount, context)
+      skillCount > 0
+        ? runSkillChallengeSet(challengeInput, skillCount, context)
         : Promise.resolve(null),
     ]);
 
-    // ── P8 ───────────────────────────────────────────────────────────────────
+    const blueprint = await runBlueprint(
+      {
+        strategy,
+        gap: project.gap_report as GapReport,
+        resume: resumeProfile,
+        // The live interviewer never sees the JD; P6 digests it into the
+        // blueprint's context block, which is read on every turn instead.
+        jd,
+        company: project.company_profile as CompanyProfile | null,
+        roleTitle: project.role_title,
+        companyName: project.company_name,
+        seniority: project.seniority ?? 'mid',
+        difficulty: config.difficulty,
+      },
+      context,
+    );
+
+    // ── P8, alongside whatever P7 is still doing ─────────────────────────────
     await publishProgress(supabase, sessionId, 'voice', undefined, clock);
-    const voiceAssets = await presynthesizeVoice(supabase, {
-      sessionId,
-      userId: session.user_id,
-      blueprint,
-      config,
-    });
+
+    const [voiceAssets, [codingChallenge, skillChallenge]] = await Promise.all([
+      presynthesizeVoice(supabase, {
+        sessionId,
+        userId: session.user_id,
+        blueprint,
+        config,
+      }),
+      challenges,
+    ]);
+
+    /*
+     * A module that was paid for and produced nothing must not leave its
+     * section in the blueprint.
+     *
+     * When challenge generation fails entirely, `skillPayload` returns null and
+     * the editor never opens — so the interviewer would hand off to a screen
+     * that never appears, then talk into a section with nothing in it. Dropping
+     * the section turns a broken round into a shorter interview, which is the
+     * better of the two.
+     *
+     * Logged at error level because the user was charged a flat module fee for
+     * this and did not get it.
+     */
+    const emptyModules = new Set<string>();
+    if (codingCount > 0 && !codingChallenge?.challenges.length) emptyModules.add('coding');
+    if (skillCount > 0 && !skillChallenge?.challenges.length) emptyModules.add('skill_challenge');
+
+    if (emptyModules.size > 0) {
+      console.error(
+        `[session-prep] ${sessionId} — PAID MODULE PRODUCED NOTHING: ${[...emptyModules].join(', ')}. ` +
+          'Section dropped from the blueprint.',
+      );
+      const kept = blueprint.sections.filter((s) => !emptyModules.has(s.type));
+      // Defensive: the intro and closing are always present, so this cannot
+      // realistically bite — but an interview with one section left is not an
+      // interview, and a broken handoff is the lesser problem at that point.
+      if (kept.length >= 2) blueprint.sections = kept;
+    }
 
     // L3 is seeded from P6's evidence contract, and the runtime starts at the
     // strategy's opening difficulty. Both are checkpointed into live_state so a
@@ -240,7 +314,7 @@ export async function runSessionPrep(
         status: 'ready',
         blueprint,
         coding_challenge: codingChallenge,
-        design_challenge: designChallenge,
+        skill_challenge: skillChallenge,
         voice_assets: voiceAssets,
         live_state: {
           v: 2,
@@ -309,13 +383,22 @@ async function presynthesizeVoice(
     section.exit_transitions.forEach((t, i) =>
       targets.push({ id: `tr_out_${si}_${i}`, text: t, kind: 'transition' }),
     );
+    /*
+     * Only the FIRST seed question of each goal.
+     *
+     * Invariant 17 plays a cached clip only on an exact text match, and the
+     * live interviewer writes its own wording — so a seed is spoken verbatim
+     * in two situations only: it opens a goal, or the live call failed and the
+     * rule layer fell back to it. The second and third seeds of a goal are
+     * almost never the thing that gets said, and synthesising all of them was
+     * roughly forty-five clips per session generated, uploaded and then never
+     * read. A miss costs a streamed clip, not a broken turn.
+     */
     section.goals.forEach((goal) => {
-      goal.question_bank.forEach((q) =>
-        targets.push({ id: `q_${q.bank_id}`, text: q.text, kind: 'bank_question' }),
-      );
-      goal.followup_bank.forEach((f) =>
-        targets.push({ id: `f_${f.followup_id}`, text: f.text, kind: 'bank_question' }),
-      );
+      const opener = goal.question_bank[0];
+      if (opener) {
+        targets.push({ id: `q_${opener.bank_id}`, text: opener.text, kind: 'bank_question' });
+      }
     });
   });
 
@@ -323,9 +406,16 @@ async function presynthesizeVoice(
     targets.push({ id: `ack_${i}`, text: a, kind: 'acknowledgement' }),
   );
 
-  // Bounded concurrency: a 40-clip burst at full parallelism gets rate-limited,
-  // and P8 must finish before READY.
-  const CONCURRENCY = 6;
+  /*
+   * Bounded concurrency: an unbounded burst gets rate-limited, and P8 must
+   * finish before READY.
+   *
+   * Raised from 6 to 10 because each unit of work is a TTS call followed by a
+   * storage upload — entirely I/O, with nothing of ours doing any work in
+   * between. Twenty-six clips at six-wide is five sequential batches and was
+   * costing ~35s of the critical path; ten-wide is three.
+   */
+  const CONCURRENCY = 10;
   for (let i = 0; i < targets.length; i += CONCURRENCY) {
     const batch = targets.slice(i, i + CONCURRENCY);
     const results = await Promise.allSettled(

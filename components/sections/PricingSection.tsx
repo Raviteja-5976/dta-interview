@@ -74,7 +74,7 @@ export default function PricingSection() {
         </Link>
 
         <p className="font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/70">
-          Credits never expire · Coding round +20 · System design +30
+          Credits never expire · Coding round +20 · Skill challenge +30
         </p>
       </div>
     </section>

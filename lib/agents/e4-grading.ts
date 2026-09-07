@@ -40,6 +40,7 @@ Filler words, false starts, and self-corrections are speech, not error. Ignore t
 - experiential: about their own work. It CANNOT be wrong. Do not populate incorrect_claims for a factual disagreement — they are describing what they did. Judge depth, ownership and specificity instead. The only thing that belongs in incorrect_claims here is a genuine technical misstatement about how something works, not a judgement about their choices.
 - behavioral: about working with people. Fill in the STAR fields. Never mark wrong.
 - coding: reasoning about their own code. Judge the reasoning, not the syntax.
+- skill: the hands-on round — something built or fixed in the editor. You are NOT reviewing the code here; a separate reader does that against the requirements. Judge only what the transcript shows about how they worked: did they say what they were doing and why, did they consider anything they rejected, did they notice their own mistakes.
 
 ## Grading against the resume
 
@@ -52,12 +53,14 @@ What the resume lets you observe:
 
 Never mark an experiential answer wrong for diverging from the resume. A resume is a summary written months earlier, not ground truth. The divergence is the observation; the judgement is not yours to make.
 
-## coding — fill this in for coding answers only, otherwise null
+## coding — fill this in for coding and skill answers only, otherwise null
 
-You are given the submitted source and the test results. The pass rate is already measured and is NOT yours to judge — assess the three things a test runner cannot:
+You are given the submitted source and, for a coding answer, the test results. The pass rate is already measured and is NOT yours to judge — assess the three things a test runner cannot:
 - complexity_match: how close the solution is to the stated target complexity. A correct brute force where the target was O(n log n) scores low here even at 100% passing.
 - code_quality: naming, structure, edge-case handling. Not formatting, not style preferences.
 - verbal_reasoning: did they explain the approach as they worked? Judge from the transcript around the submission. Silence while typing scores low even for perfect code — thinking out loud is what a coding interview is actually testing.
+
+On a SKILL answer, verbal_reasoning is the field that is used and the other two are not. Fill all three anyway, but spend your attention on that one.
 
 ## incorrect_claims
 
@@ -89,6 +92,15 @@ export interface GradingInput {
   resumeContext?: string;
   /** Sandbox results for a coding submission. Measured, never judged (§9.5). */
   codingContext?: { passed: number; total: number; language: string; source: string };
+  /**
+   * The skill round's submission.
+   *
+   * No test tally, because nothing ran. The requirements are deliberately NOT
+   * passed: SV grades against those, and handing them to E4 as well would
+   * produce a second opinion on the same question that S1 has no way to
+   * reconcile with the first.
+   */
+  skillContext?: { skill: string; format: string; language: string; source: string };
 }
 
 export async function runGrading(
@@ -129,6 +141,16 @@ export async function runGrading(
             '</submission>',
             `Sandbox result: ${input.codingContext.passed} of ${input.codingContext.total} tests passed. ` +
               'This is measured fact — do not re-judge it. Fill in the `coding` block.',
+          ].join('\n')
+        : '',
+      input.skillContext
+        ? [
+            '',
+            `<submission skill="${input.skillContext.skill}" format="${input.skillContext.format}" language="${input.skillContext.language}">`,
+            input.skillContext.source.slice(0, 4000),
+            '</submission>',
+            'Nothing was executed and the code is reviewed elsewhere. Fill in the `coding` block, ' +
+              'and put your attention on `verbal_reasoning`: what the transcript shows about how they worked.',
           ].join('\n')
         : '',
       '',

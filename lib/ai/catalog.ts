@@ -35,6 +35,17 @@ type Catalog = Record<ProviderId, Record<ModelTier, ModelSpec>>;
 const GPT_56_EFFORTS: ReasoningEffort[] = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
+ * What Groq's gpt-oss family accepts.
+ *
+ * Groq rejects `none` with a 400:
+ *   `reasoning_effort` must be one of `low`, `medium`, or `high`
+ *
+ * `resolveReasoningEffort` will therefore map a request for `none` down to `low`,
+ * which is the fastest and cheapest thinking tier Groq supports (~250ms).
+ */
+const GPT_OSS_EFFORTS: ReasoningEffort[] = ['low', 'medium', 'high'];
+
+/**
  * ── Why the ladder sits where it does ────────────────────────────────────────
  * The ladder is pinned to unit economics, not to what is impressive.
  *
@@ -195,6 +206,61 @@ export const CATALOG: Catalog = {
       supportsReasoningEffort: false,
     },
   },
+
+  /**
+   * Groq — the live loop's provider.
+   *
+   * Here for exactly one property: time to first token. The interviewer that
+   * decides and words the next question runs INSIDE the turn, in the silence
+   * after the candidate stops talking, and that silence is the whole of what
+   * makes a voice agent feel alive or dead. Nothing else in the system cares.
+   *
+   * That is why `deep` still points at a 120b model rather than something
+   * larger: there is no frontier tier here and there should not be. P6's
+   * blueprint and P7's challenges stay on OpenAI, where an extra thirty seconds
+   * costs nothing and output quality compounds across the whole interview.
+   *
+   * gpt-oss accepts `reasoningEffort: 'none'`, which the live agents want —
+   * they are selecting and wording, not deliberating.
+   */
+  groq: {
+    nano: {
+      id: 'openai/gpt-oss-20b',
+      pricing: { input: 0.1, output: 0.5 },
+      contextWindow: 131_072,
+      structuredOutputs: true,
+      supportsTemperature: true,
+      supportsReasoningEffort: true,
+      reasoningEfforts: GPT_OSS_EFFORTS,
+    },
+    fast: {
+      id: 'openai/gpt-oss-20b',
+      pricing: { input: 0.1, output: 0.5 },
+      contextWindow: 131_072,
+      structuredOutputs: true,
+      supportsTemperature: true,
+      supportsReasoningEffort: true,
+      reasoningEfforts: GPT_OSS_EFFORTS,
+    },
+    balanced: {
+      id: 'openai/gpt-oss-120b',
+      pricing: { input: 0.15, output: 0.75 },
+      contextWindow: 131_072,
+      structuredOutputs: true,
+      supportsTemperature: true,
+      supportsReasoningEffort: true,
+      reasoningEfforts: GPT_OSS_EFFORTS,
+    },
+    deep: {
+      id: 'openai/gpt-oss-120b',
+      pricing: { input: 0.15, output: 0.75 },
+      contextWindow: 131_072,
+      structuredOutputs: true,
+      supportsTemperature: true,
+      supportsReasoningEffort: true,
+      reasoningEfforts: GPT_OSS_EFFORTS,
+    },
+  },
 };
 
 // ── Voice models ─────────────────────────────────────────────────────────────
@@ -292,13 +358,14 @@ export function ttsCostUsd(provider: VoiceProviderId, characters: number): numbe
   return Math.round((characters / 1_000_000) * rate * 1_000_000) / 1_000_000;
 }
 
-export const PROVIDER_IDS: ProviderId[] = ['openai', 'google', 'xai'];
+export const PROVIDER_IDS: ProviderId[] = ['openai', 'google', 'xai', 'groq'];
 
 /** Env var holding each provider's key. Checked at resolution time, not import. */
 export const PROVIDER_ENV_KEY: Record<ProviderId, string> = {
   openai: 'OPENAI_API_KEY',
   google: 'GOOGLE_GENERATIVE_AI_API_KEY',
   xai: 'XAI_API_KEY',
+  groq: 'GROQ_API_KEY',
 };
 
 export function isProviderId(value: string): value is ProviderId {

@@ -14,7 +14,7 @@
  * refined state only.
  */
 
-import type { Blueprint } from '../agents/schemas';
+import type { Blueprint, Rubric } from '../agents/schemas';
 import {
   DEPTH_ORDER,
   depthAtLeast,
@@ -362,14 +362,67 @@ function contentTokens(text: string): Set<string> {
   );
 }
 
+/**
+ * Builds the rubric for a question from the evidence it targets.
+ *
+ * ── The change that makes a generated question gradeable ─────────────────────
+ * Rubrics used to be authored per bank question, which was fine while every
+ * question came from the bank. Once the interviewer writes its own, a
+ * question-shaped rubric grades nothing — the sentence it was written for is
+ * not the sentence that got asked, and a question with no rubric scores a hard
+ * zero (see `isGradeable` in s1-scoring.ts for what that cost).
+ *
+ * So the contract hangs off the evidence, and this assembles the slice of it
+ * that applies to one question. Whatever wording surfaced a piece of evidence,
+ * it is graded against that evidence's signals.
+ *
+ * `volatility` is the strictest of the items involved: if any of them moves
+ * with releases, the answer as a whole is worth re-checking.
+ */
+export function buildRubric(goal: BlueprintGoal, evidenceIds: string[]): Rubric {
+  const wanted = new Set(evidenceIds);
+  const items = goal.evidence_required.filter((e) => wanted.has(e.evidence_id));
+
+  // A question that targets nothing recognisable is graded against the whole
+  // goal rather than against nothing at all.
+  const effective = items.length > 0 ? items : goal.evidence_required;
+
+  const expected_signals = effective.flatMap((item) =>
+    item.expected_signals.map((s) => ({
+      id: s.id,
+      evidence_id: item.evidence_id,
+      signal: s.signal,
+      tier: item.tier,
+      weight: item.weight,
+      accept_if_candidate_says: s.accept_if_candidate_says,
+    })),
+  );
+
+  const order = { stable: 0, versioned: 1, volatile: 2 } as const;
+  const volatility = effective.reduce<Rubric['volatility']>(
+    (worst, item) => (order[item.volatility] > order[worst] ? item.volatility : worst),
+    'stable',
+  );
+
+  // S1 weights by tier, so the must-haves have to come first when the cap bites.
+  expected_signals.sort((a, b) => b.weight - a.weight);
+
+  return { expected_signals: expected_signals.slice(0, 12), volatility };
+}
+
+/**
+ * The literal spoken phrasings that count as covering a piece of evidence.
+ *
+ * These come off the evidence item itself now rather than off whichever bank
+ * question happened to mention it. That is what keeps the lexical matcher
+ * working when the interviewer writes its own questions: the phrases describe
+ * what the CANDIDATE would say, which does not depend on how they were asked.
+ */
 function collectAcceptPhrases(goal: BlueprintGoal, evidenceId: string): string[] {
-  const phrases: string[] = [];
-  for (const q of goal.question_bank) {
-    for (const signal of q.rubric.expected_signals) {
-      if (signal.evidence_id === evidenceId) phrases.push(...signal.accept_if_candidate_says);
-    }
-  }
-  return phrases;
+  const item = goal.evidence_required.find((e) => e.evidence_id === evidenceId);
+  if (!item) return [];
+
+  return item.expected_signals.flatMap((s) => s.accept_if_candidate_says);
 }
 
 interface EvidenceMatch {

@@ -22,7 +22,7 @@ import {
   CREDITS_PER_MINUTE,
   CREDIT_PACKS,
   DIFFICULTY_BANDS,
-  SYSTEM_DESIGN_MODULE_CREDITS,
+  SKILL_CHALLENGE_MODULE_CREDITS,
   planSession,
   type Difficulty,
 } from '@/lib/credits';
@@ -36,16 +36,16 @@ import { supabase } from '@/lib/supabase/client';
  */
 const RICH = 10_000;
 
-const EXAMPLES: Array<{ label: string; difficulty: Difficulty; coding: boolean; design: boolean }> = [
-  { label: 'Easy interview', difficulty: 'easy', coding: false, design: false },
-  { label: 'Medium + coding round', difficulty: 'medium', coding: true, design: false },
-  { label: 'Hard + coding + system design', difficulty: 'hard', coding: true, design: true },
+const EXAMPLES: Array<{ label: string; difficulty: Difficulty; coding: boolean; skill: boolean }> = [
+  { label: 'Easy interview', difficulty: 'easy', coding: false, skill: false },
+  { label: 'Medium + coding round', difficulty: 'medium', coding: true, skill: false },
+  { label: 'Hard + coding + skill challenge', difficulty: 'hard', coding: true, skill: true },
 ];
 
 const FAQ = [
   {
     q: 'How are credits actually charged?',
-    a: `Talking time is billed by the minute, afterwards — ${CREDITS_PER_MINUTE} credits for each minute you were actually in the interview. Nothing is held upfront for it. Coding rounds and system design are the exception: those are charged when you start, because we build the problems before you arrive.`,
+    a: `Talking time is billed by the minute, afterwards — ${CREDITS_PER_MINUTE} credits for each minute you were actually in the interview. Nothing is held upfront for it. Coding rounds and the skill challenge are the exception: those are charged when you start, because we build the problems before you arrive.`,
   },
   {
     q: 'What if I finish early?',
@@ -56,8 +56,8 @@ const FAQ = [
     a: `${CODING_MODULE_CREDITS} credits, flat, however many problems it contains. Depending on the length and difficulty of the interview that's one, two, or three problems — never more than three.`,
   },
   {
-    q: 'And system design?',
-    a: `${SYSTEM_DESIGN_MODULE_CREDITS} credits, flat, on the same basis — up to three scenarios depending on length and difficulty.`,
+    q: 'And the skill challenge?',
+    a: `${SKILL_CHALLENGE_MODULE_CREDITS} credits, flat, on the same basis. It is a hands-on task in a technology the role actually asks for — a React component, a SQL query, a bug to find in code we give you, or a system design scenario where that is what the job needs. Up to three of them, depending on length and difficulty.`,
   },
   {
     q: 'How long is an interview?',
@@ -159,7 +159,7 @@ export default function PricingPage() {
 
           <div className="space-y-3">
             {EXAMPLES.map((ex) => {
-              const plan = planSession(ex.difficulty, { coding: ex.coding, system_design: ex.design }, RICH);
+              const plan = planSession(ex.difficulty, { coding: ex.coding, skill_challenge: ex.skill }, RICH);
               const low = plan.upfrontCredits + plan.band.min * CREDITS_PER_MINUTE;
               return (
                 <div
@@ -173,7 +173,7 @@ export default function PricingPage() {
                     <span className="font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/60 tabular-nums">
                       {plan.band.min}-{plan.band.max} min × {CREDITS_PER_MINUTE}
                       {ex.coding ? ` +${CODING_MODULE_CREDITS}` : ''}
-                      {ex.design ? ` +${SYSTEM_DESIGN_MODULE_CREDITS}` : ''}
+                      {ex.skill ? ` +${SKILL_CHALLENGE_MODULE_CREDITS}` : ''}
                     </span>
                     <span className="font-[family-name:var(--font-display)] text-xl font-extrabold tabular-nums">
                       {low}-{plan.maxTotalCredits}
@@ -196,9 +196,9 @@ export default function PricingPage() {
               unit="flat · upfront · up to 3 problems"
             />
             <Rate
-              label="System design"
-              value={`${SYSTEM_DESIGN_MODULE_CREDITS} credits`}
-              unit="flat · upfront · up to 3 scenarios"
+              label="Skill challenge"
+              value={`${SKILL_CHALLENGE_MODULE_CREDITS} credits`}
+              unit="flat · upfront · up to 3 tasks"
             />
           </div>
         </Card>

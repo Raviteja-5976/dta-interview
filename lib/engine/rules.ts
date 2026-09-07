@@ -85,28 +85,16 @@ export function enumerateActions(input: RuleInput): CandidateAction[] {
 
     const isActive = runtime.active_goal_id === goal.goal_id;
 
-    // Follow-ups: only for the active goal, and only for evidence still missing.
-    if (isActive) {
-      for (const fu of goal.followup_bank) {
-        if (runtime.asked_followup_ids.includes(fu.followup_id)) continue;
-        if (!state.outstanding.includes(fu.for_evidence)) continue;
-
-        actions.push({
-          action: 'PROBE_EVIDENCE',
-          goal_id: goal.goal_id,
-          section_id: section.section_id,
-          skill_tags: goal.skill_tags,
-          source_kind: 'followup_bank',
-          source_id: fu.followup_id,
-          text: fu.text,
-          targets_evidence: [fu.for_evidence],
-          difficulty: runtime.current_difficulty,
-          entry_style: 'direct',
-          priority: 0.7,
-        });
-      }
-    }
-
+    /*
+     * The follow-up bank is gone.
+     *
+     * P6 used to pre-write a probe for every evidence item, and the rule layer
+     * offered them here. The live interviewer writes its own probes now,
+     * against the answer it just heard, which is what a follow-up is FOR — a
+     * pre-written one cannot reference what the candidate actually said.
+     *
+     * What remains in this file is the fallback path and the structural rules.
+     */
     for (const q of goal.question_bank) {
       if (runtime.asked_bank_ids.includes(q.bank_id)) continue;
 
@@ -588,6 +576,37 @@ export function pickAcknowledgement(runtime: SessionRuntime): string {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * R1 · Has this question already been asked?
+ *
+ * Exported because the live interviewer writes its own questions now, so there
+ * is no candidate set left to pre-filter — the check has to run on what it
+ * produced. It is still a RULE and not a request: D8's whole argument is that
+ * "do not ask the same thing twice" is a constraint, and a constraint asked for
+ * in a prompt holds most of the time, with the failures landing exactly where a
+ * listener notices them.
+ *
+ * Compares against every question asked this session, not just the last one. A
+ * question repeated eight turns later is just as obviously a repeat to the
+ * person answering it.
+ */
+export function isRepeatQuestion(candidate: string, alreadyAsked: string[]): boolean {
+  const text = candidate.trim();
+  if (text.length === 0) return false;
+
+  return alreadyAsked.some((asked) => lexicalSimilarity(text, asked) > REPEAT_AT);
+}
+
+/**
+ * Above this, two questions are the same question in different words.
+ *
+ * Matches R1's own threshold for consecutive questions. Lower would start
+ * rejecting legitimate probes into the same topic — asking about Kubernetes
+ * twice from different angles is good interviewing; asking the same question
+ * twice is not.
+ */
+const REPEAT_AT = 0.82;
 
 function lexicalSimilarity(a: string, b: string): number {
   const ta = new Set(a.toLowerCase().split(/\W+/).filter((t) => t.length > 3));

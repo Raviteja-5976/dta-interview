@@ -10,6 +10,7 @@
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createXai } from '@ai-sdk/xai';
+import { createGroq } from '@ai-sdk/groq';
 import type { LanguageModel } from 'ai';
 
 import type { AgentId, ModelSpec, ProviderId } from './types';
@@ -45,6 +46,10 @@ function buildFactory(provider: ProviderId): ProviderFactory {
     }
     case 'xai': {
       const p = createXai({ apiKey });
+      return (modelId) => p(modelId);
+    }
+    case 'groq': {
+      const p = createGroq({ apiKey });
       return (modelId) => p(modelId);
     }
   }

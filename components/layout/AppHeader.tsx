@@ -17,6 +17,7 @@ import {
   Sparkles
 } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
+import { useCredits } from '@/lib/hooks/use-credits';
 import { Profile } from '@/lib/supabase/db';
 
 interface AppHeaderProps {
@@ -31,7 +32,11 @@ export default function AppHeader({ profile }: AppHeaderProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  const creditsBalance = profile?.credits_balance ?? 4;
+  // The pill reads the live balance. Pages that already hold a profile hand it
+  // over so the header does not re-fetch what they just read; every other page
+  // lets the hook fetch and subscribe on its own.
+  const { credits: creditsBalance, loading: creditsLoading } = useCredits(profile?.credits_balance);
+  const lowCredits = creditsBalance != null && creditsBalance < 3;
   const displayName = profile?.full_name || user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'Candidate';
   const avatarUrl = profile?.avatar_url || user?.user_metadata?.avatar_url;
   const userInitial = displayName ? displayName[0].toUpperCase() : 'C';
@@ -110,18 +115,30 @@ export default function AppHeader({ profile }: AppHeaderProps) {
         {/* Right: Actions & User Menu */}
         <div className="flex items-center gap-3 md:gap-4">
           
-          {/* Credit Pill */}
-          <div
-            title={`${creditsBalance} interview credits available`}
-            className={`flex items-center gap-2 px-3.5 py-1.5 rounded-full border-2 border-[#1B1F3B] font-[family-name:var(--font-mono)] font-extrabold text-xs md:text-sm shadow-[2px_2px_0_#1B1F3B] transition-transform hover:-translate-y-0.5 cursor-default ${
-              creditsBalance < 3
-                ? 'bg-[#FFC93C] text-[#1B1F3B]'
-                : 'bg-white text-[#1B1F3B]'
-            }`}
-          >
-            <Zap className={`w-4 h-4 fill-current ${creditsBalance < 3 ? 'text-[#1B1F3B]' : 'text-[#FF6B35]'}`} />
-            <span>{creditsBalance} {creditsBalance === 1 ? 'Credit' : 'Credits'}</span>
-          </div>
+          {/* Credit Pill — a skeleton until the real balance lands, because a
+              placeholder number here is a number someone would plan around. */}
+          {creditsLoading ? (
+            <div
+              aria-busy="true"
+              aria-label="Loading credit balance"
+              className="flex items-center gap-2 px-3.5 py-1.5 rounded-full border-2 border-[#1B1F3B]/20 bg-[#F5EBE0] shadow-[2px_2px_0_rgba(27,31,59,0.2)] animate-pulse"
+            >
+              {/* Sized to the real pill's icon and label so nothing shifts. */}
+              <span className="w-4 h-4 rounded-full bg-[#1B1F3B]/15" />
+              <span className="w-14 h-4 md:h-5 rounded-full bg-[#1B1F3B]/15" />
+            </div>
+          ) : creditsBalance == null ? null : (
+            <Link
+              href="/credits"
+              title={`${creditsBalance} interview credits available`}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-full border-2 border-[#1B1F3B] font-[family-name:var(--font-mono)] font-extrabold text-xs md:text-sm shadow-[2px_2px_0_#1B1F3B] transition-transform hover:-translate-y-0.5 ${
+                lowCredits ? 'bg-[#FFC93C] text-[#1B1F3B]' : 'bg-white text-[#1B1F3B]'
+              }`}
+            >
+              <Zap className={`w-4 h-4 fill-current ${lowCredits ? 'text-[#1B1F3B]' : 'text-[#FF6B35]'}`} />
+              <span>{creditsBalance} {creditsBalance === 1 ? 'Credit' : 'Credits'}</span>
+            </Link>
+          )}
 
           {/* New Project — always the wizard, never an inline modal */}
           <Link

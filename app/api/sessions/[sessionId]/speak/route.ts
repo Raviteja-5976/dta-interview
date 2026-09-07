@@ -100,7 +100,7 @@ export async function GET(request: NextRequest, ctx: RouteContext<'/api/sessions
     }
 
     recordAgentRun({
-      agent: 'L4',
+      agent: 'IV',
       phase: 'live',
       provider: 'deepgram',
       model: model || DEEPGRAM_TTS_MODEL,

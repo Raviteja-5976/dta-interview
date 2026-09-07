@@ -21,6 +21,10 @@ import { Button, Chip } from './ui';
 const TABS = [
   { slug: '', label: 'Overview' },
   { slug: 'gaps', label: 'Gap analysis' },
+  // Sits after the gaps it is built from and before the interview history, in
+  // the order someone actually moves through them: see the gap, plan for it,
+  // then look at how the practice went.
+  { slug: 'plan', label: 'Prep plan' },
   { slug: 'history', label: 'History' },
 ];
 
