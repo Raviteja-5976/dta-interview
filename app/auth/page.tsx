@@ -4,21 +4,43 @@ import { useState, useEffect, useRef, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import Image from 'next/image';
-import { Eye, EyeOff, Lock, Mail, User as UserIcon, CheckCircle2, ArrowLeft, KeyRound, Code2 } from 'lucide-react';
+import { Eye, EyeOff, Lock, Mail, User as UserIcon, CheckCircle2, ArrowLeft, KeyRound, Code2, MailCheck } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 
 function AuthPageContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const { user, signUpWithEmail, signInWithEmail, signInWithOAuth, sendOtp, verifyEmailOtp } = useAuth();
+  const {
+    user,
+    signUpWithEmail,
+    signInWithEmail,
+    signInWithOAuth,
+    sendOtp,
+    verifyEmailOtp,
+    resendSignupEmail,
+    sendPasswordReset,
+  } = useAuth();
 
   // Tab State: 'login' | 'signup'
   const initialTab = searchParams.get('tab') === 'signup' ? 'signup' : 'login';
   const [authTab, setAuthTab] = useState<'login' | 'signup'>(initialTab);
 
-  // Auth Step: 'credentials' | 'otp'
-  const [step, setStep] = useState<'credentials' | 'otp'>('credentials');
+  /**
+   * Auth Step.
+   *   credentials  — the email/password form
+   *   check-email  — signed up, waiting for them to click the link we mailed
+   *   otp          — the 6-digit code path
+   *   forgot       — ask for an address to send a reset link to
+   */
+  const [step, setStep] = useState<'credentials' | 'check-email' | 'otp' | 'forgot'>(
+    searchParams.get('tab') === 'forgot' ? 'forgot' : 'credentials',
+  );
   const [otpType, setOtpType] = useState<'signup' | 'email'>('email');
+
+  /** Seconds until "resend" is allowed again — stops impatient double-sends. */
+  const [cooldown, setCooldown] = useState(0);
+  /** The check-email screen offers the 6-digit code as a fallback, folded away. */
+  const [showCodeFallback, setShowCodeFallback] = useState(false);
 
   // Form State
   const [fullName, setFullName] = useState('');
@@ -54,6 +76,23 @@ function AuthPageContent() {
       setAuthTab(tabParam);
     }
   }, [searchParams]);
+
+  // /auth/confirm sends failures back here as ?error=… — an expired link, or one
+  // opened on a different device. Surfacing it is the whole point of redirecting
+  // rather than rendering the failure on a route nobody can navigate back from.
+  useEffect(() => {
+    const err = searchParams.get('error');
+    // Reading a URL param on mount, not deriving state from other state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (err) setErrorMsg(err);
+  }, [searchParams]);
+
+  // Resend cooldown.
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [cooldown]);
 
   const resetForm = () => {
     setErrorMsg(null);
@@ -100,10 +139,21 @@ function AuthPageContent() {
         const { data, error } = await signUpWithEmail(fullName, email, password);
         if (error) {
           setErrorMsg(error.message);
+        } else if (data?.session) {
+          // Email confirmation is switched off on this Supabase project, so the
+          // account is already live and there is nothing to verify.
+          setSuccessMsg('Account created. Taking you in…');
+          setTimeout(() => router.push('/dashboard'), 800);
+        } else if (data?.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+          // Supabase returns a decoy user with no identities when the address is
+          // already registered — it will not confirm or deny an account exists.
+          // We can say the useful thing without leaking anything they did not
+          // just type in themselves.
+          setErrorMsg('That email already has an account. Try logging in, or reset your password.');
         } else {
           setOtpType('signup');
-          setStep('otp');
-          setSuccessMsg(`Password verified! We sent a 6-digit OTP code to ${email}`);
+          setStep('check-email');
+          setCooldown(45);
         }
       } else {
         const { data, error } = await signInWithEmail(email, password);
@@ -204,6 +254,59 @@ function AuthPageContent() {
     }
   };
 
+  /** Re-send the signup confirmation email from the check-email screen. */
+  const handleResendConfirmation = async () => {
+    resetForm();
+    setLoading(true);
+    try {
+      const { error } = await resendSignupEmail(email);
+      if (error) {
+        setErrorMsg(error.message);
+      } else {
+        setSuccessMsg(`Sent again to ${email}. Check your spam folder too.`);
+        setCooldown(45);
+      }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not resend the email.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /**
+   * Forgot password.
+   *
+   * The confirmation never says whether the address exists — that would turn this
+   * form into a way of checking who has an account. Supabase itself does not tell
+   * us either, so the message below is the honest one as well as the safe one.
+   */
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    resetForm();
+
+    if (!email) {
+      setErrorMsg('Enter the email address you signed up with.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { error } = await sendPasswordReset(email);
+      if (error) {
+        setErrorMsg(error.message);
+      } else {
+        setSuccessMsg(
+          `If ${email} has an account, a reset link is on its way. It is good for one hour.`,
+        );
+        setCooldown(45);
+      }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not send the reset email.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleOAuth = async (provider: 'google' | 'github') => {
     resetForm();
     setLoading(true);
@@ -218,6 +321,23 @@ function AuthPageContent() {
       setLoading(false);
     }
   };
+
+  /** One definition, four screens. */
+  const feedback = (
+    <>
+      {errorMsg && (
+        <div className="p-2.5 bg-[#FF5C7A]/15 border-2 border-[#FF5C7A] text-[#1B1F3B] rounded-xl text-xs font-[family-name:var(--font-mono)] font-bold flex items-center gap-2">
+          <span>⚠️ {errorMsg}</span>
+        </div>
+      )}
+      {successMsg && (
+        <div className="p-2.5 bg-[#6EE7B7]/20 border-2 border-[#6EE7B7] text-[#1B1F3B] rounded-xl text-xs font-[family-name:var(--font-mono)] font-bold flex items-center gap-2">
+          <CheckCircle2 className="w-4 h-4 text-[#6EE7B7] shrink-0" />
+          <span>{successMsg}</span>
+        </div>
+      )}
+    </>
+  );
 
   return (
     <div className="min-h-screen lg:h-screen w-full grid grid-cols-1 lg:grid-cols-12 bg-[#FFF8F0] font-[family-name:var(--font-body)] overflow-x-hidden lg:overflow-hidden">
@@ -310,18 +430,7 @@ function AuthPageContent() {
                   </button>
                 </div>
 
-                {/* FEEDBACK BANNERS */}
-                {errorMsg && (
-                  <div className="p-2.5 bg-[#FF5C7A]/15 border-2 border-[#FF5C7A] text-[#1B1F3B] rounded-xl text-xs font-[family-name:var(--font-mono)] font-bold flex items-center gap-2">
-                    <span>⚠️ {errorMsg}</span>
-                  </div>
-                )}
-                {successMsg && (
-                  <div className="p-2.5 bg-[#6EE7B7]/20 border-2 border-[#6EE7B7] text-[#1B1F3B] rounded-xl text-xs font-[family-name:var(--font-mono)] font-bold flex items-center gap-2">
-                    <CheckCircle2 className="w-4 h-4 text-[#6EE7B7] shrink-0" />
-                    <span>{successMsg}</span>
-                  </div>
-                )}
+                {feedback}
 
                 {/* CREDENTIALS FORM */}
                 <form onSubmit={handleSubmitCredentials} className="space-y-3.5">
@@ -429,9 +538,16 @@ function AuthPageContent() {
                       <span>Remember Me</span>
                     </label>
 
-                    <a href="#forgot" className="font-bold text-[#FF6B35] hover:underline">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        resetForm();
+                        setStep('forgot');
+                      }}
+                      className="font-bold text-[#FF6B35] hover:underline"
+                    >
                       Forgot Password?
-                    </a>
+                    </button>
                   </div>
 
                   {/* Orange Submit Button */}
@@ -489,6 +605,141 @@ function AuthPageContent() {
                   </button>
                 </div>
               </>
+            ) : step === 'forgot' ? (
+              /* FORGOT PASSWORD: ask for an address, mail a recovery link */
+              <div className="space-y-4">
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetForm();
+                    setStep('credentials');
+                  }}
+                  className="inline-flex items-center gap-1.5 font-[family-name:var(--font-mono)] text-xs font-bold text-[#FF6B35] hover:underline"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" /> Back to login
+                </button>
+
+                <div>
+                  <div className="w-10 h-10 bg-[#FFC93C] text-[#1B1F3B] border-2 border-[#1B1F3B] rounded-xl flex items-center justify-center shadow-[3px_3px_0_#1B1F3B] mb-2">
+                    <KeyRound className="w-5 h-5" />
+                  </div>
+                  <h3 className="font-[family-name:var(--font-display)] text-xl font-black text-[#1B1F3B]">
+                    Reset your password
+                  </h3>
+                  <p className="font-[family-name:var(--font-body)] text-xs text-[#1B1F3B]/80 mt-0.5">
+                    We&apos;ll email you a link that lets you set a new one. It works for one hour.
+                  </p>
+                </div>
+
+                {feedback}
+
+                <form onSubmit={handleForgotPassword} className="space-y-3.5">
+                  <div>
+                    <label className="block font-[family-name:var(--font-mono)] text-[10px] font-bold text-[#1B1F3B] mb-1 uppercase tracking-wider">
+                      EMAIL ADDRESS
+                    </label>
+                    <div className="relative">
+                      <Mail className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-[#1B1F3B]/50" />
+                      <input
+                        type="email"
+                        required
+                        autoFocus
+                        placeholder="coder@dta.com"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        className="w-full pl-10 pr-4 py-2.5 bg-white border-2 border-[#1B1F3B] rounded-xl font-[family-name:var(--font-body)] text-xs text-[#1B1F3B] focus:outline-none focus:ring-2 focus:ring-[#FF6B35]"
+                      />
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={loading || cooldown > 0}
+                    className="tactile-btn w-full py-3 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-sm uppercase tracking-wider border-2 border-[#1B1F3B] rounded-xl shadow-[4px_4px_0_#1B1F3B] hover:bg-[#e85a27] flex items-center justify-center gap-2 disabled:opacity-60"
+                  >
+                    {loading ? (
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    ) : (
+                      <span>{cooldown > 0 ? `RESEND IN ${cooldown}s` : 'SEND RESET LINK'}</span>
+                    )}
+                  </button>
+                </form>
+              </div>
+            ) : step === 'check-email' ? (
+              /* SIGNED UP: waiting on the link we just mailed */
+              <div className="space-y-4">
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetForm();
+                    setStep('credentials');
+                  }}
+                  className="inline-flex items-center gap-1.5 font-[family-name:var(--font-mono)] text-xs font-bold text-[#FF6B35] hover:underline"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" /> Use a different email
+                </button>
+
+                <div>
+                  <div className="w-10 h-10 bg-[#6EE7B7] text-[#1B1F3B] border-2 border-[#1B1F3B] rounded-xl flex items-center justify-center shadow-[3px_3px_0_#1B1F3B] mb-2">
+                    <MailCheck className="w-5 h-5" />
+                  </div>
+                  <h3 className="font-[family-name:var(--font-display)] text-xl font-black text-[#1B1F3B]">
+                    Check your email
+                  </h3>
+                  <p className="font-[family-name:var(--font-body)] text-xs text-[#1B1F3B]/80 mt-0.5 leading-relaxed">
+                    We sent a verification link to <strong className="text-[#1B1F3B]">{email}</strong>.
+                    Click it and you&apos;re in — no password needed a second time.
+                  </p>
+                </div>
+
+                {feedback}
+
+                <div className="p-3 bg-[#FFF8F0] border-2 border-[#1B1F3B]/20 rounded-xl">
+                  <p className="font-[family-name:var(--font-mono)] text-[11px] text-[#1B1F3B]/70 leading-relaxed">
+                    Not there after a minute? Check spam. Open the link in{' '}
+                    <strong className="text-[#1B1F3B]">this same browser</strong> if you can — it is
+                    the most reliable.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleResendConfirmation}
+                  disabled={loading || cooldown > 0}
+                  className="tactile-btn w-full py-3 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-sm uppercase tracking-wider border-2 border-[#1B1F3B] rounded-xl shadow-[4px_4px_0_#1B1F3B] hover:bg-[#e85a27] flex items-center justify-center gap-2 disabled:opacity-60"
+                >
+                  {loading ? (
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <span>{cooldown > 0 ? `RESEND IN ${cooldown}s` : 'RESEND THE LINK'}</span>
+                  )}
+                </button>
+
+                {/* Folded away, because it only applies if the project's email
+                    template includes {{ .Token }} as well as the link. Someone
+                    who has a code will go looking for this; nobody else needs it. */}
+                {showCodeFallback ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      resetForm();
+                      setOtpType('signup');
+                      setStep('otp');
+                    }}
+                    className="w-full text-center font-[family-name:var(--font-mono)] text-xs font-bold text-[#1B1F3B]/70 underline hover:text-[#FF6B35]"
+                  >
+                    Enter the 6-digit code instead →
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setShowCodeFallback(true)}
+                    className="w-full text-center font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/50 underline hover:text-[#1B1F3B]"
+                  >
+                    The email has a code, not a link
+                  </button>
+                )}
+              </div>
             ) : (
               /* STEP 2: OTP VERIFICATION CODE FORM */
               <div className="space-y-4">
@@ -512,18 +763,7 @@ function AuthPageContent() {
                   </p>
                 </div>
 
-                {/* FEEDBACK BANNERS */}
-                {errorMsg && (
-                  <div className="p-2.5 bg-[#FF5C7A]/15 border-2 border-[#FF5C7A] text-[#1B1F3B] rounded-xl text-xs font-[family-name:var(--font-mono)] font-bold flex items-center gap-2">
-                    <span>⚠️ {errorMsg}</span>
-                  </div>
-                )}
-                {successMsg && (
-                  <div className="p-2.5 bg-[#6EE7B7]/20 border-2 border-[#6EE7B7] text-[#1B1F3B] rounded-xl text-xs font-[family-name:var(--font-mono)] font-bold flex items-center gap-2">
-                    <CheckCircle2 className="w-4 h-4 text-[#6EE7B7] shrink-0" />
-                    <span>{successMsg}</span>
-                  </div>
-                )}
+                {feedback}
 
                 {/* OTP CODE FORM */}
                 <form onSubmit={handleVerifyOtp} className="space-y-4">

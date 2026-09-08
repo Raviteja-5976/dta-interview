@@ -20,6 +20,7 @@ import { useParams } from 'next/navigation';
 import { ArrowRight, Check, X } from 'lucide-react';
 
 import AppHeader from '@/components/layout/AppHeader';
+import InterviewFeedback from '@/components/app/InterviewFeedback';
 import {
   Button,
   Card,
@@ -382,6 +383,11 @@ export default function ReportPage() {
           Question-by-question review <ArrowRight className="w-4 h-4" />
         </Button>
       </div>
+
+      {/* Asked here, at the bottom, and never before the report: a survey placed
+          between someone and the result they paid for is answered by people
+          trying to dismiss it. */}
+      <InterviewFeedback sessionId={sessionId} />
 
       {/* The loop — make it the last thing on the page */}
       <Card className="p-6 md:p-8 text-center" accent="orange">

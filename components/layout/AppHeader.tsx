@@ -4,20 +4,22 @@ import { useState, useRef, useEffect } from 'react';
 import Image from 'next/image';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { 
-  User as UserIcon, 
-  LogOut, 
-  Zap, 
-  LayoutDashboard, 
-  Settings, 
-  Menu, 
-  X, 
-  Plus, 
+import {
+  User as UserIcon,
+  LogOut,
+  Zap,
+  LayoutDashboard,
+  Settings,
+  Menu,
+  X,
+  Plus,
   ChevronDown,
+  Shield,
   Sparkles
 } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 import { useCredits } from '@/lib/hooks/use-credits';
+import { useIsAdmin } from '@/lib/hooks/use-is-admin';
 import { Profile } from '@/lib/supabase/db';
 
 interface AppHeaderProps {
@@ -36,6 +38,8 @@ export default function AppHeader({ profile }: AppHeaderProps) {
   // over so the header does not re-fetch what they just read; every other page
   // lets the hook fetch and subscribe on its own.
   const { credits: creditsBalance, loading: creditsLoading } = useCredits(profile?.credits_balance);
+  // Shows the Admin link and nothing more — the console gates itself server-side.
+  const isAdmin = useIsAdmin(profile?.role);
   const lowCredits = creditsBalance != null && creditsBalance < 3;
   const displayName = profile?.full_name || user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'Candidate';
   const avatarUrl = profile?.avatar_url || user?.user_metadata?.avatar_url;
@@ -109,6 +113,20 @@ export default function AppHeader({ profile }: AppHeaderProps) {
               <UserIcon className="w-4 h-4" />
               <span>Profile</span>
             </Link>
+
+            {isAdmin && (
+              <Link
+                href="/admin"
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl border-2 transition-all ${
+                  pathname.startsWith('/admin')
+                    ? 'bg-[#1B1F3B] text-white border-[#1B1F3B] shadow-[3px_3px_0_#FF6B35]'
+                    : 'bg-white text-[#1B1F3B] border-[#1B1F3B] hover:bg-[#F5EBE0] shadow-[2px_2px_0_#1B1F3B]'
+                }`}
+              >
+                <Shield className="w-4 h-4" />
+                <span>Admin</span>
+              </Link>
+            )}
           </nav>
         </div>
 

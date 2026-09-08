@@ -1,8 +1,9 @@
 'use client';
 
 import { useState, useRef } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { X, Eye, EyeOff, Lock, Mail, User as UserIcon, CheckCircle2, ArrowLeft, KeyRound } from 'lucide-react';
+import { X, Eye, EyeOff, Lock, Mail, User as UserIcon, CheckCircle2, ArrowLeft, KeyRound, MailCheck } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 
 export default function AuthModal() {
@@ -17,10 +18,11 @@ export default function AuthModal() {
     signInWithOAuth,
     sendOtp,
     verifyEmailOtp,
+    resendSignupEmail,
   } = useAuth();
 
-  // Auth Step: 'credentials' | 'otp'
-  const [step, setStep] = useState<'credentials' | 'otp'>('credentials');
+  // Auth Step: 'credentials' | 'check-email' | 'otp'
+  const [step, setStep] = useState<'credentials' | 'check-email' | 'otp'>('credentials');
   const [otpType, setOtpType] = useState<'signup' | 'email'>('email');
 
   // Form State
@@ -88,10 +90,16 @@ export default function AuthModal() {
         const { data, error } = await signUpWithEmail(fullName, email, password);
         if (error) {
           setErrorMsg(error.message);
+        } else if (data?.session) {
+          // Email confirmation is off on this project — the account is already live.
+          closeAuthModal();
+          router.push('/dashboard');
+        } else if (data?.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+          // Supabase's decoy user for an address that is already registered.
+          setErrorMsg('That email already has an account. Try logging in, or reset your password.');
         } else {
           setOtpType('signup');
-          setStep('otp');
-          setSuccessMsg(`Password verified! We sent a 6-digit OTP code to ${email}`);
+          setStep('check-email');
         }
       } else {
         // Log in: verify password first
@@ -483,6 +491,21 @@ export default function AuthModal() {
                     </div>
                   )}
 
+                  {/* Forgot password. A link to the full auth page rather than a
+                      fourth step in here: the reset flow already exists there,
+                      and two copies of it would drift apart. */}
+                  {authTab === 'login' && (
+                    <div className="text-right">
+                      <Link
+                        href="/auth?tab=forgot"
+                        onClick={closeAuthModal}
+                        className="font-[family-name:var(--font-body)] text-xs font-bold text-[#FF6B35] hover:underline"
+                      >
+                        Forgot password?
+                      </Link>
+                    </div>
+                  )}
+
                   {/* Submit Button */}
                   <button
                     type="submit"
@@ -497,6 +520,71 @@ export default function AuthModal() {
                   </button>
                 </form>
               </>
+            ) : step === 'check-email' ? (
+              /* SIGNED UP: the verification link is in their inbox */
+              <div className="space-y-5">
+                <button
+                  type="button"
+                  onClick={() => setStep('credentials')}
+                  className="inline-flex items-center gap-1.5 font-[family-name:var(--font-mono)] text-xs font-bold text-[#FF6B35] hover:underline"
+                >
+                  <ArrowLeft className="w-4 h-4" /> Use a different email
+                </button>
+
+                <div>
+                  <div className="w-12 h-12 bg-[#6EE7B7] text-[#1B1F3B] border-2 border-[#1B1F3B] rounded-2xl flex items-center justify-center shadow-[3px_3px_0_#1B1F3B] mb-3">
+                    <MailCheck className="w-6 h-6" />
+                  </div>
+                  <h3 className="font-[family-name:var(--font-display)] text-2xl font-black text-[#1B1F3B]">
+                    Check your email
+                  </h3>
+                  <p className="font-[family-name:var(--font-body)] text-sm text-[#1B1F3B]/80 mt-1 leading-relaxed">
+                    We sent a verification link to <strong className="text-[#1B1F3B]">{email}</strong>.
+                    Click it and you&apos;re in.
+                  </p>
+                </div>
+
+                {errorMsg && (
+                  <div className="p-3 bg-[#FF5C7A]/15 border-2 border-[#FF5C7A] text-[#1B1F3B] rounded-xl text-xs font-[family-name:var(--font-mono)] font-bold">
+                    ⚠️ {errorMsg}
+                  </div>
+                )}
+                {successMsg && (
+                  <div className="p-3 bg-[#6EE7B7]/20 border-2 border-[#6EE7B7] text-[#1B1F3B] rounded-xl text-xs font-[family-name:var(--font-mono)] font-bold flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-[#6EE7B7] shrink-0" />
+                    <span>{successMsg}</span>
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={async () => {
+                    setErrorMsg(null);
+                    setSuccessMsg(null);
+                    setLoading(true);
+                    const { error } = await resendSignupEmail(email);
+                    setLoading(false);
+                    if (error) setErrorMsg(error.message);
+                    else setSuccessMsg(`Sent again to ${email}. Check spam too.`);
+                  }}
+                  className="tactile-btn w-full py-3.5 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-base border-3 border-[#1B1F3B] rounded-2xl shadow-[4px_4px_0_#1B1F3B] hover:bg-[#e85a27] flex items-center justify-center gap-2 disabled:opacity-60"
+                >
+                  {loading ? (
+                    <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <span>Resend the link</span>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setStep('otp')}
+                  className="w-full text-center font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/50 underline hover:text-[#1B1F3B]"
+                >
+                  The email has a code, not a link
+                </button>
+              </div>
             ) : (
               /* STEP 2: OTP VERIFICATION CODE FORM */
               <div className="space-y-6">

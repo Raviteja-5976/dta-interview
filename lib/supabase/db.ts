@@ -21,6 +21,12 @@ export interface Profile {
   full_name: string | null;
   avatar_url: string | null;
   org_id: string | null;
+  /**
+   * Set by hand in Supabase, never from the app — migration 020 revokes the
+   * column from `authenticated`, so an update that includes it is rejected
+   * outright rather than silently ignored.
+   */
+  role: 'student' | 'admin';
   credits_balance: number;
   prefs: {
     language?: string;
@@ -106,6 +112,7 @@ export const MOCK_PROFILE: Profile = {
   full_name: '',
   avatar_url: null,
   org_id: null,
+  role: 'student',
   credits_balance: 100, // signup grant — see migration 014
   prefs: {
     language: 'en-IN',

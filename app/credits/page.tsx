@@ -17,6 +17,7 @@ import Link from 'next/link';
 import { AlertCircle, Check, Loader2, Zap } from 'lucide-react';
 
 import AppHeader from '@/components/layout/AppHeader';
+import RedeemCode from '@/components/app/RedeemCode';
 import { Button, Card, Chip, ErrorCard, Eyebrow, SectionTitle, Skeleton } from '@/components/app/ui';
 import { paymentsEnabled, useRazorpayCheckout } from '@/components/app/useRazorpayCheckout';
 import {
@@ -38,6 +39,8 @@ interface LedgerRow {
     minutes?: number;
     breakdown?: Record<string, number>;
     charged?: number;
+    /** Set on `grant` rows written by redeem_promo_code(). */
+    code?: string;
   } | null;
   created_at: string;
 }
@@ -66,6 +69,10 @@ function ledgerLabel(row: LedgerRow): string {
         : 'Interview time';
     case 'modules':
       return 'Coding / design round';
+    // Naming the code beats a bare "Free credits" — it is how someone recognises
+    // the workshop they got these at.
+    case 'promo_code':
+      return row.meta.code ? `Promo · ${row.meta.code}` : 'Promo code';
     // Sessions that started under the old hold-and-refund model.
     case 'settlement':
       return 'Unused time';
@@ -211,6 +218,10 @@ function CreditsContent() {
                 />
               </div>
             )}
+
+            {/* Above the packs on purpose: someone who was handed a code at a
+                workshop should not have to scroll past three prices to use it. */}
+            <RedeemCode onRedeemed={() => void load()} />
 
             {/* Packs */}
             <SectionTitle sub={`${CREDITS_PER_MINUTE} credits per minute, billed after the interview · coding round ${CODING_MODULE_CREDITS} upfront · skill challenge ${SKILL_CHALLENGE_MODULE_CREDITS} upfront`}>

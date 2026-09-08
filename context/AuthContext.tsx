@@ -20,7 +20,31 @@ interface AuthContextType {
   signInWithEmail: (email: string, password: string) => Promise<{ data: any; error: Error | null }>;
   signInWithOAuth: (provider: 'google' | 'github') => Promise<{ data: any; error: Error | null }>;
   sendOtp: (email: string) => Promise<{ data: any; error: Error | null }>;
-  verifyEmailOtp: (email: string, token: string, type?: 'email' | 'signup' | 'magiclink') => Promise<{ data: any; error: Error | null }>;
+  verifyEmailOtp: (email: string, token: string, type?: 'email' | 'signup' | 'magiclink' | 'recovery') => Promise<{ data: any; error: Error | null }>;
+  // `unknown` rather than the `any` above: every caller of these three reads
+  // `error` and nothing else, so there is no reason to hand out an escape hatch.
+  /** Re-send the signup confirmation email. Not the same as sending a fresh magic link. */
+  resendSignupEmail: (email: string) => Promise<{ data: unknown; error: Error | null }>;
+  /** Step 1 of forgot-password: emails a recovery link. */
+  sendPasswordReset: (email: string) => Promise<{ data: unknown; error: Error | null }>;
+  /** Step 2: called from /auth/reset-password, where a recovery session exists. */
+  updatePassword: (password: string) => Promise<{ data: unknown; error: Error | null }>;
+}
+
+/**
+ * Where a link in an email lands.
+ *
+ * Everything email-borne goes through /auth/confirm, which understands both the
+ * `token_hash` templates and the default `{{ .ConfirmationURL }}` one. `next` is
+ * where the user ends up once the session exists.
+ *
+ * Built from `window.location.origin` rather than an env var so it is correct on
+ * localhost, on a preview deploy, and in production without three configs to
+ * keep in step. Supabase still refuses any redirect not on its allow-list.
+ */
+function confirmUrl(next: string): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return `${window.location.origin}/auth/confirm?next=${encodeURIComponent(next)}`;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -79,8 +103,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         data: {
           full_name: fullName,
         },
+        // Without this the link in the confirmation email goes to whatever Site
+        // URL the Supabase project has, which on localhost is the production
+        // site — you click the link and land somewhere else entirely.
+        emailRedirectTo: confirmUrl('/dashboard'),
       },
     });
+    return { data, error };
+  };
+
+  const resendSignupEmail = async (email: string) => {
+    const { data, error } = await supabase.auth.resend({
+      type: 'signup',
+      email,
+      options: { emailRedirectTo: confirmUrl('/dashboard') },
+    });
+    return { data, error };
+  };
+
+  const sendPasswordReset = async (email: string) => {
+    // Lands on /auth/confirm, which establishes the recovery session and then
+    // forwards to the page that actually takes the new password.
+    const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: confirmUrl('/auth/reset-password'),
+    });
+    return { data, error };
+  };
+
+  const updatePassword = async (password: string) => {
+    const { data, error } = await supabase.auth.updateUser({ password });
     return { data, error };
   };
 
@@ -95,11 +146,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const sendOtp = async (email: string) => {
     const { data, error } = await supabase.auth.signInWithOtp({
       email,
+      options: {
+        // Same reason as signUp: without this the magic link in that email goes
+        // to the project's Site URL, so a link generated while developing on
+        // localhost drops you on the production site.
+        emailRedirectTo: confirmUrl('/dashboard'),
+      },
     });
     return { data, error };
   };
 
-  const verifyEmailOtp = async (email: string, token: string, type: 'email' | 'signup' | 'magiclink' = 'email') => {
+  const verifyEmailOtp = async (
+    email: string,
+    token: string,
+    type: 'email' | 'signup' | 'magiclink' | 'recovery' = 'email',
+  ) => {
     const { data, error } = await supabase.auth.verifyOtp({
       email,
       token,
@@ -145,6 +206,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         signInWithOAuth,
         sendOtp,
         verifyEmailOtp,
+        resendSignupEmail,
+        sendPasswordReset,
+        updatePassword,
       }}
     >
       {children}

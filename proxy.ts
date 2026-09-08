@@ -17,7 +17,12 @@ import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
 
 /** Everything under these prefixes requires a session. */
-const PROTECTED_PREFIXES = ['/dashboard', '/projects', '/sessions', '/interview', '/credits', '/settings', '/profile'];
+/**
+ * `/admin` is here for the redirect-to-sign-in behaviour only. The role check
+ * that actually gates it lives in app/admin/layout.tsx and in every
+ * /api/admin/* handler — this file knows nothing about roles.
+ */
+const PROTECTED_PREFIXES = ['/dashboard', '/projects', '/sessions', '/interview', '/credits', '/settings', '/profile', '/admin'];
 
 /** Signed-in users get bounced off these to the dashboard. */
 const AUTH_ROUTES = ['/auth', '/login', '/register'];

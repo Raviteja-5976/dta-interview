@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useCallback, useState, useEffect } from 'react';
 import Image from 'next/image';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
@@ -24,6 +24,7 @@ import {
   Radio
 } from 'lucide-react';
 import AppHeader from '@/components/layout/AppHeader';
+import RedeemCode from '@/components/app/RedeemCode';
 import { useAuth } from '@/context/AuthContext';
 import { 
   fetchUserProfile, 
@@ -97,6 +98,28 @@ export default function ProfilePage() {
     };
 
     loadProfile();
+  }, [user]);
+
+  /**
+   * Re-read the balance and the ledger after a promo code lands.
+   *
+   * Deliberately does NOT re-populate the form fields the way loadProfile does:
+   * someone can redeem a code while halfway through editing their name on the
+   * Details tab, and resetting those inputs would throw the edit away.
+   */
+  const refreshCredits = useCallback(async () => {
+    try {
+      const [profData, ledgerData] = await Promise.all([
+        fetchUserProfile(user?.id),
+        fetchCreditLedger(user?.id),
+      ]);
+      setProfile(profData);
+      setLedger(ledgerData);
+    } catch (err) {
+      console.error('Error refreshing credits:', err);
+    }
+    // `user`, not `user?.id` — the React Compiler infers the whole object here
+    // and refuses to optimise the component when the two disagree.
   }, [user]);
 
   // Handle Profile Form Submit
@@ -556,9 +579,13 @@ export default function ProfilePage() {
                 </div>
 
                 <div className="px-4 py-2 bg-[#FFC93C] text-[#1B1F3B] font-[family-name:var(--font-mono)] font-extrabold text-sm border-2 border-[#1B1F3B] rounded-xl shadow-[2px_2px_0_#1B1F3B]">
-                  Current Balance: {profile?.credits_balance ?? 4}
+                  Current Balance: {profile?.credits_balance ?? 0}
                 </div>
               </div>
+
+              {/* Above the ledger: this is the one thing on the tab someone
+                  comes here to DO, rather than to read. */}
+              <RedeemCode variant="inline" onRedeemed={() => void refreshCredits()} />
 
               {/* Ledger Table */}
               <div className="overflow-x-auto border-2 border-[#1B1F3B] rounded-2xl shadow-[4px_4px_0_#1B1F3B]">
@@ -664,6 +691,19 @@ function ledgerNote(meta: Record<string, unknown> | null | undefined): string {
   if (meta.reason === 'settlement') {
     const minutes = meta.billed_minutes;
     return typeof minutes === 'number' ? `Unused time returned · ${minutes} min billed` : 'Unused time returned';
+  }
+
+  // Which code it was is the whole point of the row — "promo code" alone tells
+  // you nothing three months later.
+  if (meta.reason === 'promo_code') {
+    return typeof meta.code === 'string' ? `Promo code · ${meta.code}` : 'Promo code';
+  }
+
+  // Whatever the admin typed in the grant dialog, if they typed anything.
+  if (meta.reason === 'admin_grant') {
+    return typeof meta.note === 'string' && meta.note.length > 0
+      ? `Granted · ${meta.note}`
+      : 'Granted by DevTrackAcademy';
   }
 
   for (const key of ['reason', 'pack', 'pack_name', 'role'] as const) {

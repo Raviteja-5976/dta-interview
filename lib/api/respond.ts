@@ -10,6 +10,7 @@ import { UnauthorizedError } from '../supabase/server';
 import { AgentError } from '../ai/run';
 import { MissingProviderKeyError } from '../ai/registry';
 import { MissingServiceRoleKeyError } from '../supabase/admin';
+import { AdminOnlyError } from '../admin/guard';
 
 export function ok<T>(data: T, init?: ResponseInit): Response {
   return Response.json(data, { status: 200, ...init });
@@ -42,6 +43,10 @@ export function unauthorized(): Response {
 /** Maps thrown errors to responses without leaking internals to the client. */
 export function handleRouteError(err: unknown): Response {
   if (err instanceof UnauthorizedError) return unauthorized();
+
+  // 404, not 403 — the same rule as an ownership failure. A 403 here would
+  // confirm that /api/admin/* is a real surface worth attacking.
+  if (err instanceof AdminOnlyError) return notFound();
 
   if (err instanceof MissingProviderKeyError) {
     return failure(503, 'The interview engine is not configured yet.', {
