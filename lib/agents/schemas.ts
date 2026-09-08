@@ -305,6 +305,23 @@ export const blueprintContextSchema = z.object({
     .max(6)
     .describe('Specific resume claims the interview should test.'),
   priority_skills: z.array(z.string()).max(10),
+  /**
+   * What the candidate asked to be interviewed on, from the setup screen.
+   *
+   * Optional because blueprints written before this existed do not carry it and
+   * are still read back and run. Empty is the ordinary case — most sessions do
+   * not name any.
+   */
+  focus_skills: z.array(z.string()).max(10).optional(),
+  /**
+   * The gap report's verdict on each skill in play, as a line the live
+   * interviewer can read: "Postgres · STRONG", "Kubernetes · MISSING".
+   *
+   * The live loop never sees the gap report — it sees this digest — so without
+   * it the interviewer had no idea which of the skills it was chasing the
+   * resume already evidenced and which it did not.
+   */
+  skill_status: z.array(z.string()).max(16).optional(),
 });
 export type BlueprintContext = z.infer<typeof blueprintContextSchema>;
 

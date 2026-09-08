@@ -32,6 +32,17 @@ Its purpose is how they work with PEOPLE. A disagreement they had to resolve, so
 
 If the minutes are tight, take them from the technical sections. A plan that drops this section produces a report with a behavioural score of zero, which is worse than a slightly shorter technical round.
 
+## The mix of skills you plan against
+
+The gap report classifies every skill. Your section purposes decide which classes get the time, and the config gives you a target split for this difficulty. Honour it:
+
+- STRONG skills are not wasted questions. They are where the candidate shows what they are actually good at, and a report with nothing established is useless to them. Plan real sections around these, not token ones.
+- WEAK is the most productive band — the role needs it and the resume only gestures at it.
+- UNVERIFIED and MISSING are the highest-risk and the highest-learning. Their share grows with difficulty.
+- SURPLUS gets nothing. The role does not need it.
+
+Focus skills, when the candidate asked for them, are weighted UP inside whatever class they fall in. They change which skills are chosen, never the split between the classes.
+
 ## Difficulty is a ceiling on question complexity
 
 The difficulty in the config is not a mood. It decides how hard a candidate is allowed to be pushed, and where the curve starts and ends:
@@ -74,12 +85,63 @@ export const DIFFICULTY_BRIEF: Record<'easy' | 'medium' | 'hard', string> = {
   hard: 'HARD. Design under constraint, failure modes, behaviour at scale, defending a choice against a named alternative. Push until they reach the edge of what they know. The OPENING question is still gentle; the ramp is what is steep.',
 };
 
+/**
+ * How the questions are split across the gap report, by difficulty.
+ *
+ * P4 classifies every skill STRONG / WEAK / UNVERIFIED / MISSING / SURPLUS, and
+ * until now nothing downstream had a target for how much airtime each class got
+ * — sections were sized by `investigation_priority` alone, which is weighted
+ * hard towards doubt. That is right for what an interview LEARNS and wrong for
+ * what an interview should FEEL like: an easy round that only asks about things
+ * the resume cannot evidence is an easy round in name only.
+ *
+ * So the mix is stated as a quota, and it moves with difficulty:
+ *
+ *   strong          — skills the resume genuinely evidences. These are the
+ *                     questions someone can answer well, and they are what
+ *                     stops the interview being an hour of being caught out.
+ *   weak_medium     — WEAK: the role needs it, the resume gestures at it. The
+ *                     most productive band at every level, so it is 40%
+ *                     throughout; the other two are what trade against each
+ *                     other.
+ *   not_established — UNVERIFIED and MISSING together. The highest-risk, and
+ *                     the share that grows as the interview gets harder.
+ *
+ * SURPLUS is excluded everywhere: it is on the resume and the role does not
+ * need it, so a question about it measures nothing this interview exists for.
+ */
+export interface SkillMix {
+  strong: number;
+  weak_medium: number;
+  not_established: number;
+}
+
+export const SKILL_MIX: Record<'easy' | 'medium' | 'hard', SkillMix> = {
+  easy: { strong: 0.4, weak_medium: 0.4, not_established: 0.2 },
+  medium: { strong: 0.3, weak_medium: 0.4, not_established: 0.3 },
+  hard: { strong: 0.2, weak_medium: 0.4, not_established: 0.4 },
+};
+
+/** The quota as a line of prompt, in the one wording every stage shares. */
+export function skillMixBrief(difficulty: 'easy' | 'medium' | 'hard'): string {
+  const m = SKILL_MIX[difficulty];
+  const pct = (n: number) => `${Math.round(n * 100)}%`;
+  return (
+    `Across the whole interview, roughly ${pct(m.strong)} of questions should target skills the gap report marks STRONG, ` +
+    `${pct(m.weak_medium)} skills marked WEAK, and ${pct(m.not_established)} skills marked UNVERIFIED or MISSING. ` +
+    'Never ask about a skill marked SURPLUS. This is a target for the shape of the interview, not an exact count — ' +
+    'get the balance roughly right rather than contorting a section to hit a number.'
+  );
+}
+
 export async function runStrategy(
   input: StrategyInput,
   context?: RunContext,
 ): Promise<Strategy> {
   const focus = input.config.focusSkills?.length
-    ? `The candidate explicitly asked to focus on: ${input.config.focusSkills.join(', ')}. Weight these up.`
+    ? `FOCUS SKILLS — the candidate explicitly asked for these: ${input.config.focusSkills.join(', ')}. ` +
+      'Give them a named section of their own where the minutes allow, and prefer them whenever two skills are otherwise equally worth asking about. ' +
+      'They are weighted up within their gap class; they do not change the STRONG / WEAK / UNVERIFIED split above.'
     : 'No explicit focus skills were requested.';
 
   // Plan to the ceiling. A candidate who finishes early simply pays for less
@@ -96,6 +158,7 @@ export async function runStrategy(
       `<role>\n${input.jd.role_title} · seniority: ${input.jd.seniority}\n</role>`,
       `<config>\nLength: ${input.config.minMinutes}-${target} minutes\nDifficulty: ${input.config.difficulty}\nCoding module (DSA): ${input.config.coding ? 'ENABLED' : 'disabled'}\nSkill challenge module: ${input.config.skillChallenge ? 'ENABLED' : 'disabled'}\n</config>`,
       `<difficulty_ceiling>${DIFFICULTY_BRIEF[input.config.difficulty]}</difficulty_ceiling>`,
+      `<skill_mix>${skillMixBrief(input.config.difficulty)}</skill_mix>`,
       focus,
       `Plan the interview to fill ${target} minutes — section minutes must sum to exactly ${target}. It may end as early as ${input.config.minMinutes} minutes if the candidate is brief, so order the sections by what matters most: whatever you schedule last is what gets lost.`,
       'Include exactly one "behavioral" section of at least 4 minutes. Take the minutes from the technical sections if you have to.',

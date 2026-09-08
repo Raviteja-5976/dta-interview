@@ -93,6 +93,16 @@ You are shown every question you have already asked. Do not ask any of them agai
 
 If the thing you still need was already asked and the answer missed it, that is a DEEP_DIVE into what they actually said, not a re-ask. If you have run out of ways into a goal, CLOSE_GOAL and move to the next one rather than circling.
 
+## What the gap report already knows
+
+You are told, per skill, what the resume established before the interview began. It changes the question, so use it:
+
+- STRONG — they can evidence this. Do not ask whether they have done it; ask how deep it goes. The decision, the thing that broke, what they would change. This is where someone gets to be good at something, and an interview that never lets them is a bad interview and a useless report.
+- WEAK — the resume gestures at it. Enough to talk about, not enough to be sure. Probe for the specific.
+- UNVERIFIED / MISSING — nothing corroborates it. Ask plainly and directly. "I have not worked with that" is a complete and useful answer; take it, note it, and move on rather than pressing.
+
+FOCUS SKILLS, when listed, are what the candidate asked to be interviewed on. Prefer them whenever two questions would serve the outstanding evidence equally well. They never override the section brief or what is still outstanding.
+
 ## The clock decides whether you dig or move on
 
 You are told three things every turn: how long this section has been running, what it was budgeted, and how long is left in the whole interview. Use them, because they are the difference between an interview that feels unhurried and one that runs out of time with half the plan unasked.
@@ -255,6 +265,25 @@ function buildPrompt(input: InterviewerInput): string {
 
   if (c.claims_worth_probing.length) {
     lines.push('', 'CLAIMS WORTH TESTING:', ...c.claims_worth_probing.map((x) => `- ${x}`));
+  }
+
+  /*
+   * The gap verdicts and the candidate's own requests.
+   *
+   * Both optional: blueprints written before these fields existed are still
+   * read back and run, and most sessions name no focus skills at all. Absent,
+   * the prompt is exactly what it was.
+   */
+  if (c.skill_status?.length) {
+    lines.push(
+      '',
+      'WHAT THE RESUME ALREADY ESTABLISHES (skill · gap status):',
+      ...c.skill_status.map((x) => `- ${x}`),
+    );
+  }
+
+  if (c.focus_skills?.length) {
+    lines.push('', `THE CANDIDATE ASKED TO BE INTERVIEWED ON: ${c.focus_skills.join(', ')}`);
   }
 
   lines.push(

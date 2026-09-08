@@ -49,7 +49,7 @@
 import { runAgent } from '../ai/run';
 import type { RunContext } from '../ai/types';
 import { SECTION_QUESTION_BUDGET } from '../engine/types';
-import { DIFFICULTY_BRIEF } from './p5-strategy';
+import { DIFFICULTY_BRIEF, skillMixBrief } from './p5-strategy';
 import {
   blueprintSectionSchema,
   type Blueprint,
@@ -132,6 +132,18 @@ Every evidence_required item carries:
 
 A goal whose evidence is a mix of modes is fine and normal.
 
+## The gap classes, and what each one is for
+
+The gaps are given to you in three groups, and they want different questions:
+
+- STRONG — the resume evidences this. The question is not "have you done it" but how deep it goes: the decision they made, the thing that broke, what they would do differently. These are where a candidate demonstrates competence, and an interview with none of them produces a report that establishes nothing.
+- WEAK — the role needs it and the resume only gestures at it. The most productive band: enough to talk about, not enough to be sure.
+- NOT ESTABLISHED (UNVERIFIED / MISSING) — nothing corroborates it. Ask directly and plainly. If they have not done it, that is a finding, not a failure — write exit_conditions that let the goal close gracefully rather than pressing someone on something they have already said they have not touched.
+
+Never build a goal around a SURPLUS skill; the role does not need it.
+
+You are given a target split for the interview as a whole. Your section serves its own purpose first — but within that purpose, let the split decide which skills you reach for.
+
 ## Difficulty is a ceiling, and it is given to you
 
 You are told the interview's difficulty. It bounds how hard anything in this section may be — the seed questions, the evidence you require, and the depth in completion_criteria. An easy interview asking one hard question wastes the question and rattles the candidate for everything after it; a hard interview that never leaves recall establishes nothing worth reporting. Size the goals to the ceiling you were given.
@@ -164,6 +176,23 @@ export interface BlueprintInput {
   companyName: string;
   seniority: string;
   difficulty: 'easy' | 'medium' | 'hard';
+  /** What the candidate asked for on the setup screen. Usually empty. */
+  focusSkills?: string[];
+}
+
+/**
+ * The gap report's five statuses, collapsed to the three classes the mix quota
+ * is expressed in.
+ *
+ * UNVERIFIED and MISSING are one class because they are the same thing to an
+ * interview: the resume does not establish it, so the only way to find out is
+ * to ask. SURPLUS is not a class — it is excluded everywhere.
+ */
+export function gapClass(status: string): 'strong' | 'weak_medium' | 'not_established' | null {
+  if (status === 'STRONG') return 'strong';
+  if (status === 'WEAK') return 'weak_medium';
+  if (status === 'UNVERIFIED' || status === 'MISSING') return 'not_established';
+  return null;
 }
 
 // ── The context block, built rather than generated ───────────────────────────
@@ -261,6 +290,21 @@ function buildContext(input: BlueprintInput): BlueprintContext {
       .slice(0, 6)
       .map((c) => clip(c.claim, 200)),
     priority_skills: input.strategy.priority_skills.slice(0, 10),
+    focus_skills: (input.focusSkills ?? []).slice(0, 10),
+    /*
+     * The gap verdict per skill, most worth investigating first.
+     *
+     * The live interviewer never sees the gap report, so before this it could
+     * not tell a skill the resume proves from one it never mentions — and those
+     * two want completely different questions. SURPLUS is filtered out: the role
+     * does not need it, so a question about it measures nothing.
+     */
+    skill_status: input.gap.skills
+      .filter((sk) => gapClass(sk.status) !== null)
+      .slice()
+      .sort((a, b) => b.investigation_priority - a.investigation_priority)
+      .slice(0, 16)
+      .map((sk) => `${sk.skill} · ${sk.status}`),
   };
 }
 
@@ -782,12 +826,37 @@ async function runSection(
   // Only the gap entries worth investigating. The full report is 30 rows, most
   // of which this section has no business asking about, and every row of it
   // would be prompt weight on all of the parallel calls at once.
-  const relevantGaps = input.gap.skills
-    .filter((s) => s.status !== 'SURPLUS')
-    .sort((a, b) => b.investigation_priority - a.investigation_priority)
-    .slice(0, 10)
-    .map((s) => `- ${s.skill} · ${s.status} · importance ${s.jd_importance.toFixed(2)} · resume: ${s.resume_evidence} · ${s.rationale}`)
-    .join('\n');
+  /*
+   * Grouped by gap class rather than listed flat.
+   *
+   * A single list sorted by investigation_priority puts every UNVERIFIED and
+   * MISSING skill at the top and buries the STRONG ones, and a model reading it
+   * builds the section entirely out of what the candidate cannot evidence —
+   * which is the whole reason the mix quota exists. Under headings the three
+   * classes are visible AS classes, and the quota below becomes something the
+   * model can actually act on.
+   */
+  const bucket = (want: ReturnType<typeof gapClass>) =>
+    input.gap.skills
+      .filter((sk) => gapClass(sk.status) === want)
+      .sort((a, b) => b.investigation_priority - a.investigation_priority)
+      .slice(0, 6)
+      .map(
+        (sk) =>
+          `- ${sk.skill} · ${sk.status} · importance ${sk.jd_importance.toFixed(2)} · resume: ${sk.resume_evidence} · ${sk.rationale}`,
+      );
+
+  const gapGroup = (label: string, rows: string[]) =>
+    rows.length ? [label, ...rows].join('\n') : `${label}\n(none)`;
+
+  const relevantGaps = [
+    gapGroup('STRONG — the resume evidences these. Ask them to show the depth behind the claim.', bucket('strong')),
+    gapGroup('WEAK — the role needs it, the resume only gestures at it. The most productive band.', bucket('weak_medium')),
+    gapGroup(
+      'NOT ESTABLISHED (UNVERIFIED / MISSING) — nothing corroborates these. Highest risk, highest learning.',
+      bucket('not_established'),
+    ),
+  ].join('\n\n');
 
   const result = await runAgent({
     agent: 'P6',
@@ -819,6 +888,17 @@ async function runSection(
       `<gaps>\n${relevantGaps}\n</gaps>`,
       '',
       `DIFFICULTY CEILING: ${DIFFICULTY_BRIEF[input.difficulty]}`,
+      '',
+      `SKILL MIX: ${skillMixBrief(input.difficulty)}`,
+      // The quota is an interview-wide target and this call writes ONE section,
+      // so it is stated as a share to respect rather than a count to hit —
+      // otherwise every section independently tries to satisfy all three
+      // classes and none of them investigates anything properly.
+      'That split is for the interview as a whole. Weight THIS section towards whichever classes its purpose calls for, and do not try to satisfy all three inside one section.',
+      '',
+      ctx.focus_skills?.length
+        ? `FOCUS SKILLS — the candidate explicitly asked to be interviewed on: ${ctx.focus_skills.join(', ')}. Where one of these belongs in this section's purpose, build a goal around it and name it in question_focus. Prefer it over an equally-ranked skill; never leave this section's purpose to reach one.`
+        : '',
       '',
       `PACING: this section will ask ${budget.min}-${budget.max} questions. Size its goals and evidence so there is genuinely that much to establish — a section with one thin goal leaves the interviewer circling. ${planned.type === 'behavioral' ? 'EVERY evidence item in this section must carry grading_mode "behavioral" - it is the behavioural round.' : 'At least one evidence item must carry grading_mode "factual".'}`,
       `Set section_id to "${planned.type}_${index + 1}", type to "${planned.type}", title to "${planned.title}", time_budget_sec to ${Math.round(planned.minutes * 60)} and time_ceiling_sec to ${Math.round(planned.minutes * 60 * 1.25)}.`,

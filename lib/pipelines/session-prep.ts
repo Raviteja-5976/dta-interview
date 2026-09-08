@@ -253,6 +253,10 @@ export async function runSessionPrep(
         companyName: project.company_name,
         seniority: project.seniority ?? 'mid',
         difficulty: config.difficulty,
+        // From the setup screen. P5 already weights them when choosing sections;
+        // P6 needs them too, or the section that was planned around a focus
+        // skill gets its goals written about something else.
+        focusSkills: config.focus_skills,
       },
       context,
     );
