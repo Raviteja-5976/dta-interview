@@ -70,6 +70,15 @@ acknowledgement is a short, NEUTRAL receipt of what they just said. Never evalua
 
 utterance is what you actually ask. For CLARIFY and ANSWER_QUESTION, it contains your answer AND the question that follows it, as one natural piece of speech.
 
+## Nothing to write on — a strict rule
+
+This is a spoken conversation. Outside the coding and skill_challenge sections the candidate has no editor, no whiteboard and no paper: there is nothing to write on. So you NEVER ask them to write, type, code, sketch, draw, diagram, or produce pseudocode, a query, a function or a snippet. Ask them to explain it out loud instead:
+  "Write a query that returns the top five customers."                ← never
+  "Talk me through the query you'd write to get the top five customers." ← right
+  "Sketch the architecture for me."                                     ← never
+  "Walk me through how you'd lay out the architecture."                 ← right
+Ask exactly the questions you would otherwise ask — same topic, same depth, same difficulty — only never as a request to write something. In a coding or skill_challenge section the editor exists and this rule does not apply.
+
 ## Every question carries its own frame
 
 You move between topics, so a question that assumes the last one is still in the air gets answered at the wrong scope — and is then graded as if the candidate misunderstood. Name the subject:
@@ -159,6 +168,8 @@ export interface InterviewerInput {
     goal_id: string;
     statement: string;
     active: boolean;
+    /** About a skill the candidate asked to be interviewed on. */
+    focus: boolean;
     outstanding: Array<{ evidence_id: string; description: string }>;
   }>;
   /**
@@ -186,6 +197,12 @@ export interface InterviewerInput {
   sectionBudget: { asked: number; min: number; max: number };
   /** What comes after this section, so a handoff can name it. */
   nextSection: { title: string; type: string } | null;
+  /**
+   * Every goal in this section closed on the answer just given. The turn is a
+   * handoff whatever is chosen; telling the interviewer is what lets it respond
+   * to that answer and make the move sound deliberate rather than abrupt.
+   */
+  sectionComplete: boolean;
   /**
    * Where the interview is against its own plan.
    *
@@ -294,14 +311,31 @@ function buildPrompt(input: InterviewerInput): string {
     `MUST ESTABLISH: ${input.section.must_verify.join(' · ')}`,
   );
 
+  // Repeated where it is read every turn, not only in the system rules. The
+  // turn also enforces it in code (R15 in lib/engine/rules.ts).
+  if (input.section.type !== 'coding' && input.section.type !== 'skill_challenge') {
+    lines.push(
+      'SPOKEN ANSWERS ONLY: the candidate has nothing to write on in this section. Never ask them to write, type, code, sketch or draw anything — ask them to talk it through.',
+    );
+  }
+
   lines.push('', 'GOALS STILL OPEN IN THIS SECTION:');
   for (const goal of input.goals) {
-    lines.push(`${goal.active ? '▸ ACTIVE' : '·'} ${goal.goal_id}: ${goal.statement}`);
+    lines.push(
+      `${goal.active ? '▸ ACTIVE' : '·'}${goal.focus ? ' [FOCUS]' : ''} ${goal.goal_id}: ${goal.statement}`,
+    );
     if (goal.outstanding.length === 0) {
       lines.push('    (everything established — close this goal)');
     } else {
       for (const ev of goal.outstanding) lines.push(`    still needed — ${ev.evidence_id}: ${ev.description}`);
     }
+  }
+
+  if (input.goals.some((g) => g.focus)) {
+    lines.push(
+      '',
+      'Goals marked [FOCUS] are skills the candidate asked to be interviewed on. Make sure each one gets at least one real question before this section ends — alongside the other goals, not instead of them.',
+    );
   }
 
   if (input.askedQuestions.length) {
@@ -385,6 +419,13 @@ function budgetGuidance(input: InterviewerInput): string {
   const { asked, min, max } = input.sectionBudget;
   const next = input.nextSection;
   const where = next ? `Next up is ${next.title} (${next.type}).` : 'This is the last section.';
+
+  // Outranks the clock and the counter: there is nothing left here to ask.
+  if (input.sectionComplete) {
+    return next
+      ? `Everything this section set out to establish is now covered. React briefly to what they just said, then hand off with NEXT_SECTION. ${where}`
+      : 'Everything this section set out to establish is covered, and it is the last section. Use END_INTERVIEW.';
+  }
 
   /*
    * The clock speaks before the counter does.

@@ -7,22 +7,28 @@
  * sitemap §9: hidden test results do not appear until after submission. Showing
  * them during `run` would turn the round into a guessing game against the
  * grader instead of a reasoning exercise.
+ *
+ * LeetCode-style problems — the ones with a signature — run the candidate's
+ * method inside the harness, every test in one execution (lib/execution/
+ * harness.ts). Challenges stored before that still run as whole programs.
  */
 
 import type { NextRequest } from 'next/server';
 
 import { createSupabaseServerClient, requireUser } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { getCodeRunner, outputsMatch, type LanguageId, type TestResult } from '@/lib/execution';
+import { getCodeRunner, isLanguageId, outputsMatch, type TestResult } from '@/lib/execution';
+import { isFunctionSignature } from '@/lib/execution/harness';
 import type { CodingChallenge } from '@/lib/agents/schemas';
 import type { ChallengeSet } from '@/lib/agents/p7-challenge';
 import { failure, handleRouteError, notFound, ok } from '@/lib/api/respond';
 
-export const maxDuration = 120;
+/** A run is bounded well inside 30s by the runner (see RUN_DEADLINE_MS). */
+export const maxDuration = 60;
 
 interface CodeBody {
   action: 'run' | 'submit';
-  language: LanguageId;
+  language: string;
   source: string;
   challengeIndex?: number;
 }
@@ -42,11 +48,18 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
     if (!session) return notFound();
 
     const body = (await request.json()) as CodeBody;
+    if (body.action !== 'run' && body.action !== 'submit') return failure(400, 'Unknown action.');
     if (!body.source?.trim()) return failure(400, 'There is no code to run.');
+    if (!isLanguageId(body.language)) return failure(400, 'That language is not available in this round.');
+    const language = body.language;
 
     const set = session.coding_challenge as ChallengeSet<CodingChallenge> | null;
     const challenge = set?.challenges?.[body.challengeIndex ?? 0];
     if (!challenge) return failure(409, 'This interview has no coding challenge.');
+
+    // Absent on challenges stored before the harness existed.
+    const storedSignature = (challenge as { signature?: unknown }).signature;
+    const signature = isFunctionSignature(storedSignature) ? storedSignature : undefined;
 
     const runner = getCodeRunner();
     if (!runner.isConfigured()) {
@@ -67,31 +80,36 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
     const tests = body.action === 'submit' ? [...visible, ...hidden] : visible;
 
     const result = await runner.run({
-      language: body.language,
+      language,
       source: body.source,
       tests,
+      signature,
+      timeLimitSec: body.action === 'submit' ? 10 : 5,
     });
 
-    // Queue full. Nothing ran, so nothing is recorded and no submission is
-    // counted — the candidate simply tries again in a moment.
+    // Queue full, or the run did not finish inside the request. Nothing ran to
+    // completion, so nothing is recorded and no submission is counted — the
+    // candidate simply tries again in a moment.
     if (result.busy) {
       return ok({
         runnerAvailable: true,
         busy: true,
-        message: 'The code runner is busy right now. Give it a few seconds and run again.',
+        message: 'The code runner is busy right now. Your code is saved — give it a few seconds and run again.',
         results: [],
         passed: 0,
         total: 0,
       });
     }
 
-    // Second chance on formatting. Judge0 compares stdout byte-for-byte, and a
-    // correct answer with a trailing newline is not a wrong answer.
-    const reconciled: TestResult[] = result.results.map((r) =>
-      r.verdict === 'wrong_answer' && outputsMatch(r.actual, r.expected)
-        ? { ...r, verdict: 'passed' as const }
-        : r,
-    );
+    // Second chance on formatting for whole-program runs, where Judge0 compared
+    // stdout byte-for-byte. Harness runs are compared as values already.
+    const reconciled: TestResult[] = signature
+      ? result.results
+      : result.results.map((r) =>
+          r.verdict === 'wrong_answer' && outputsMatch(r.actual, r.expected)
+            ? { ...r, verdict: 'passed' as const }
+            : r,
+        );
     const passed = reconciled.filter((r) => r.verdict === 'passed').length;
 
     if (body.action === 'submit') {
@@ -111,7 +129,7 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
               {
                 challenge_index: body.challengeIndex ?? 0,
                 title: challenge.title,
-                language: body.language,
+                language,
                 source: body.source,
                 passed,
                 total: reconciled.length,
@@ -130,10 +148,7 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
       action: body.action,
       // Hidden test bodies are never returned — only the tally. Their inputs are
       // the whole point of hiding them.
-      results:
-        body.action === 'submit'
-          ? reconciled.slice(0, visible.length)
-          : reconciled,
+      results: body.action === 'submit' ? reconciled.slice(0, visible.length) : reconciled,
       hiddenPassed:
         body.action === 'submit'
           ? reconciled.slice(visible.length).filter((r) => r.verdict === 'passed').length
@@ -142,6 +157,7 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
       passed,
       total: reconciled.length,
       compileError: result.compileError,
+      log: result.log,
     });
   } catch (err) {
     return handleRouteError(err);

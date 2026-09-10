@@ -95,6 +95,8 @@ const MONACO_LANGUAGE: Record<EditorLanguage, string> = {
   typescript: 'typescript',
   java: 'java',
   cpp: 'cpp',
+  // Monaco's cpp grammar registers `c` as well.
+  c: 'c',
   go: 'go',
   csharp: 'csharp',
   php: 'php',
@@ -159,11 +161,18 @@ export default function MonacoEditor({
   value,
   onChange,
   readOnly = false,
+  path,
 }: {
   language: EditorLanguage;
   value: string;
   onChange: (next: string) => void;
   readOnly?: boolean;
+  /**
+   * A distinct document per path. Switching path switches documents, each with
+   * its own undo history and cursor — so undo in one language can never bring
+   * back code written in another. Omit for a single-document editor.
+   */
+  path?: string;
 }) {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
 
@@ -225,6 +234,7 @@ export default function MonacoEditor({
   return (
     <Editor
       height="100%"
+      path={path}
       language={MONACO_LANGUAGE[language]}
       value={value}
       onChange={(next) => onChange(next ?? '')}

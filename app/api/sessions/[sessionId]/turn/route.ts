@@ -154,6 +154,9 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/session
       answer: body.answer,
       elapsedSec: body.endNow ? maxDurationSec : elapsedSec,
       maxDurationSec,
+      // Distinguishes the candidate ending the interview from the clock doing
+      // it: only the clock leaves an unreached paid module still owed.
+      endNow: body.endNow,
       // Sets how many questions each section gets (R12).
       difficulty: config.difficulty ?? 'medium',
     });
@@ -334,6 +337,9 @@ function codingPayload(
     visible_tests: challenge.visible_tests,
     target_complexity: challenge.target_complexity,
     hidden_test_count: challenge.hidden_tests.length,
+    // Labels test inputs by parameter on screen. Null on challenges stored
+    // before signatures existed.
+    signature: (challenge as { signature?: unknown }).signature ?? null,
   };
 }
 
@@ -465,8 +471,7 @@ async function resolveAudio(args: {
   /*
    * Resolved PER SEGMENT, not as one concatenated line.
    *
-   * P8 renders each acknowledgement, transition and bank question as its own
-   * clip. Looking up the joined string could therefore only ever hit when both
+   * P8 caches clips part by part (today, only the opening question). Looking up the joined string could therefore only ever hit when both
    * the acknowledgement and the transition happened to be empty — so in
    * practice the cache never hit, every turn paid live TTS, and the ~40 clips
    * P8 generated during preparation were thrown away. That is most of what made
@@ -485,22 +490,26 @@ async function resolveAudio(args: {
 
   const prosody = args.utterance.plan.prosody;
 
-  for (const part of parts) {
-    const hit = args.assets?.assets.find((a) => a.text === part.text);
+  /*
+   * Everything that is not cached is spoken as ONE stream.
+   *
+   * Streaming each part separately put a whole round trip — auth, a session
+   * read, Deepgram's first byte — between "Right, that makes sense." and the
+   * question, because the browser only asks for a clip when the one before it
+   * has finished. One request for the joined text leaves no gap to fill, and the
+   * synthesiser reads the sentence break as the natural pause a person leaves.
+   * Now that P8 caches only the opening line, that is nearly every turn.
+   */
+  let uncached: Array<{ kind: AudioSegment['kind']; text: string }> = [];
 
-    if (hit) {
-      const { data } = await args.admin.storage.from('voice').createSignedUrl(hit.path, 900);
-      if (data?.signedUrl) {
-        segments.push({ url: data.signedUrl, kind: part.kind, source: 'cache' });
-        continue;
-      }
-    }
+  const flushUncached = () => {
+    if (uncached.length === 0) return;
 
     // Same-origin, so the browser sends its session cookie and the Web Audio
     // graph is never tainted — which is the other thing that used to silence
     // playback when a cross-origin clip lost its CORS headers.
     const query = new URLSearchParams({
-      text: part.text,
+      text: uncached.map((p) => p.text.trim()).join(' '),
       emotion: prosody.emotion,
       rate: String(prosody.rate),
     });
@@ -509,10 +518,29 @@ async function resolveAudio(args: {
 
     segments.push({
       url: `/api/sessions/${args.sessionId}/speak?${query.toString()}`,
-      kind: part.kind,
+      kind: uncached[uncached.length - 1].kind,
       source: 'stream',
     });
+    uncached = [];
+  };
+
+  for (const part of parts) {
+    const hit = args.assets?.assets.find((a) => a.text === part.text);
+
+    if (hit) {
+      const { data } = await args.admin.storage.from('voice').createSignedUrl(hit.path, 900);
+      if (data?.signedUrl) {
+        // Whatever was waiting to be streamed is said before this clip.
+        flushUncached();
+        segments.push({ url: data.signedUrl, kind: part.kind, source: 'cache' });
+        continue;
+      }
+    }
+
+    uncached.push(part);
   }
+
+  flushUncached();
 
   if (segments.length === 0) return { segments: [], source: 'none' };
 

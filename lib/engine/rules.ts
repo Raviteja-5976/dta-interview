@@ -533,13 +533,56 @@ export function validateIntent(
  * Returns a repaired plan rather than failing — a slightly plainer sentence is
  * always better than a stalled turn (invariant 12).
  */
+/**
+ * R15 · Nothing to write on.
+ *
+ * Outside the coding and skill rounds the interview is voice only: there is no
+ * editor, no whiteboard and no paper. A question like "write a query that…"
+ * leaves the candidate with no way to answer it as asked. The interviewer and
+ * P6 are both told this; these patterns are the enforcement for when a model
+ * asks anyway.
+ *
+ * Deliberately broad. A false positive costs one extra spoken sentence — "no
+ * need to write anything down" — while a miss leaves someone stuck.
+ */
+const WRITE_REQUEST_PATTERNS: RegExp[] = [
+  // "can you write…", "could you sketch…" — but not "how would you write…",
+  // which already asks for an explanation.
+  /\b(?<!how )(?:can|could|would|will) you (?:please )?(?:quickly |just )?(?:write|type|code|sketch|draw(?! on\b)|jot|whiteboard|diagram|pseudo-?code)\b/i,
+  // Imperatives at the start of a sentence: "Write a function…", "Sketch it."
+  /(?:^|[.!?:;]\s+)(?:please\s+|now\s+|go ahead and\s+|try\s+)?(?:write|type|code up|sketch|draw(?! on\b)|jot|diagram)\b/i,
+  /\b(?:write|type|jot|note|put) (?:it|that|this|them|those|something) down\b/i,
+  /\b(?:write|type) (?:it |that |this )?(?:out|up)\b/i,
+  /\bin pseudo-?code\b/i,
+  /\b(?:on|to|using) (?:a|the) whiteboard\b/i,
+  /\b(?:share|paste) (?:your|the) (?:screen|code|query)\b/i,
+];
+
+const SPOKEN_ONLY_NOTE = 'No need to write anything down — just talk me through it.';
+
+/** True when a question asks the candidate to produce something written. */
+export function asksToWrite(text: string): boolean {
+  return WRITE_REQUEST_PATTERNS.some((re) => re.test(text));
+}
+
 export function validateAndRepairPlan(
   plan: UtterancePlan,
   runtime: SessionRuntime,
-  opts: { callbackNouns?: string[] } = {},
+  opts: {
+    callbackNouns?: string[];
+    /** Only in the coding and skill rounds, where there is an editor to write in. */
+    allowWriting?: boolean;
+  } = {},
 ): { plan: UtterancePlan; repairs: string[] } {
   const repairs: string[] = [];
   const next = { ...plan };
+
+  // R15 · a request to write becomes a request to explain. The question itself
+  // is kept — it is the interviewer's thread — and told to be answered out loud.
+  if (!opts.allowWriting && asksToWrite(next.utterance) && !next.utterance.includes(SPOKEN_ONLY_NOTE)) {
+    next.utterance = `${next.utterance.trim()} ${SPOKEN_ONLY_NOTE}`;
+    repairs.push('R15: asked for something written outside a coding or skill round');
+  }
 
   // R5 · acknowledgements are neutral, never evaluative.
   if (next.acknowledgement && FORBIDDEN_ACK_PATTERNS.some((re) => re.test(next.acknowledgement))) {

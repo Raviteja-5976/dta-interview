@@ -11,9 +11,13 @@
  * the most expensive prep call, so the cache is what makes P1 affordable.
  */
 
+import { memo } from '../ai/durable';
 import { runAgent } from '../ai/run';
 import type { RunContext } from '../ai/types';
 import { companyProfileSchema, type CompanyProfile } from './schemas';
+
+/** Engineering blogs and careers pages carry the stack and culture signal a homepage does not. */
+const EXTRA_PATHS = ['/careers', '/blog', '/engineering'];
 
 const SYSTEM = `You are researching a company so an interview can sound like it came from someone who works there.
 
@@ -70,16 +74,29 @@ export async function runCompanyResearch(
 
   if (input.companyUrl) {
     const base = normaliseUrl(input.companyUrl);
-    const home = await fetchSiteText(base);
-    if (home) pages.push(`<page url="${base}">\n${home}\n</page>`);
 
-    // Engineering blogs and careers pages carry the stack and culture signal
-    // that a marketing homepage never does. Both are best-effort.
-    for (const path of ['/careers', '/blog', '/engineering']) {
-      if (pages.length >= 3) break;
-      const text = await fetchSiteText(`${base}${path}`);
-      if (text) pages.push(`<page url="${base}${path}">\n${text.slice(0, 8_000)}\n</page>`);
-    }
+    /*
+     * Fetched in parallel, once per run.
+     *
+     * In parallel because four best-effort fetches at ten seconds each, one
+     * after another, could spend a whole 30-second request on their own.
+     *
+     * Memoised because under a durable run (lib/ai/durable.ts) this function
+     * executes on every pass until P1 lands. A page re-scraped on each pass that
+     * differs by a single byte — a timestamp, a rotating banner — is a different
+     * prompt, and so a different call, started again from nothing every time.
+     */
+    const [home, ...extras] = await memo(`p1:site:${base}`, () =>
+      Promise.all([fetchSiteText(base), ...EXTRA_PATHS.map((path) => fetchSiteText(`${base}${path}`))]),
+    );
+
+    if (home) pages.push(`<page url="${base}">\n${home}\n</page>`);
+    EXTRA_PATHS.forEach((path, i) => {
+      const text = extras[i];
+      if (text && pages.length < 3) {
+        pages.push(`<page url="${base}${path}">\n${text.slice(0, 8_000)}\n</page>`);
+      }
+    });
   }
 
   const scraped = pages.length > 0 ? pages.join('\n\n') : '(no site text could be retrieved)';

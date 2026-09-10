@@ -34,6 +34,7 @@ import type {
 } from '../agents/schemas';
 import { runInterviewer, type InterviewerInput } from '../agents/interviewer';
 import { DIFFICULTY_BRIEF } from '../agents/p5-strategy';
+import { goalServesFocus, openingSeed } from '../agents/p6-blueprint';
 import { runMemoryExtraction } from '../agents/l2-memory';
 import { mergeExtraction, openCallbacks, type InterviewMemory } from '../engine/l2-memory-store';
 import {
@@ -92,6 +93,8 @@ export interface TurnInput {
   /** Total elapsed interview seconds, for the hard ceiling. */
   elapsedSec: number;
   maxDurationSec: number;
+  /** The candidate pressed "End interview". Nothing is owed after that. */
+  endNow?: boolean;
   /** Sets R12's per-section question budget. Defaults to medium. */
   difficulty?: 'easy' | 'medium' | 'hard';
 }
@@ -252,11 +255,25 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
   };
 
   // ── 2 · Close goals and advance sections — ceilings, not decisions ────────
-  applyGoalAndSectionProgress(state, blueprint);
+  const sectionFinished = applyGoalAndSectionProgress(state, blueprint);
+
+  /*
+   * A paid module the conversation never reached is still owed.
+   *
+   * The coding and skill rounds sit at the end of the interview, so an
+   * overrunning conversation used to eat them: the time ceiling closed the
+   * interview and a round the candidate paid a flat fee for was never asked.
+   * Module time is not conversation time — the editor stops the meter and
+   * extends the ceiling — so running out of conversation is no reason to skip
+   * one. The turn jumps straight into the next owed module instead. Pressing
+   * "End interview" still ends it.
+   */
+  const timeUp = input.elapsedSec >= input.maxDurationSec;
+  const owedModule = timeUp && !input.endNow ? nextOwedModule(state, blueprint) : undefined;
 
   // Hard stop. O1 enforces the total ceiling above everything else, so a goal
   // that will not close can never run the interview past its budget.
-  if (input.elapsedSec >= input.maxDurationSec || allSectionsDone(state, blueprint)) {
+  if (!owedModule && (timeUp || allSectionsDone(state, blueprint))) {
     // Latency no longer matters on the last turn, and the final answer's
     // evidence belongs in the report as much as any other.
     await collectVerdicts();
@@ -305,7 +322,7 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
    * model).
    */
   const budget = SECTION_QUESTION_BUDGET[input.difficulty ?? 'medium'];
-  const nextUp = nextSectionAfter(blueprint, state.runtime.current_section_id);
+  const nextUp = owedModule ?? nextSectionAfter(blueprint, state.runtime.current_section_id);
 
   /*
    * ── The clock, computed once ────────────────────────────────────────────
@@ -331,7 +348,22 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
         ? 'ahead'
         : 'on_track';
 
-  const iv = section
+  /*
+   * ── The opening turn is not the interviewer's to write ──────────────────
+   *
+   * The first line of the interview is the warm-up's opening seed, spoken as
+   * written. P6 builds the warm-up in code for the same reason — it is the
+   * first thing the candidate hears, and too important to leave to chance — and
+   * speaking it verbatim is what lets session prep render it to audio ahead of
+   * time. The interview then opens on a cached clip rather than a Groq call
+   * followed by a synthesis, and that clip is the only one prep still makes.
+   *
+   * The jump into an owed module is scripted the same way: there is nothing to
+   * decide, and the words are the module's own handoff.
+   */
+  const scripted = openingTurn(input, state, section) ?? moduleHandoffTurn(owedModule, state);
+
+  const iv = section && !scripted
     ? await runInterviewer(
         {
           context: blueprint.context,
@@ -352,6 +384,7 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
           runtime: state.runtime,
           sectionBudget: { asked: state.runtime.questions_in_section, ...budget },
           nextSection: nextUp ? { title: nextUp.title, type: nextUp.type } : null,
+          sectionComplete: sectionFinished,
           timing: {
             sectionElapsedSec,
             sectionBudgetSec,
@@ -372,7 +405,7 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
         },
         context,
       )
-    : null;
+    : scripted;
 
   /*
    * ── 5 · Structure is enforced here, not requested in the prompt ──────────
@@ -393,6 +426,8 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
     nextSectionOpener: nextUp?.goals[0]?.question_bank[0]?.text ?? null,
     pace,
     remainingSec,
+    leaveSection: sectionFinished || Boolean(owedModule),
+    focusSeeds: section ? unaskedFocusSeeds(state, section, blueprint.context.focus_skills ?? []) : [],
     fallback: () => ruleLayerIntent(shortlist[0], answerWeak),
   });
 
@@ -427,9 +462,8 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
   }
 
   // ── 6 · Resolve what will actually be said ───────────────────────────────
-  const nextSection = intent.action === 'TRANSITION_SECTION'
-    ? nextSectionAfter(blueprint, state.runtime.current_section_id)
-    : undefined;
+  // `nextUp` is the owed module when there is one, and the next section otherwise.
+  const nextSection = intent.action === 'TRANSITION_SECTION' ? nextUp : undefined;
 
   /*
    * Leaving the last section IS the end of the interview.
@@ -498,7 +532,11 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
     allow_barge_in_after_ms: 800,
   };
 
-  const { plan: repaired, repairs } = validateAndRepairPlan(plan, state.runtime);
+  const { plan: repaired, repairs } = validateAndRepairPlan(plan, state.runtime, {
+    // The section the question belongs to — on a handoff, the one being
+    // entered. Only the coding and skill rounds have an editor to write in.
+    allowWriting: targetSection?.type === 'coding' || targetSection?.type === 'skill_challenge',
+  });
 
   // ── 8 · Record the question and update the runtime ───────────────────────
   const questionId = `q_${String(state.questions.length + 1).padStart(2, '0')}`;
@@ -541,7 +579,13 @@ export async function runTurn(input: TurnInput): Promise<TurnOutput> {
   await collectVerdicts();
 
   state.questions.push(record);
+  const leavingSectionId = state.runtime.current_section_id;
   applyRuntimeUpdates(state, intent, repaired, resolved, nextSection?.section_id);
+
+  // A jump to an owed module skips whatever sat between; those sections are over.
+  if (owedModule && nextSection?.section_id === owedModule.section_id) {
+    closeSectionsBetween(state, blueprint, leavingSectionId, owedModule.section_id);
+  }
 
   // A goal the interviewer declared finished is closed here rather than left to
   // time out on its own exit conditions.
@@ -630,6 +674,7 @@ function openGoalsInSection(
   const section = blueprint.sections.find((s) => s.section_id === sectionId);
   if (!section) return [];
 
+  const focusSkills = blueprint.context.focus_skills ?? [];
   const out: InterviewerInput['goals'] = [];
 
   for (const goal of section.goals) {
@@ -642,6 +687,7 @@ function openGoalsInSection(
       goal_id: goal.goal_id,
       statement: goal.statement,
       active: state.runtime.active_goal_id === goal.goal_id,
+      focus: goalServesFocus(goal, focusSkills),
       outstanding: cov.outstanding.map((id) => ({
         evidence_id: id,
         description: described.get(id) ?? id,
@@ -750,6 +796,13 @@ function applyStructuralRules(args: {
   pace: 'ahead' | 'on_track' | 'over';
   /** Seconds left in the whole interview. */
   remainingSec: number;
+  /**
+   * This turn leaves the section: every goal in it closed on the answer just
+   * given, or the conversation is out of time and a paid module is owed.
+   */
+  leaveSection: boolean;
+  /** Opening seeds of focus-skill goals here that nothing has been asked about. */
+  focusSeeds: Array<{ bank_id: string; text: string; goal_id: string }>;
   fallback: () => ConversationalIntent | null;
 }): StructuralDecision {
   const { proposed, runtime, section, hasNextSection, budget } = args;
@@ -863,6 +916,27 @@ function applyStructuralRules(args: {
   }
 
   /*
+   * Every goal here closed on the last answer, so this turn leaves — as a
+   * handoff the candidate hears, after the interviewer has taken in what they
+   * said. The interviewer is told, and usually hands off by itself with its own
+   * line; this catches the turns where it asked into a finished section anyway.
+   *
+   * A clarification or a question back at us is still answered first: the next
+   * turn finds the section just as finished and hands off then.
+   */
+  if (
+    args.leaveSection &&
+    hasNextSection &&
+    action !== 'NEXT_SECTION' &&
+    action !== 'END_INTERVIEW' &&
+    action !== 'CLARIFY' &&
+    action !== 'ANSWER_QUESTION'
+  ) {
+    action = 'NEXT_SECTION';
+    overrideReason = 'section complete: every goal closed';
+  }
+
+  /*
    * Holding a section open needs a QUESTION, not just a verdict.
    *
    * When the interviewer chooses NEXT_SECTION its utterance is a handoff line —
@@ -873,7 +947,10 @@ function applyStructuralRules(args: {
    * honest thing is to let the section end early.
    */
   const holdInSection = (reason: string): boolean => {
-    const seed = args.seeds.find((q) => !isRepeatQuestion(q.text, args.askedQuestions));
+    // A focus skill nobody has asked about yet is the best use of a held turn.
+    const seed = [...args.focusSeeds, ...args.seeds].find(
+      (q) => !isRepeatQuestion(q.text, args.askedQuestions),
+    );
     if (!seed) return false;
     action = 'ASK';
     utterance = seed.text;
@@ -886,7 +963,9 @@ function applyStructuralRules(args: {
   // R12 floor · leaving early is not allowed while there is still material,
   // except in sections whose natural length is short.
   const hasFloor = section !== undefined && !NO_FLOOR_SECTIONS.has(section.type);
-  if (action === 'NEXT_SECTION' && hasFloor && asked < budget.min) {
+  // Not once every goal has closed — the "material" left would be seeds for
+  // goals that are already done.
+  if (action === 'NEXT_SECTION' && hasFloor && asked < budget.min && !args.leaveSection) {
     holdInSection('R12: below the section question floor');
   }
 
@@ -915,6 +994,27 @@ function applyStructuralRules(args: {
   }
 
   /*
+   * A focus skill is not left unasked by choice.
+   *
+   * The candidate named it on the setup screen, and P6 gave it a goal in this
+   * section. If the interviewer decides to move on before anything has been
+   * asked about it, the turn stays and asks that goal's opening question
+   * instead. Only a voluntary exit is held: over time, out of question budget,
+   * or forced by a rule, the section still leaves — those protect the rest of
+   * the interview.
+   */
+  if (
+    action === 'NEXT_SECTION' &&
+    overrideReason === undefined &&
+    !args.leaveSection &&
+    args.pace !== 'over' &&
+    asked < budget.max &&
+    args.focusSeeds.length > 0
+  ) {
+    holdInSection('focus skill not yet asked about in this section — staying');
+  }
+
+  /*
    * The mirror of it. Leaving a section with time still on it and goals still
    * open is how an interview finishes ten minutes early having established
    * nothing — the candidate paid for those minutes and the report is thinner
@@ -932,7 +1032,9 @@ function applyStructuralRules(args: {
     hasFloor &&
     // Never undo R1, R9 or R12: those left the section for a reason that has
     // nothing to do with the clock, and re-entering it would loop.
-    overrideReason === undefined
+    overrideReason === undefined &&
+    // Nor a turn that has to leave: a finished section, or an owed module.
+    !args.leaveSection
   ) {
     holdInSection('R14: section still has time and open goals — staying');
   }
@@ -997,6 +1099,70 @@ function applyStructuralRules(args: {
     closedGoalId: action === 'CLOSE_GOAL' ? (proposed.target_goal || runtime.active_goal_id) ?? undefined : undefined,
     previousWasNotAnAnswer,
     overrideReason,
+  };
+}
+
+/**
+ * The opening turn, decided in code: the warm-up's first seed, verbatim.
+ *
+ * Shaped as an interviewer proposal so it goes through `applyStructuralRules`
+ * like any other — which also retires the seed, because the text matches it
+ * exactly. Null on every later turn, and on a blueprint with no warm-up, where
+ * the interviewer opens as it always has.
+ */
+function openingTurn(
+  input: TurnInput,
+  state: LiveState,
+  section: BlueprintSection | undefined,
+): { turn: InterviewerTurn; fromFallback: boolean; latencyMs: number } | null {
+  if (input.answer || state.questions.length > 0) return null;
+
+  const seed = openingSeed(section);
+  if (!seed) return null;
+
+  return {
+    turn: {
+      action: 'ASK',
+      target_goal: seed.goal_id,
+      targets_evidence: seed.targets_evidence.slice(0, 4),
+      // Nothing has been said yet, so there is nothing to acknowledge.
+      acknowledgement: '',
+      utterance: seed.text,
+      emotional_tone: 'warm',
+      difficulty_delta: 0,
+      reason: 'Opening turn: the warm-up opener, spoken as written so its prepared clip plays.',
+    },
+    fromFallback: false,
+    latencyMs: 0,
+  };
+}
+
+/**
+ * The jump into a paid module the conversation ran out of time for.
+ *
+ * Decided in code, like the opening turn: there is nothing to decide. The
+ * module's entry line is spoken as the transition, and this is what follows
+ * it — the module's own opening prompt.
+ */
+function moduleHandoffTurn(
+  module: BlueprintSection | undefined,
+  state: LiveState,
+): { turn: InterviewerTurn; fromFallback: boolean; latencyMs: number } | null {
+  if (!module) return null;
+
+  return {
+    turn: {
+      action: 'NEXT_SECTION',
+      target_goal: '',
+      targets_evidence: [],
+      acknowledgement: pickAcknowledgement(state.runtime),
+      utterance: module.goals[0]?.question_bank[0]?.text ?? '',
+      emotional_tone: 'steady',
+      difficulty_delta: 0,
+      reason: 'Conversation time is up; moving straight to a paid module it had not reached.',
+    },
+    fromFallback: false,
+    latencyMs: 0,
   };
 }
 
@@ -1101,7 +1267,8 @@ function startEvidenceCheck(
   ).catch(() => ({ verdicts: [], fromFallback: true, latencyMs: 0 }));
 }
 
-function applyGoalAndSectionProgress(state: LiveState, blueprint: Blueprint): void {
+/** Closes goals whose exit conditions have been met. True when the section has none left open. */
+function applyGoalAndSectionProgress(state: LiveState, blueprint: Blueprint): boolean {
   const activeId = state.runtime.active_goal_id;
 
   /*
@@ -1139,12 +1306,23 @@ function applyGoalAndSectionProgress(state: LiveState, blueprint: Blueprint): vo
     }
   }
 
-  if (isSectionComplete(state.coverage, state.runtime.current_section_id)) {
-    const next = nextSectionAfter(blueprint, state.runtime.current_section_id);
-    // Only advance when there is somewhere to go. On the last section this
-    // leaves `allSectionsDone` to end the interview on the next check.
-    if (next) enterSection(state, next.section_id);
-  }
+  /*
+   * A section whose goals have all closed is REPORTED, not left.
+   *
+   * This used to move into the next section right here — before the
+   * interviewer had seen the answer that closed this one. It was then prompted
+   * as if it had always been in the next section, so it asked that section's
+   * first question cold: no handoff line, and nothing said about what the
+   * candidate had just finished telling it. From the candidate's side, the last
+   * answer of a section was dropped and the topic lurched.
+   *
+   * Now the section stays current for this turn and the caller makes the turn
+   * a real handoff: the interviewer is told the section is done, responds to
+   * the answer, and the transition is spoken. `applyRuntimeUpdates` does the
+   * move itself. On the last section, `allSectionsDone` ends the interview as
+   * it always did.
+   */
+  return isSectionComplete(state.coverage, state.runtime.current_section_id);
 }
 
 /**
@@ -1173,15 +1351,56 @@ function closeOutSection(state: LiveState, sectionId: string): void {
   }
 }
 
-/** Moves into a section and resets everything scoped to one. */
-function enterSection(state: LiveState, sectionId: string): void {
-  closeOutSection(state, state.runtime.current_section_id);
+/** The next coding or skill section after the current one that has not been run. */
+function nextOwedModule(state: LiveState, blueprint: Blueprint): BlueprintSection | undefined {
+  const current = blueprint.sections.findIndex((s) => s.section_id === state.runtime.current_section_id);
+  return blueprint.sections
+    .slice(current + 1)
+    .find(
+      (s) =>
+        (s.type === 'coding' || s.type === 'skill_challenge') &&
+        !state.runtime.sections_completed.includes(s.section_id),
+    );
+}
 
-  state.runtime.current_section_id = sectionId;
-  state.runtime.active_goal_id = null;
-  state.runtime.turns_on_active_goal = 0;
-  state.runtime.questions_in_section = 0;
-  state.runtime.section_started_sec = state.runtime.elapsed_sec;
+/** Closes every section strictly between two others — the ones a jump skipped. */
+function closeSectionsBetween(state: LiveState, blueprint: Blueprint, fromId: string, toId: string): void {
+  const from = blueprint.sections.findIndex((s) => s.section_id === fromId);
+  const to = blueprint.sections.findIndex((s) => s.section_id === toId);
+  for (const s of blueprint.sections.slice(from + 1, Math.max(from + 1, to))) {
+    closeOutSection(state, s.section_id);
+  }
+}
+
+/**
+ * Opening seeds of this section's focus-skill goals that nothing has been asked
+ * about yet — what a held turn asks, so a skill the candidate named is never
+ * left out of the section built to cover it.
+ */
+function unaskedFocusSeeds(
+  state: LiveState,
+  section: BlueprintSection,
+  focusSkills: string[],
+): Array<{ bank_id: string; text: string; goal_id: string }> {
+  if (focusSkills.length === 0) return [];
+
+  const spoken = new Set(state.questions.map((q) => q.text));
+  const askedGoals = new Set(
+    state.questions.flatMap((q) => [q.goal_id, q.displayed_goal?.goal_id]).filter(Boolean),
+  );
+
+  return section.goals
+    .filter((goal) => goalServesFocus(goal, focusSkills) && !askedGoals.has(goal.goal_id))
+    .filter((goal) => {
+      const status = state.coverage.goals.find((g) => g.goal_id === goal.goal_id)?.status;
+      return status !== 'satisfied' && status !== 'abandoned';
+    })
+    .flatMap((goal) =>
+      goal.question_bank
+        .filter((q) => !state.runtime.asked_bank_ids.includes(q.bank_id) && !spoken.has(q.text))
+        .slice(0, 1)
+        .map((q) => ({ bank_id: q.bank_id, text: q.text, goal_id: goal.goal_id })),
+    );
 }
 
 function allSectionsDone(state: LiveState, blueprint: Blueprint): boolean {

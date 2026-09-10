@@ -134,13 +134,61 @@ export function skillMixBrief(difficulty: 'easy' | 'medium' | 'hard'): string {
   );
 }
 
+/**
+ * Makes the plan's module sections match the modules that were bought.
+ *
+ * P5 is TOLD to include a coding or skill_challenge section only when that
+ * module is on, and it follows the instruction most of the time — which is not
+ * good enough for a round the candidate paid a flat fee for. A missing coding
+ * section meant the problem was generated and never asked; a module section
+ * with its module off meant a handoff to an editor that never opens. So the
+ * plan is corrected in code, the same way P6 guarantees the behavioural round.
+ *
+ * An added section borrows its length from the other module where P5 planned
+ * one, and goes just before the close, where the modules always sit.
+ */
+export function alignModuleSections(
+  strategy: Strategy,
+  modules: { coding: boolean; skillChallenge: boolean },
+): Strategy {
+  const enabled = { coding: modules.coding, skill_challenge: modules.skillChallenge };
+
+  const kept = strategy.sections.filter((s) =>
+    s.type === 'coding' || s.type === 'skill_challenge' ? enabled[s.type] : true,
+  );
+  const missing = (['coding', 'skill_challenge'] as const).filter(
+    (type) => enabled[type] && !kept.some((s) => s.type === type),
+  );
+
+  if (missing.length === 0 && kept.length === strategy.sections.length) return strategy;
+
+  const reference = kept.find((s) => s.type === 'coding' || s.type === 'skill_challenge');
+  const closing = kept.findIndex((s) => s.type === 'closing');
+  const at = closing >= 0 ? closing : kept.length;
+
+  const added = missing.map((type) => ({
+    type,
+    title: type === 'coding' ? 'Coding' : 'Hands-on task',
+    minutes: reference?.minutes ?? 6,
+    purpose:
+      type === 'coding'
+        ? 'A LeetCode-style problem solved in the editor.'
+        : 'A hands-on task in the technology the role requires.',
+  }));
+
+  if (missing.length > 0) console.warn(`[P5] plan was missing ${missing.join(' and ')} — added in code`);
+  if (kept.length < strategy.sections.length) console.warn('[P5] plan had a section for a module that is off — removed');
+
+  return { ...strategy, sections: [...kept.slice(0, at), ...added, ...kept.slice(at)] };
+}
+
 export async function runStrategy(
   input: StrategyInput,
   context?: RunContext,
 ): Promise<Strategy> {
   const focus = input.config.focusSkills?.length
     ? `FOCUS SKILLS — the candidate explicitly asked for these: ${input.config.focusSkills.join(', ')}. ` +
-      'Give them a named section of their own where the minutes allow, and prefer them whenever two skills are otherwise equally worth asking about. ' +
+      'Put them in priority_skills and let them shape the purposes of the technical sections. They are ADDED to the plan, not a replacement for it: the sections are still built from the gap report and the role, and still cover what those call for. ' +
       'They are weighted up within their gap class; they do not change the STRONG / WEAK / UNVERIFIED split above.'
     : 'No explicit focus skills were requested.';
 

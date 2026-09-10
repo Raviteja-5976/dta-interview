@@ -8,10 +8,17 @@
  * because they both read `question_record[]`. E4 emits observations; S1 emits
  * numbers. E6 reads L3's coverage ledger directly so the report's
  * skill-verification claims come from the live record rather than re-derivation.
+ *
+ * ── How it runs ──────────────────────────────────────────────────────────────
+ * As a durable pipeline (lib/ai/durable.ts), one short pass per request from
+ * POST /api/sessions/[id]/evaluate. Every pass executes this function from the
+ * top, replaying finished grading calls from the run's state, so nothing is
+ * written until the pass with every result in hand.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
+import { checkpoint, memo, reportProgress, rethrowIfPending } from '../ai/durable';
 import { runGrading } from '../agents/e4-grading';
 import { runRewriteCoach } from '../agents/e5-rewrite';
 import { runReportComposer } from '../agents/e6-report';
@@ -58,7 +65,7 @@ export async function runEvaluation(
   const { data: session } = await supabase
     .from('sessions')
     .select(
-      'id, user_id, project_id, seq, config, blueprint, live_state, media, started_at, credits_charged, skill_challenge',
+      'id, user_id, project_id, seq, status, config, blueprint, live_state, media, started_at, credits_charged, skill_challenge',
     )
     .eq('id', sessionId)
     .single();
@@ -83,7 +90,11 @@ export async function runEvaluation(
   const context = { userId: session.user_id, projectId: session.project_id, sessionId };
 
   try {
-    await supabase.from('sessions').update({ status: 'processing' }).eq('id', sessionId);
+    // Every pass reaches this line; only the first needs to write it.
+    if (session.status !== 'processing') {
+      await supabase.from('sessions').update({ status: 'processing' }).eq('id', sessionId);
+    }
+    reportProgress('transcript');
 
     // ── E1 · Transcript assembly ─────────────────────────────────────────────
     /*
@@ -103,8 +114,6 @@ export async function runEvaluation(
     if (answered.length === 0) {
       return await fail(supabase, sessionId, 'No answers were recorded in this session.');
     }
-
-    const wordsBySeq = await loadWordTimings(supabase, session.user_id, sessionId, answered);
 
     // What the candidate claimed on paper, for grading experiential answers
     // against something. Loaded once and shared across all ~15 E4 calls.
@@ -128,44 +137,58 @@ export async function runEvaluation(
       session.skill_challenge as ChallengeSet<SkillChallenge> | null,
       context,
     );
+    // Awaited below, after grading — but a pass can end in PendingWork before
+    // it gets there, and an unobserved rejection must not take the process with
+    // it. Awaiting it later still sees the rejection.
+    skillReviewPromise.catch(() => undefined);
 
     // ── E2 · Speech metrics · deterministic, parallel-free ───────────────────
-    const metricsBySeq = new Map<number, SpeechMetrics>();
-    for (const q of answered) {
-      const words = wordsBySeq.get(q.seq);
+    //
+    // Computed once per run and replayed. Under a durable run this function
+    // executes on every pass until grading lands, and downloading every
+    // answer's word timings from Storage again on each of those passes would be
+    // hundreds of reads for one report.
+    const metricsEntries = await memo('speech_metrics', async () => {
+      const wordsBySeq = await loadWordTimings(supabase, session.user_id, sessionId, answered);
 
-      /*
-       * Two paths, and the first one is now the ordinary case again.
-       *
-       * With words: the full metric set including the pause profile. Deepgram's
-       * nova-3 returns per-word timing from the live socket that transcribed
-       * the answer, so this is what a session recorded on the current stack
-       * lands on (invariant 16 — the timing comes from the live STT, not a
-       * second pass).
-       *
-       * Without: transcript plus the speech window the client measured from the
-       * microphone. Pace, fillers and repetition are all real; pause metrics are
-       * reported as unavailable and S1 renormalises around them. This covers
-       * sessions recorded before the move to Deepgram, and answers where the
-       * live socket never opened.
-       */
-      metricsBySeq.set(
-        q.seq,
-        words?.length
-          ? computeSpeechMetrics(words, {
-              silenceBeforeMs: q.answer.silence_before_answer_ms,
-              asrConfidenceAvg: q.answer.asr_confidence_avg,
-            })
-          : computeSpeechMetricsFromText(
-              q.answer.transcript,
-              // The client-measured window, in seconds.
-              Math.max(0, q.answer.end_ms - q.answer.start_ms) / 1000,
-              { silenceBeforeMs: q.answer.silence_before_answer_ms },
-            ),
-      );
-    }
+      return answered.map((q): [number, SpeechMetrics] => {
+        const words = wordsBySeq.get(q.seq);
+
+        /*
+         * Two paths, and the first one is now the ordinary case again.
+         *
+         * With words: the full metric set including the pause profile.
+         * Deepgram's nova-3 returns per-word timing from the live socket that
+         * transcribed the answer, so this is what a session recorded on the
+         * current stack lands on (invariant 16 — the timing comes from the live
+         * STT, not a second pass).
+         *
+         * Without: transcript plus the speech window the client measured from
+         * the microphone. Pace, fillers and repetition are all real; pause
+         * metrics are reported as unavailable and S1 renormalises around them.
+         * This covers sessions recorded before the move to Deepgram, and
+         * answers where the live socket never opened.
+         */
+        return [
+          q.seq,
+          words?.length
+            ? computeSpeechMetrics(words, {
+                silenceBeforeMs: q.answer.silence_before_answer_ms,
+                asrConfidenceAvg: q.answer.asr_confidence_avg,
+              })
+            : computeSpeechMetricsFromText(
+                q.answer.transcript,
+                // The client-measured window, in seconds.
+                Math.max(0, q.answer.end_ms - q.answer.start_ms) / 1000,
+                { silenceBeforeMs: q.answer.silence_before_answer_ms },
+              ),
+        ];
+      });
+    });
+    const metricsBySeq = new Map<number, SpeechMetrics>(metricsEntries);
 
     // ── E4 · Grading · map-reduce, one call per question ─────────────────────
+    reportProgress('grading');
     const gradings = await mapWithConcurrency(answered, 5, async (q) =>
       runGrading(
         {
@@ -292,6 +315,7 @@ export async function runEvaluation(
     });
 
     // ── E5 · Rewrites · parallel ─────────────────────────────────────────────
+    reportProgress('report');
     const rewrites = await mapWithConcurrency(answered, 4, async (q, i) =>
       runRewriteCoach(
         {
@@ -302,7 +326,11 @@ export async function runEvaluation(
           roleTitle: project?.role_title ?? 'this role',
         },
         context,
-      ).catch(() => null),
+      ).catch((err: unknown) => {
+        // Still running is not failed — the next pass collects it.
+        rethrowIfPending(err);
+        return null;
+      }),
     );
 
     // ── Speech rollup ────────────────────────────────────────────────────────
@@ -363,6 +391,9 @@ export async function runEvaluation(
     );
 
     // ── Persist per-question rows ────────────────────────────────────────────
+    // Belt and braces: every call above has landed, or this pass ends here.
+    checkpoint();
+
     await writeSessionQuestions(supabase, {
       sessionId,
       userId: session.user_id,
@@ -378,6 +409,10 @@ export async function runEvaluation(
     const readiness = computeReadiness({
       scores: sessionScores,
       previous: (project?.readiness as Readiness | null) ?? null,
+      // Nothing passed this before, so resume_match was carried forward from a
+      // value no code ever set: a flat 0 on every project, and never part of
+      // the overall score.
+      resumeMatch: await loadResumeMatch(supabase, session.project_id),
       sessionId,
     });
 
@@ -409,6 +444,9 @@ export async function runEvaluation(
 
     return { status: 'complete', overall: sessionScores.overall };
   } catch (err) {
+    // Unfinished work is not a failure — the next pass picks it up.
+    rethrowIfPending(err);
+
     const message = err instanceof Error ? err.message : 'Evaluation failed.';
     return await fail(supabase, sessionId, message);
   }
@@ -445,6 +483,27 @@ async function loadResumeContext(
 
   const json = JSON.stringify(digest);
   return json.length > 6000 ? `${json.slice(0, 6000)}…` : json;
+}
+
+/**
+ * The resume-match dimension of readiness: the ATS score (0-100) project prep
+ * computed for the resume against this job's description.
+ *
+ * Read from the latest resume version, which is the one prep scored. Null when
+ * the ATS pass failed — `computeReadiness` then keeps whatever it had rather
+ * than recording a zero nobody measured.
+ */
+async function loadResumeMatch(supabase: SupabaseClient, projectId: string): Promise<number | null> {
+  const { data } = await supabase
+    .from('resumes')
+    .select('ats')
+    .eq('project_id', projectId)
+    .order('version', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const score = (data?.ats as { score?: unknown } | null)?.score;
+  return typeof score === 'number' && Number.isFinite(score) ? Math.round(score) : null;
 }
 
 /**
@@ -634,6 +693,8 @@ async function reviewSkillSubmissions(
 
         return { seq: question.seq, review: { validation, outcomes, skill: challenge.skill, format: challenge.format } };
       } catch (err) {
+        // Still running is not failed — the next pass collects it.
+        rethrowIfPending(err);
         console.error('[SV] skill validation failed', context.sessionId, err);
         return null;
       }
@@ -865,7 +926,18 @@ async function mapWithConcurrency<T, R>(
     }
   });
 
-  await Promise.all(workers);
+  /*
+   * `allSettled`, then the first rejection.
+   *
+   * Under a durable run a worker stops at the first call that is still running,
+   * which keeps the fan-out to `limit` calls in flight across passes as well as
+   * within one. `Promise.all` would return on the first of those while its
+   * siblings were still starting theirs.
+   */
+  const settled = await Promise.allSettled(workers);
+  const rejected = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (rejected) throw rejected.reason;
+
   return results;
 }
 

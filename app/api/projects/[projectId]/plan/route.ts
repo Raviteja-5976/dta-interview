@@ -8,23 +8,35 @@
  * also what the page does when the date changes and the existing plan becomes
  * stale — recording the new date immediately means a page reload does not
  * quietly revert it.
+ *
+ * ── Building is a loop, not a request ────────────────────────────────────────
+ * RI, SP and then TR are long outputs, and Amplify ends every request at 30
+ * seconds. So `generate` starts a durable run (lib/pipelines/pipeline-runs.ts)
+ * and advances it by one pass; the page then sends `{ continue: true }` until
+ * the answer stops saying `pending`. `continue` is also how a reopened page
+ * picks up a build that was left running.
  */
 
 import type { NextRequest } from 'next/server';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { createSupabaseServerClient, requireUser } from '@/lib/supabase/server';
-import { runPrepPlan } from '@/lib/pipelines/prep-plan';
+import { createAdminClient } from '@/lib/supabase/admin';
+import { runPrepPlan, type PrepPlanResult } from '@/lib/pipelines/prep-plan';
+import { advanceRun, loadRun, startRun, type PipelineRun } from '@/lib/pipelines/pipeline-runs';
 import { computePrepWindow, isValidIsoDate } from '@/lib/engine/prep-window';
 import { failure, handleRouteError, notFound, ok } from '@/lib/api/respond';
 
-/** Two model calls in parallel, both on medium reasoning over a long output. */
-export const maxDuration = 180;
+/** A pass takes seconds. This is only a ceiling for hosts that honour it. */
+export const maxDuration = 60;
 
 interface PlanBody {
   /** YYYY-MM-DD, in the candidate's own calendar. */
-  interviewDate: string;
+  interviewDate?: string;
   /** False to save the date without spending a generation on it. */
   generate?: boolean;
+  /** Advance the build already running rather than starting a new one. */
+  continue?: boolean;
 }
 
 export async function POST(request: NextRequest, ctx: RouteContext<'/api/projects/[projectId]/plan'>) {
@@ -37,9 +49,9 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/project
     /*
      * Ownership is checked by reading the row through the USER's client, which
      * RLS scopes to their own projects. `runPrepPlan` writes through the same
-     * client, so there is no service-role escalation anywhere in this path —
-     * nothing here needs to bypass the policies that already say who may read a
-     * project.
+     * client, so the plan itself never needs to bypass the policies that already
+     * say who may read a project. The service role is used for one thing only:
+     * the `pipeline_runs` row that tracks the build.
      */
     const { data: project } = await supabase
       .from('projects')
@@ -49,7 +61,15 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/project
 
     if (!project) return notFound();
 
-    const body = (await request.json()) as PlanBody;
+    const body = ((await request.json().catch(() => ({}))) ?? {}) as PlanBody;
+    const admin = createAdminClient();
+
+    if (body.continue) {
+      const run = await loadRun(admin, 'prep_plan', projectId);
+      if (!run) return ok({ status: 'idle' });
+      return await advancePlan(admin, supabase, run, user.id);
+    }
+
     const interviewDate = String(body.interviewDate ?? '').trim();
 
     // Validated rather than trusted: `2026-02-31` parses to March 3rd in a Date
@@ -85,18 +105,57 @@ export async function POST(request: NextRequest, ctx: RouteContext<'/api/project
       );
     }
 
-    const result = await runPrepPlan(supabase, projectId, interviewDate);
-    if (result.status === 'failed') {
-      return failure(422, result.error ?? 'Could not build the plan.');
-    }
+    // A rebuild replaces whatever was running, and cancels its calls.
+    const run = await startRun(admin, {
+      kind: 'prep_plan',
+      subjectId: projectId,
+      userId: user.id,
+      input: { interviewDate },
+      previous: await loadRun(admin, 'prep_plan', projectId),
+    });
 
-    console.info(
-      `[prep-plan] ${projectId} → ${window.daysUntil}d (${window.pressure}), ` +
-        `${result.plan?.schedule.length ?? 0} scheduled days, user ${user.id}`,
-    );
-
-    return ok({ interviewDate, window, generated: true, plan: result.plan });
+    return await advancePlan(admin, supabase, run, user.id);
   } catch (err) {
     return handleRouteError(err);
   }
+}
+
+async function advancePlan(
+  admin: SupabaseClient,
+  supabase: SupabaseClient,
+  run: PipelineRun,
+  userId: string,
+): Promise<Response> {
+  const interviewDate = String(run.input.interviewDate ?? '');
+
+  const snapshot = await advanceRun(admin, run, async () => {
+    const result = await runPrepPlan(supabase, run.subject_id, interviewDate);
+    return { ok: result.status === 'ok', error: result.error, result };
+  });
+
+  if (snapshot.status === 'running') {
+    return ok({ status: 'running', pending: true, interviewDate, progress: snapshot.progress });
+  }
+
+  const result = snapshot.result as PrepPlanResult | null;
+
+  if (snapshot.status === 'failed') {
+    return failure(422, result?.error ?? snapshot.error ?? 'Could not build the plan.');
+  }
+
+  if (snapshot.settledNow) {
+    console.info(
+      `[prep-plan] ${run.subject_id} → ${result?.plan?.window.daysUntil ?? '?'}d ` +
+        `(${result?.plan?.window.pressure ?? '?'}), ${result?.plan?.schedule.length ?? 0} scheduled days, ` +
+        `user ${userId}`,
+    );
+  }
+
+  return ok({
+    status: 'done',
+    interviewDate,
+    window: result?.plan?.window ?? computePrepWindow(interviewDate),
+    generated: true,
+    plan: result?.plan,
+  });
 }

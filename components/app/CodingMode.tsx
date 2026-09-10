@@ -11,16 +11,31 @@
  *   · No scores, no correctness verdict on the answer itself. Pass/fail on a
  *     test is mechanical fact; a judgement about the candidate is not, and
  *     mid-interview evaluation corrupts the data (agentdesign R5).
+ *
+ * The editor works the way LeetCode's does: pick a language and its template
+ * loads; code written in each language is kept separately, so switching back
+ * finds it; Reset restores the template. The template is only the method —
+ * input and output are handled by the harness when the code runs.
+ *
+ * Each language is its own editor document, with its own undo history — so
+ * switching from Python to Java and pressing undo cannot bring the Python back
+ * into the Java editor. Every result says which language it ran as.
  */
 
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, Loader2, Play, Send, X } from 'lucide-react';
+import { Check, Loader2, Minus, Play, RotateCcw, Send, X } from 'lucide-react';
 
 import { Button, Chip } from './ui';
 import MonacoEditor from './MonacoEditor';
-import type { LanguageId, TestResult } from '@/lib/execution/types';
+import {
+  LANGUAGES,
+  type FunctionSignature,
+  type LanguageId,
+  type TestResult,
+  type TestVerdict,
+} from '@/lib/execution/types';
 
 export interface CodingChallengeView {
   index: number;
@@ -34,18 +49,24 @@ export interface CodingChallengeView {
   visible_tests: Array<{ input: string; expected: string }>;
   target_complexity: { time: string; space: string };
   hidden_test_count: number;
+  /** Present for LeetCode-style problems; labels test inputs by parameter. */
+  signature?: FunctionSignature | null;
 }
 
 /** Work in progress, held by the page so it survives the editor closing between turns. */
 export interface CodeDraft {
   language: LanguageId;
   source: string;
+  /** What has been written in each language, so switching back finds it. */
+  byLanguage?: Partial<Record<LanguageId, string>>;
 }
 
 interface RunResponse {
   runnerAvailable: boolean;
   /** The runner had no free capacity. Nothing ran; this is not a failure. */
   busy?: boolean;
+  /** The request itself failed — shown as a message, never as test results. */
+  failed?: boolean;
   message?: string;
   results: TestResult[];
   passed: number;
@@ -53,17 +74,45 @@ interface RunResponse {
   hiddenPassed?: number;
   hiddenTotal?: number;
   compileError?: string;
+  /** What the candidate's own print statements wrote. */
+  log?: string;
+  /** The language the code was run as — shown, so it is never a guess. */
+  language: LanguageId;
 }
 
-function normaliseLanguage(label: string): LanguageId {
-  const l = label.toLowerCase();
-  if (l.includes('python')) return 'python';
-  if (l.includes('typescript')) return 'typescript';
-  if (l.includes('javascript') || l.includes('node')) return 'javascript';
-  if (l.includes('java')) return 'java';
-  if (l.includes('c++') || l.includes('cpp')) return 'cpp';
-  if (l.includes('go')) return 'go';
-  return 'python';
+function labelOf(id: LanguageId): string {
+  return LANGUAGES.find((l) => l.id === id)?.label ?? id;
+}
+
+const VERDICT_LABEL: Record<TestVerdict, string> = {
+  passed: 'Accepted',
+  wrong_answer: 'Wrong answer',
+  runtime_error: 'Runtime error',
+  time_limit: 'Time limit exceeded',
+  compile_error: 'Compile error',
+  internal_error: 'Runner error',
+  not_run: 'Not run',
+};
+
+/**
+ * Starter-code labels → language ids. New challenges store the id itself;
+ * older ones stored a display name ("Python", "Java 17").
+ */
+function normaliseLanguage(label: string): LanguageId | null {
+  const l = label.trim().toLowerCase();
+  if (l.startsWith('python')) return 'python';
+  if (l.startsWith('javascript') || l === 'js' || l.startsWith('node')) return 'javascript';
+  if (l.startsWith('java')) return 'java';
+  if (l === 'cpp' || l.startsWith('c++')) return 'cpp';
+  if (l === 'c' || l.startsWith('c (')) return 'c';
+  return null;
+}
+
+/** A test's JSON lines as LeetCode shows a testcase: `nums = [2,7,11,15]`. */
+function describeInput(input: string, signature?: FunctionSignature | null): string {
+  const lines = input.split('\n');
+  if (!signature || lines.length !== signature.params.length) return input;
+  return lines.map((line, i) => `${signature.params[i].name} = ${line}`).join('\n');
 }
 
 export default function CodingMode({
@@ -93,47 +142,63 @@ export default function CodingMode({
   /** Called once the candidate has submitted and wants to talk it through. */
   onSubmitted: (summary: { passed: number; total: number; language: string; source: string }) => void;
 }) {
-  const languages = useMemo(
-    () => challenge.starter_code.map((s) => ({ id: normaliseLanguage(s.language), raw: s })),
-    [challenge],
-  );
+  /** Each language's template, keyed by id. */
+  const starters = useMemo(() => {
+    const map = new Map<LanguageId, string>();
+    for (const s of challenge.starter_code) {
+      const id = normaliseLanguage(s.language);
+      if (id && !map.has(id)) map.set(id, s.code);
+    }
+    return map;
+  }, [challenge.starter_code]);
+
+  /** The picker, in LeetCode's order, limited to what this problem has templates for. */
+  const languages = useMemo(() => LANGUAGES.filter((l) => starters.has(l.id)), [starters]);
 
   // Lazy initialisers: the restored draft is read once, at mount.
-  const [language, setLanguage] = useState<LanguageId>(
-    () => getDraft?.(challenge.index)?.language ?? languages[0]?.id ?? 'python',
-  );
-  const [source, setSource] = useState(
-    () => getDraft?.(challenge.index)?.source ?? languages[0]?.raw.code ?? '',
-  );
+  const [language, setLanguage] = useState<LanguageId>(() => {
+    const draft = getDraft?.(challenge.index);
+    if (draft && starters.has(draft.language)) return draft.language;
+    return languages[0]?.id ?? 'python';
+  });
+
+  const [byLanguage, setByLanguage] = useState<Partial<Record<LanguageId, string>>>(() => {
+    const draft = getDraft?.(challenge.index);
+    return draft ? { ...(draft.byLanguage ?? {}), [draft.language]: draft.source } : {};
+  });
+
+  // What is in the editor: this language's own work, or its template.
+  const source = byLanguage[language] ?? starters.get(language) ?? '';
+
   const [busy, setBusy] = useState<'run' | 'submit' | null>(null);
   const [result, setResult] = useState<RunResponse | null>(null);
   const [submitted, setSubmitted] = useState(false);
 
+  const setSource = useCallback(
+    (next: string) => setByLanguage((prev) => ({ ...prev, [language]: next })),
+    [language],
+  );
+
   // Mirrored up to the page as it changes. A ref write on the other end, so it
   // costs a function call and no render.
   useEffect(() => {
-    onDraftChange?.(challenge.index, { language, source });
-  }, [challenge.index, language, source, onDraftChange]);
+    onDraftChange?.(challenge.index, { language, source, byLanguage });
+  }, [challenge.index, language, source, byLanguage, onDraftChange]);
 
   /**
-   * Switching language swaps in that language's starter code — but only while
-   * the candidate has not started writing. Replacing work someone has already
-   * done because they tapped the wrong tab is unforgivable.
+   * Back to this language's template.
    *
-   * Done in the handler rather than an effect: this is a response to an event,
-   * not state derived from a render.
+   * Asked first: it throws away work, and a misclick costs someone their
+   * solution in a timed round.
    */
-  const switchLanguage = useCallback(
-    (next: LanguageId) => {
-      const untouched = languages.some((l) => l.raw.code.trim() === source.trim());
-      setLanguage(next);
-      if (untouched) {
-        const starter = languages.find((l) => l.id === next);
-        if (starter) setSource(starter.raw.code);
-      }
-    },
-    [languages, source],
-  );
+  const resetCode = useCallback(() => {
+    if (!window.confirm('Reset to the starting template? Your code in this language will be replaced.')) return;
+    setByLanguage((prev) => {
+      const next = { ...prev };
+      delete next[language];
+      return next;
+    });
+  }, [language]);
 
   const execute = useCallback(
     async (action: 'run' | 'submit') => {
@@ -144,23 +209,51 @@ export default function CodingMode({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action, language, source, challengeIndex: challenge.index }),
         });
-        const data = (await res.json()) as RunResponse;
-        setResult(data);
+        const data = (await res.json().catch(() => null)) as (Partial<RunResponse> & { error?: string }) | null;
 
-        // A busy runner is not a submission — do not advance the round.
-        if (action === 'submit' && res.ok && !data.busy) {
+        /*
+         * Normalised before it reaches state.
+         *
+         * An error response has no `results`, and rendering it as if it did used
+         * to take the whole editor down — so one failed run meant no more runs.
+         * Anything that is not a proper result is shown as a message, and the
+         * editor stays usable.
+         */
+        const ok = res.ok && data !== null;
+        setResult({
+          language,
+          runnerAvailable: data?.runnerAvailable ?? true,
+          busy: data?.busy,
+          failed: !ok,
+          message: ok
+            ? data?.message
+            : (data?.error ?? 'Your code could not be run just now. It is saved — try again.'),
+          results: Array.isArray(data?.results) ? data.results : [],
+          passed: data?.passed ?? 0,
+          total: data?.total ?? 0,
+          hiddenPassed: data?.hiddenPassed,
+          hiddenTotal: data?.hiddenTotal,
+          compileError: data?.compileError,
+          log: data?.log,
+        });
+
+        // A busy runner or a failed request is not a submission — do not
+        // advance the round.
+        if (action === 'submit' && ok && !data?.busy) {
           setSubmitted(true);
           onSubmitted({
-            passed: data.passed ?? 0,
-            total: data.total ?? 0,
+            passed: data?.passed ?? 0,
+            total: data?.total ?? 0,
             language,
             source,
           });
         }
       } catch {
         setResult({
+          language,
           runnerAvailable: false,
-          message: 'Could not reach the code runner. Your code is still saved.',
+          failed: true,
+          message: 'Could not reach the code runner. Your code is still saved — try again.',
           results: [],
           passed: 0,
           total: 0,
@@ -171,6 +264,8 @@ export default function CodingMode({
     },
     [sessionId, language, source, challenge.index, onSubmitted],
   );
+
+  const showMessage = result && (result.failed || result.busy || !result.runnerAvailable) && result.message;
 
   return (
     /*
@@ -266,32 +361,50 @@ export default function CodingMode({
 
         {/* ── Right: the editor ────────────────────────────────────────────── */}
         <div className="flex flex-col min-h-0">
-          <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b-2 border-[#1B1F3B] bg-[#F5EBE0]">
-            {languages.map((l) => (
-              <button
-                key={l.id}
-                onClick={() => switchLanguage(l.id)}
-                className={`px-3 py-1 rounded-full border-2 border-[#1B1F3B] font-[family-name:var(--font-mono)] text-[11px] font-bold uppercase transition-colors ${
-                  language === l.id ? 'bg-[#1B1F3B] text-white' : 'bg-white text-[#1B1F3B]'
-                }`}
-              >
-                {l.raw.language}
-              </button>
-            ))}
+          <div className="shrink-0 flex items-center justify-between gap-2 px-4 py-2 border-b-2 border-[#1B1F3B] bg-[#F5EBE0]">
+            <select
+              aria-label="Language"
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as LanguageId)}
+              className="px-3 py-1 rounded-full border-2 border-[#1B1F3B] bg-white font-[family-name:var(--font-mono)] text-[12px] font-bold text-[#1B1F3B] focus:outline-none focus:ring-2 focus:ring-[#FF6B35]"
+            >
+              {languages.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.label}
+                </option>
+              ))}
+            </select>
+
+            <button
+              type="button"
+              onClick={resetCode}
+              disabled={byLanguage[language] === undefined}
+              className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full border-2 border-[#1B1F3B] bg-white font-[family-name:var(--font-mono)] text-[11px] font-bold uppercase text-[#1B1F3B] disabled:opacity-40"
+              title="Reset to the starting template"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Reset
+            </button>
           </div>
 
           <div className="flex-1 min-h-[320px] lg:min-h-0 bg-[#FFFDF9]">
-            <MonacoEditor language={language} value={source} onChange={setSource} />
+            {/* One document per problem and language — see the file header. */}
+            <MonacoEditor
+              path={`coding-${challenge.index}/solution.${LANGUAGES.find((l) => l.id === language)?.extension ?? language}`}
+              language={language}
+              value={source}
+              onChange={setSource}
+            />
           </div>
 
           {/* Results */}
-          <div className="border-t-4 border-[#1B1F3B] bg-white max-h-64 overflow-y-auto shrink-0">
+          <div className="border-t-4 border-[#1B1F3B] bg-white max-h-72 overflow-y-auto shrink-0">
             {result ? (
               <div className="p-4 space-y-3">
-                {(!result.runnerAvailable || result.busy) && (
+                {showMessage && (
                   <p
                     className={`text-sm p-3 border-2 border-[#1B1F3B] rounded-2xl ${
-                      result.busy ? 'bg-[#FFC93C]/25' : 'text-[#1B1F3B]/75'
+                      result.busy ? 'bg-[#FFC93C]/25' : result.failed ? 'bg-[#FF5C7A]/10' : 'text-[#1B1F3B]/75'
                     }`}
                   >
                     {result.message}
@@ -301,40 +414,92 @@ export default function CodingMode({
                 {result.compileError && (
                   <div className="p-3 border-2 border-[#FF5C7A] rounded-2xl bg-[#FF5C7A]/10">
                     <p className="font-[family-name:var(--font-mono)] text-[11px] font-bold uppercase tracking-wider mb-1">
-                      Compile error
+                      Compile error · {labelOf(result.language)}
                     </p>
-                    <pre className="font-[family-name:var(--font-mono)] text-xs whitespace-pre-wrap">
+                    <pre className="font-[family-name:var(--font-mono)] text-xs whitespace-pre-wrap break-words">
                       {result.compileError}
                     </pre>
                   </div>
                 )}
 
-                {result.results.map((r, i) => (
-                  <div key={i} className="flex items-start gap-2 text-xs">
-                    <span
-                      className="shrink-0 w-5 h-5 mt-0.5 rounded-full border-2 border-[#1B1F3B] flex items-center justify-center"
-                      style={{ backgroundColor: r.verdict === 'passed' ? '#6EE7B7' : '#FF5C7A' }}
-                    >
-                      {r.verdict === 'passed' ? <Check className="w-3 h-3" /> : <X className="w-3 h-3" />}
-                    </span>
-                    <div className="min-w-0 font-[family-name:var(--font-mono)]">
-                      <p className="font-bold">
-                        Test {i + 1} · {r.verdict.replace(/_/g, ' ')}
-                      </p>
-                      {r.verdict !== 'passed' && (
-                        <p className="text-[#1B1F3B]/65 break-words">
-                          expected <span className="text-[#1B1F3B]">{r.expected}</span> · got{' '}
-                          <span className="text-[#1B1F3B]">{r.actual || '(nothing)'}</span>
+                {!result.compileError && result.results.length > 0 && (
+                  <p className="font-[family-name:var(--font-mono)] text-xs font-bold">
+                    Ran as {labelOf(result.language)} ·{' '}
+                    {result.results.filter((r) => r.verdict === 'passed').length}/{result.results.length} test
+                    {result.results.length === 1 ? '' : 's'} passed
+                  </p>
+                )}
+
+                {/* A result from another language is still on screen after a switch. */}
+                {result.language !== language && (
+                  <p className="text-xs p-2 border-2 border-dashed border-[#1B1F3B]/40 rounded-xl text-[#1B1F3B]/75">
+                    These results are from your {labelOf(result.language)} code. Run again to test your{' '}
+                    {labelOf(language)} code.
+                  </p>
+                )}
+
+                {!result.compileError &&
+                  result.results.map((r, i) => (
+                    <div key={i} className="flex items-start gap-2 text-xs">
+                      <span
+                        className="shrink-0 w-5 h-5 mt-0.5 rounded-full border-2 border-[#1B1F3B] flex items-center justify-center"
+                        style={{
+                          backgroundColor:
+                            r.verdict === 'passed' ? '#6EE7B7' : r.verdict === 'not_run' ? '#E5E1DA' : '#FF5C7A',
+                        }}
+                      >
+                        {r.verdict === 'passed' ? (
+                          <Check className="w-3 h-3" />
+                        ) : r.verdict === 'not_run' ? (
+                          <Minus className="w-3 h-3" />
+                        ) : (
+                          <X className="w-3 h-3" />
+                        )}
+                      </span>
+                      <div className="min-w-0 flex-1 font-[family-name:var(--font-mono)]">
+                        <p className="font-bold">
+                          Case {i + 1} · {VERDICT_LABEL[r.verdict] ?? r.verdict}
                         </p>
-                      )}
-                      {r.stderr && (
-                        <pre className="text-[#FF5C7A] whitespace-pre-wrap break-words mt-0.5">
-                          {r.stderr.slice(0, 300)}
-                        </pre>
-                      )}
+                        {r.verdict !== 'passed' && r.verdict !== 'not_run' && (
+                          <div className="mt-1 space-y-1 text-[#1B1F3B]/70">
+                            <div>
+                              <span className="text-[#1B1F3B]/55">Input</span>
+                              <pre className="whitespace-pre-wrap break-words text-[#1B1F3B]">
+                                {describeInput(r.input, challenge.signature)}
+                              </pre>
+                            </div>
+                            <p className="break-words">
+                              <span className="text-[#1B1F3B]/55">Expected </span>
+                              <span className="text-[#1B1F3B]">{r.expected}</span>
+                            </p>
+                            {r.verdict === 'wrong_answer' && (
+                              <p className="break-words">
+                                <span className="text-[#1B1F3B]/55">Output </span>
+                                <span className="text-[#1B1F3B]">{r.actual || '(nothing)'}</span>
+                              </p>
+                            )}
+                          </div>
+                        )}
+                        {r.stderr && (
+                          <pre className="text-[#FF5C7A] whitespace-pre-wrap break-words mt-1">
+                            {r.stderr.slice(0, 800)}
+                          </pre>
+                        )}
+                      </div>
                     </div>
+                  ))}
+
+                {/* Their own print statements — kept apart from the answers. */}
+                {result.log && (
+                  <div className="pt-2 border-t-2 border-[#1B1F3B]/15">
+                    <p className="font-[family-name:var(--font-mono)] text-[11px] font-bold uppercase tracking-wider text-[#1B1F3B]/55 mb-1">
+                      Stdout
+                    </p>
+                    <pre className="font-[family-name:var(--font-mono)] text-xs whitespace-pre-wrap break-words">
+                      {result.log.slice(0, 2000)}
+                    </pre>
                   </div>
-                ))}
+                )}
 
                 {/* Hidden tests: a tally only, and only after submitting. */}
                 {result.hiddenTotal !== undefined && (
@@ -346,9 +511,23 @@ export default function CodingMode({
                 )}
               </div>
             ) : (
-              <p className="p-4 font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/55">
-                Run your code against the examples, then submit when you&apos;re happy with it.
-              </p>
+              // Before the first run: the testcases, as LeetCode shows them.
+              <div className="p-4 space-y-3">
+                <p className="font-[family-name:var(--font-mono)] text-[11px] font-bold uppercase tracking-wider text-[#1B1F3B]/55">
+                  Testcases
+                </p>
+                {challenge.visible_tests.map((t, i) => (
+                  <div key={i} className="font-[family-name:var(--font-mono)] text-xs">
+                    <p className="font-bold">Case {i + 1}</p>
+                    <pre className="whitespace-pre-wrap break-words text-[#1B1F3B]/75">
+                      {describeInput(t.input, challenge.signature)}
+                    </pre>
+                  </div>
+                ))}
+                <p className="text-xs text-[#1B1F3B]/60">
+                  Run your code against these, then submit when you&apos;re happy with it.
+                </p>
+              </div>
             )}
           </div>
 
@@ -356,7 +535,7 @@ export default function CodingMode({
           <div className="shrink-0 border-t-2 border-[#1B1F3B] p-3 flex items-center justify-between gap-3 bg-[#F5EBE0]">
             <Button variant="secondary" onClick={() => void execute('run')} disabled={busy !== null}>
               {busy === 'run' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-              Run tests
+              Run
             </Button>
 
             <Button onClick={() => void execute('submit')} disabled={busy !== null}>

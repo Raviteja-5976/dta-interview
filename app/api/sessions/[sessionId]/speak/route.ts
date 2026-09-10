@@ -35,10 +35,13 @@ import { failure, handleRouteError, notFound } from '@/lib/api/respond';
 export const maxDuration = 60;
 
 /**
- * An utterance is one or two sentences. The cap is what stops this being a
- * general-purpose TTS endpoint for anyone with an account.
+ * One turn's speech: acknowledgement, transition and question, joined into a
+ * single stream so there is no gap between them (see resolveAudio in the turn
+ * route). Those cap at 80 + 160 + 500 characters, so this leaves room for them
+ * and not much else — the cap is what stops this being a general-purpose TTS
+ * endpoint for anyone with an account.
  */
-const MAX_CHARS = 600;
+const MAX_CHARS = 900;
 
 export async function GET(request: NextRequest, ctx: RouteContext<'/api/sessions/[sessionId]/speak'>) {
   try {

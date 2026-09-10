@@ -33,6 +33,8 @@
 
 import { z } from 'zod';
 
+import { VALUE_TYPES } from '../execution/types';
+
 const score10 = z.number().min(0).max(10);
 const confidence = z.number().min(0).max(1);
 
@@ -489,7 +491,30 @@ export const dsaTopic = z.enum([
 ]);
 export type DsaTopic = z.infer<typeof dsaTopic>;
 
-export const codingChallengeSchema = z.object({
+/**
+ * The one method the candidate writes, LeetCode-style.
+ *
+ * The harness (lib/execution/harness.ts) generates the starter code for every
+ * language and the hidden program around it from this, so the model never
+ * writes I/O or starter code — the two things it used to get wrong in ways that
+ * failed a candidate before their own code ran.
+ */
+export const functionSignatureSchema = z.object({
+  function_name: z.string().describe('camelCase method name, e.g. "twoSum".'),
+  params: z
+    .array(z.object({ name: z.string().describe('camelCase parameter name.'), type: z.enum(VALUE_TYPES) }))
+    .min(1)
+    .max(4),
+  return_type: z.enum(VALUE_TYPES),
+});
+
+const codingTestSchema = z.object({
+  input: z.string().describe('One JSON value per line, one line per parameter, in parameter order.'),
+  expected: z.string().describe('The JSON of the value the method must return.'),
+});
+
+/** What P7 writes. Starter code is added in code — see `codingChallengeSchema`. */
+export const codingChallengeDraftSchema = z.object({
   v: z.literal(3),
   title: z.string().describe('A LeetCode-style name, e.g. "Longest Substring Without Repeating Characters".'),
   topic: dsaTopic,
@@ -498,12 +523,21 @@ export const codingChallengeSchema = z.object({
   problem_statement: z.string(),
   /** The bounds on n and on the values, which is what decides the target complexity. */
   constraints: z.array(z.string()).min(1).max(6),
-  input_format: z.string(),
-  output_format: z.string(),
-  examples: z.array(z.object({ input: z.string(), output: z.string(), explanation: z.string() })).min(1).max(3),
-  starter_code: z.array(z.object({ language: z.string(), code: z.string() })).min(1).max(4),
-  visible_tests: z.array(z.object({ input: z.string(), expected: z.string() })).min(1).max(5),
-  hidden_tests: z.array(z.object({ input: z.string(), expected: z.string() })).min(1).max(8),
+  input_format: z.string().describe('The parameters, in words.'),
+  output_format: z.string().describe('What the method returns, in words.'),
+  signature: functionSignatureSchema,
+  examples: z
+    .array(
+      z.object({
+        input: z.string().describe('As LeetCode shows it: nums = [2,7,11,15], target = 9'),
+        output: z.string(),
+        explanation: z.string(),
+      }),
+    )
+    .min(1)
+    .max(3),
+  visible_tests: z.array(codingTestSchema).min(1).max(5),
+  hidden_tests: z.array(codingTestSchema).min(1).max(8),
   target_complexity: z.object({ time: z.string(), space: z.string() }),
   /** The naive approach and why it is not good enough. What the follow-up talks about. */
   brute_force_note: z.string(),
@@ -512,6 +546,16 @@ export const codingChallengeSchema = z.object({
   /** Asked out loud once the code is submitted — the "now make it better" question. */
   follow_up_question: z.string(),
   skill_tags: z.array(z.string()).max(6),
+});
+export type CodingChallengeDraft = z.infer<typeof codingChallengeDraftSchema>;
+
+/**
+ * What is stored and served: the draft, plus starter code for every language
+ * generated from its signature. Challenges stored before signatures existed
+ * have no `signature` and whole-program starter code; readers check.
+ */
+export const codingChallengeSchema = codingChallengeDraftSchema.extend({
+  starter_code: z.array(z.object({ language: z.string(), code: z.string() })).min(1).max(5),
 });
 export type CodingChallenge = z.infer<typeof codingChallengeSchema>;
 

@@ -46,6 +46,7 @@
  *   #9 — grading_mode assigned here and never changed.
  */
 
+import { throwIfAnyPending } from '../ai/durable';
 import { runAgent } from '../ai/run';
 import type { RunContext } from '../ai/types';
 import { SECTION_QUESTION_BUDGET } from '../engine/types';
@@ -108,6 +109,7 @@ Questions that are only "tell me about your project" cannot distinguish someone 
 
 - targets_evidence links each question to what it is trying to surface. Be accurate; the interviewer selects by gap.
 - Questions must be speakable. This is voice — a candidate hears it once. One question per question. No multi-part questions, no parentheticals, nothing over about 30 words.
+- STRICT: the candidate has nothing to write on in this section — no editor, no whiteboard, no paper. Never ask them to write, type, code, sketch, draw or diagram anything, and never ask for pseudocode, a query or a snippet. Ask them to explain it out loud: "Talk me through the query you'd write to find duplicates", never "Write a query that finds duplicates". The coding and skill rounds are separate sections with an editor; this section is conversation only.
 
 ### Every question carries its own frame
 
@@ -393,6 +395,29 @@ function warmUpSection(): BlueprintSection {
         ],
       },
     ],
+  };
+}
+
+/**
+ * The first thing the candidate hears: the warm-up's opening seed.
+ *
+ * The live turn speaks it verbatim on the opening turn, and session prep
+ * renders it to audio ahead of time, so the interview opens on a cached clip
+ * rather than a model call followed by a synthesis. Both read it from here so
+ * they cannot disagree about the words — a clip only plays on an exact match.
+ */
+export function openingSeed(
+  section: BlueprintSection | undefined,
+): { bank_id: string; text: string; goal_id: string; targets_evidence: string[] } | null {
+  if (section?.type !== 'intro') return null;
+  const goal = section.goals[0];
+  const seed = goal?.question_bank[0];
+  if (!goal || !seed?.text.trim()) return null;
+  return {
+    bank_id: seed.bank_id,
+    text: seed.text,
+    goal_id: goal.goal_id,
+    targets_evidence: seed.targets_evidence,
   };
 }
 
@@ -698,6 +723,8 @@ function buildFallbackSection(
   planned: Strategy['sections'][number],
   index: number,
   ctx: BlueprintContext,
+  /** Build goals for exactly these skills, instead of the top gaps. */
+  onlySkills?: string[],
 ): BlueprintSection {
   const timeBudgetSec = Math.round(planned.minutes * 60);
   const timeCeilingSec = Math.round(planned.minutes * 60 * 1.25);
@@ -709,7 +736,13 @@ function buildFallbackSection(
     .sort((a, b) => b.investigation_priority - a.investigation_priority);
 
   const topSkills = candidateSkills.slice(0, 2).map((s) => s.skill);
-  const targetSkills = topSkills.length > 0 ? topSkills : (ctx.priority_skills.slice(0, 2).length ? ctx.priority_skills.slice(0, 2) : [input.roleTitle]);
+  const targetSkills = onlySkills?.length
+    ? onlySkills
+    : topSkills.length > 0
+      ? topSkills
+      : ctx.priority_skills.slice(0, 2).length
+        ? ctx.priority_skills.slice(0, 2)
+        : [input.roleTitle];
 
   const goals = targetSkills.map((skill, sIdx) => {
     const goalId = `goal_${planned.type}_${index + 1}_${sIdx + 1}`;
@@ -811,6 +844,114 @@ function buildFallbackSection(
   };
 }
 
+// ── Focus skills ─────────────────────────────────────────────────────────────
+
+function sameSkill(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+/** True when a goal is about one of these skills — tagged with it, or naming it. */
+export function goalServesFocus(
+  goal: { skill_tags: string[]; statement: string },
+  focusSkills: string[],
+): boolean {
+  return focusSkills.some((skill) => {
+    const key = skill.trim().toLowerCase();
+    if (!key) return false;
+    return goal.skill_tags.some((tag) => sameSkill(tag, skill)) || goal.statement.toLowerCase().includes(key);
+  });
+}
+
+/**
+ * Which conversational section carries which focus skill.
+ *
+ * Decided here, in code, because the sections are written in parallel and
+ * cannot coordinate: left to each call, either every section picks the same
+ * focus skill or each assumes another one has it. A skill the resume evidences
+ * (STRONG or WEAK) goes with resume verification; anything else goes with the
+ * role's requirements; and the load is spread when there is a choice.
+ *
+ * Never the behavioural round: every item in it is graded as behavioural, so a
+ * technical focus goal there would be scored by the wrong instrument.
+ */
+function assignFocusSkills(
+  planned: Strategy['sections'],
+  focusSkills: string[],
+  gap: GapReport,
+): Map<number, string[]> {
+  const out = new Map<number, string[]>();
+
+  const technical = planned.flatMap((s, index) =>
+    s.type === 'resume_skills' || s.type === 'role_skills' ? [{ type: s.type, index }] : [],
+  );
+  if (technical.length === 0) return out;
+
+  const seen = new Set<string>();
+  for (const raw of focusSkills) {
+    const skill = raw.trim();
+    if (!skill || seen.has(skill.toLowerCase())) continue;
+    seen.add(skill.toLowerCase());
+
+    const status = gap.skills.find((g) => sameSkill(g.skill, skill))?.status;
+    const wanted = status === 'STRONG' || status === 'WEAK' ? 'resume_skills' : 'role_skills';
+    const pool = technical.filter((t) => t.type === wanted);
+    const candidates = pool.length > 0 ? pool : technical;
+
+    // The least-loaded candidate; ties go to the earlier section.
+    const load = (i: number) => out.get(i)?.length ?? 0;
+    const target = candidates.reduce((best, t) => (load(t.index) < load(best.index) ? t : best));
+
+    out.set(target.index, [...(out.get(target.index) ?? []), skill]);
+  }
+
+  return out;
+}
+
+/** What a section is told about focus skills — its own, or that others have them. */
+function focusBrief(assigned: string[], all: string[]): string {
+  if (assigned.length > 0) {
+    return (
+      `FOCUS SKILLS FOR THIS SECTION — the candidate asked to be interviewed on ${assigned.join(', ')}. ` +
+      'Add at least one goal about each (two closely related skills may share a goal), and put the skill in that goal\'s skill_tags exactly as written here. ' +
+      'These are ADDED to this section\'s plan, not a replacement for it: the rest of the section is still built from the gap report above, and at least one goal must come from it.'
+    );
+  }
+  if (all.length > 0) {
+    return `The candidate's focus skills (${all.join(', ')}) are covered by other sections. Build this one from the gap report as usual.`;
+  }
+  return '';
+}
+
+/**
+ * Makes sure every focus skill assigned to a section has a goal in it.
+ *
+ * The section prompt asks for one; this is the guarantee. A skill the model
+ * left out gets a goal built in code — the same shape the fallback section
+ * uses — so the live interviewer always has it to pursue. Goals written from
+ * the gap report are left exactly as they are: focus goals are added to a
+ * section, never swapped in for its own.
+ */
+function ensureFocusCoverage(
+  section: BlueprintSection,
+  assigned: string[],
+  input: BlueprintInput,
+  planned: Strategy['sections'][number],
+  index: number,
+  ctx: BlueprintContext,
+): BlueprintSection {
+  const missing = assigned.filter((skill) => !section.goals.some((g) => goalServesFocus(g, [skill])));
+  if (missing.length === 0) return section;
+
+  console.info(`[P6] ${section.section_id}: adding goals for focus skills the section left out — ${missing.join(', ')}`);
+  const added = buildFallbackSection(input, planned, index, ctx, missing).goals.map((goal) => ({
+    ...goal,
+    // Distinct from anything the model or the fallback section wrote.
+    goal_id: `${goal.goal_id}_focus`,
+  }));
+
+  return { ...section, goals: [...section.goals, ...added] };
+}
+
 // ── One conversational section, one model call ───────────────────────────────
 
 async function runSection(
@@ -819,6 +960,8 @@ async function runSection(
   index: number,
   siblings: Strategy['sections'],
   ctx: BlueprintContext,
+  /** Focus skills this section is responsible for. See assignFocusSkills. */
+  assignedFocus: string[],
   context?: RunContext,
 ): Promise<BlueprintSection> {
   const budget = SECTION_QUESTION_BUDGET[input.difficulty];
@@ -896,9 +1039,7 @@ async function runSection(
       // classes and none of them investigates anything properly.
       'That split is for the interview as a whole. Weight THIS section towards whichever classes its purpose calls for, and do not try to satisfy all three inside one section.',
       '',
-      ctx.focus_skills?.length
-        ? `FOCUS SKILLS — the candidate explicitly asked to be interviewed on: ${ctx.focus_skills.join(', ')}. Where one of these belongs in this section's purpose, build a goal around it and name it in question_focus. Prefer it over an equally-ranked skill; never leave this section's purpose to reach one.`
-        : '',
+      focusBrief(assignedFocus, ctx.focus_skills ?? []),
       '',
       `PACING: this section will ask ${budget.min}-${budget.max} questions. Size its goals and evidence so there is genuinely that much to establish — a section with one thin goal leaves the interviewer circling. ${planned.type === 'behavioral' ? 'EVERY evidence item in this section must carry grading_mode "behavioral" - it is the behavioural round.' : 'At least one evidence item must carry grading_mode "factual".'}`,
       `Set section_id to "${planned.type}_${index + 1}", type to "${planned.type}", title to "${planned.title}", time_budget_sec to ${Math.round(planned.minutes * 60)} and time_ceiling_sec to ${Math.round(planned.minutes * 60 * 1.25)}.`,
@@ -923,6 +1064,12 @@ export async function runBlueprint(
 ): Promise<Blueprint> {
   const ctx = buildContext(input);
   const planned = input.strategy.sections;
+  const focusBySection = assignFocusSkills(planned, input.focusSkills ?? [], input.gap);
+
+  // Applied to every conversational section however it was produced —
+  // generated, or the fallback that stands in for a failed call.
+  const withFocus = (section: BlueprintSection, i: number) =>
+    ensureFocusCoverage(section, focusBySection.get(i) ?? [], input, planned[i], i, ctx);
 
   const started = Date.now();
 
@@ -941,16 +1088,21 @@ export async function runBlueprint(
       case 'skill_challenge':
         return moduleSection(section, index, section.type);
       default:
-        return runSection(input, section, index, planned, ctx, context);
+        return runSection(input, section, index, planned, ctx, focusBySection.get(index) ?? [], context);
     }
   });
 
   const settled = await Promise.allSettled(jobs);
 
+  // A section still being written is not a failed one, and must not be swapped
+  // for a fallback. Under a durable run the blueprint is assembled on the pass
+  // where every section has landed.
+  throwIfAnyPending(settled);
+
   const sections: BlueprintSection[] = [];
   for (const [i, outcome] of settled.entries()) {
     if (outcome.status === 'fulfilled' && outcome.value) {
-      sections.push(outcome.value);
+      sections.push(withFocus(outcome.value, i));
     } else {
       const plannedSection = planned[i];
       if (plannedSection && !['intro', 'closing', 'coding', 'skill_challenge'].includes(plannedSection.type)) {
@@ -958,7 +1110,7 @@ export async function runBlueprint(
           `[P6] conversational section ${plannedSection.type} (${plannedSection.title}) failed; using fallback section instead of dropping:`,
           outcome.status === 'rejected' ? outcome.reason : 'empty',
         );
-        sections.push(buildFallbackSection(input, plannedSection, i, ctx));
+        sections.push(withFocus(buildFallbackSection(input, plannedSection, i, ctx), i));
       } else {
         console.warn(
           `[P6] section ${plannedSection?.type} (${plannedSection?.title}) failed and was dropped:`,

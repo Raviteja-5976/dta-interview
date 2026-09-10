@@ -1,24 +1,38 @@
 /**
  * `runAgent` — the single entry point every LLM agent in this system goes through.
  *
- * It owns the five things that must not be re-implemented per agent:
+ * It owns the six things that must not be re-implemented per agent:
  *   1. Provider/model resolution (env-driven, see config.ts)
  *   2. A hard wall-clock timeout per attempt
  *   3. Retries with backoff, on transport errors only
  *   4. Fallback on failure — invariant 12, degrade texture, never terminate
  *   5. Cost/latency/token accounting into `agent_runs`
+ *   6. Durable execution inside a pipeline pass — a call started as an OpenAI
+ *      background job in one request and collected in a later one (durable.ts)
  *
  * Agents supply a Zod schema and prompts. They never see a model name, an API
- * key, or a retry loop.
+ * key, a retry loop, or which request their call finishes in.
  */
 
-import { generateObject, NoObjectGeneratedError } from 'ai';
+import { createHash } from 'node:crypto';
+
+import { asSchema, generateObject, NoObjectGeneratedError } from 'ai';
 import type { z } from 'zod';
 
-import type { AgentId, AgentRunResult, ReasoningEffort, RunContext } from './types';
+import type { AgentId, AgentPolicy, AgentRunResult, ReasoningEffort, RunContext } from './types';
 import { computeCostUsd, resolveReasoningEffort } from './catalog';
 import { getPolicy } from './config';
-import { resolveModelForAgent, MissingProviderKeyError } from './registry';
+import { currentDurableContext, PendingWork, type DurableContext, type DurableJob } from './durable';
+import {
+  cancelResponse,
+  createBackgroundResponse,
+  isTerminal,
+  isTransientHttpError,
+  readOutput,
+  retrieveResponse,
+  type ResponseObject,
+} from './openai-background';
+import { resolveModelForAgent, MissingProviderKeyError, type ResolvedModel } from './registry';
 import { recordAgentRun } from './telemetry';
 
 /**
@@ -82,6 +96,16 @@ export interface RunAgentOptions<T> {
 }
 
 export async function runAgent<T>(opts: RunAgentOptions<T>): Promise<AgentRunResult<T>> {
+  // Inside a pipeline pass every call is durable: started once, polled across
+  // requests, and replayed from the run's state after it lands. See durable.ts.
+  const durable = currentDurableContext();
+  if (durable) return durable.track(runDurably(opts, durable));
+
+  return runInline(opts);
+}
+
+/** One call, start to finish, inside this request — the live loop's path. */
+async function runInline<T>(opts: RunAgentOptions<T>): Promise<AgentRunResult<T>> {
   const { agent, schema, system, prompt, context, fallback, meta } = opts;
   const policy = getPolicy(agent);
   const timeoutMs = opts.timeoutMs ?? policy.timeoutMs;
@@ -367,4 +391,368 @@ function describeError(err: unknown): string {
     return err.message.slice(0, 300);
   }
   return 'unknown_error';
+}
+
+// ── Durable execution ────────────────────────────────────────────────────────
+
+/**
+ * A background call's per-attempt wall clock: the agent's own timeout plus room
+ * for queueing, which background requests are subject to and an inline call is
+ * not. Past it the call is cancelled and counted as a timeout — and not
+ * retried, the same rule `isTransient` applies inline.
+ */
+const BACKGROUND_QUEUE_GRACE_MS = 60_000;
+
+/**
+ * Background mode is OpenAI's. Any other provider runs inline inside the pass —
+ * still memoised, so it runs once per run rather than once per pass, but bounded
+ * again by the host's request limit. `AI_BACKGROUND=off` forces that path.
+ */
+function usesBackground(resolved: ResolvedModel): boolean {
+  return resolved.provider === 'openai' && process.env.AI_BACKGROUND !== 'off';
+}
+
+/**
+ * A call's identity across passes: the agent, the model, and exactly what it
+ * was asked. Two passes that build the same prompt find the same job — which is
+ * why durable.ts insists that anything non-deterministic feeding a prompt goes
+ * through `memo`.
+ */
+function jobKey(agent: AgentId, model: string, system: string, prompt: string): string {
+  const digest = createHash('sha256')
+    .update(model)
+    .update('\0')
+    .update(system)
+    .update('\0')
+    .update(prompt)
+    .digest('hex');
+  return `${agent}:${digest.slice(0, 24)}`;
+}
+
+function newJob(agent: AgentId, resolved: ResolvedModel, now: number): DurableJob {
+  return {
+    agent,
+    provider: resolved.provider,
+    model: resolved.modelId,
+    status: 'pending',
+    responseId: null,
+    startedAt: now,
+    attemptStartedAt: now,
+    attempts: 0,
+    retryAt: null,
+  };
+}
+
+async function runDurably<T>(opts: RunAgentOptions<T>, durable: DurableContext): Promise<AgentRunResult<T>> {
+  const { agent } = opts;
+  const policy = getPolicy(agent);
+
+  let resolved: ResolvedModel;
+  try {
+    resolved = resolveModelForAgent(agent);
+  } catch {
+    // No key for the provider. The inline path owns that outcome — the fallback
+    // or an AgentError — and there is nothing durable about it.
+    return runInline(opts);
+  }
+
+  const key = jobKey(agent, resolved.modelId, opts.system, opts.prompt);
+  let job = durable.state.jobs[key];
+
+  // Settled on an earlier pass: replay it. Telemetry was written when it settled.
+  if (job?.status === 'done') return replayDone(job, opts);
+  if (job?.status === 'failed') return replayFailed(job, opts);
+
+  if (!usesBackground(resolved)) return runInlineMemoised(opts, resolved, durable, key);
+
+  if (!job) {
+    if (!durable.canStartWork()) {
+      durable.markPending();
+      throw new PendingWork();
+    }
+    job = newJob(agent, resolved, Date.now());
+    durable.state.jobs[key] = job;
+  }
+
+  await advanceBackgroundJob(job, opts, resolved, policy, durable);
+
+  if (job.status === 'pending') {
+    durable.markPending();
+    throw new PendingWork();
+  }
+
+  recordSettledJob(job, opts, resolved, policy);
+  return job.status === 'done' ? replayDone(job, opts) : replayFailed(job, opts);
+}
+
+/**
+ * Moves one background call as far as it will go in this request: starts it,
+ * restarts it after a transient failure, or polls it.
+ */
+async function advanceBackgroundJob<T>(
+  job: DurableJob,
+  opts: RunAgentOptions<T>,
+  resolved: ResolvedModel,
+  policy: AgentPolicy,
+  durable: DurableContext,
+): Promise<void> {
+  const now = Date.now();
+  const deadlineMs = policy.timeoutMs + BACKGROUND_QUEUE_GRACE_MS;
+
+  // ── Start, or restart after a transient failure ──────────────────────────
+  if (!job.responseId) {
+    if (job.retryAt !== null && now < job.retryAt) return;
+    if (!durable.canStartWork()) return;
+
+    job.attempts += 1;
+    job.attemptStartedAt = now;
+    job.retryAt = null;
+
+    try {
+      const created = await createBackgroundResponse(await backgroundRequest(opts, resolved, policy));
+      job.responseId = created.id;
+      if (isTerminal(created.status)) settleFromResponse(job, created, opts, policy);
+    } catch (err) {
+      if (isTransientHttpError(err) && job.attempts < policy.maxRetries + 1) {
+        job.retryAt = now + backoffMs(job.attempts);
+      } else {
+        failJob(job, describeError(err));
+      }
+    }
+    return;
+  }
+
+  // ── Poll ─────────────────────────────────────────────────────────────────
+  let response: ResponseObject;
+  try {
+    response = await retrieveResponse(job.responseId);
+  } catch {
+    // A failed poll is not a failed call — it is still running on OpenAI's side.
+    // Try again next pass, unless it has outlived its deadline regardless.
+    if (now - job.attemptStartedAt > deadlineMs) {
+      await cancelResponse(job.responseId);
+      failJob(job, 'timeout');
+    }
+    return;
+  }
+
+  if (!isTerminal(response.status)) {
+    if (now - job.attemptStartedAt > deadlineMs) {
+      await cancelResponse(job.responseId);
+      failJob(job, 'timeout');
+    }
+    return;
+  }
+
+  settleFromResponse(job, response, opts, policy);
+}
+
+/**
+ * Reads a finished response into the job. Validation is the same contract the
+ * inline path gets from `generateObject`: the Zod schema, or a schema violation.
+ */
+function settleFromResponse<T>(
+  job: DurableJob,
+  response: ResponseObject,
+  opts: RunAgentOptions<T>,
+  policy: AgentPolicy,
+): void {
+  job.inputTokens = (job.inputTokens ?? 0) + (response.usage?.input_tokens ?? 0);
+  job.outputTokens = (job.outputTokens ?? 0) + (response.usage?.output_tokens ?? 0);
+  job.reasoningTokens =
+    (job.reasoningTokens ?? 0) + (response.usage?.output_tokens_details?.reasoning_tokens ?? 0);
+
+  if (response.status === 'completed') {
+    const { text, refusal } = readOutput(response);
+    if (!text) {
+      failJob(job, refusal ? `refusal: ${refusal.slice(0, 200)}` : 'schema_violation');
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      failJob(job, 'schema_violation');
+      return;
+    }
+
+    const checked = opts.schema.safeParse(parsed);
+    if (!checked.success) {
+      failJob(job, 'schema_violation');
+      return;
+    }
+
+    job.status = 'done';
+    job.ok = true;
+    job.data = checked.data;
+    return;
+  }
+
+  if (response.status === 'failed') {
+    const code = response.error?.code ?? 'failed';
+    // Retried as a fresh call on a later pass, within the agent's retry budget.
+    if (/server_error|rate_limit/i.test(code) && job.attempts < policy.maxRetries + 1) {
+      job.responseId = null;
+      job.retryAt = Date.now() + backoffMs(job.attempts);
+      return;
+    }
+    failJob(job, `${code}: ${response.error?.message ?? ''}`.slice(0, 300));
+    return;
+  }
+
+  if (response.status === 'incomplete') {
+    // Almost always max_output_tokens: the reasoning ate the budget. Not
+    // retried, for the same reason a schema violation is not — it will recur.
+    failJob(job, `incomplete: ${response.incomplete_details?.reason ?? 'unknown'}`);
+    return;
+  }
+
+  failJob(job, response.status === 'cancelled' ? 'cancelled' : `unexpected status ${response.status}`);
+}
+
+function failJob(job: DurableJob, error: string): void {
+  job.status = 'failed';
+  job.ok = false;
+  job.error = error;
+}
+
+/** Written once, on the pass where the call settled — never on a replay. */
+function recordSettledJob<T>(
+  job: DurableJob,
+  opts: RunAgentOptions<T>,
+  resolved: ResolvedModel,
+  policy: AgentPolicy,
+): void {
+  job.latencyMs = Date.now() - job.startedAt;
+  job.costUsd = computeCostUsd(resolved.spec, job.inputTokens, job.outputTokens);
+
+  recordAgentRun({
+    agent: opts.agent,
+    phase: policy.phase,
+    provider: resolved.provider,
+    model: resolved.modelId,
+    latencyMs: job.latencyMs,
+    inputTokens: job.inputTokens || undefined,
+    outputTokens: job.outputTokens || undefined,
+    costUsd: job.costUsd,
+    ok: job.status === 'done',
+    context: opts.context,
+    meta: {
+      ...opts.meta,
+      attempts: job.attempts,
+      tier: policy.tier,
+      overridden: resolved.isOverridden,
+      reasoning_effort: policy.reasoningEffort,
+      reasoning_tokens: job.reasoningTokens || undefined,
+      // Latency here is wall clock across passes, so it carries up to one poll
+      // interval of slack on top of the model's own time.
+      background: true,
+      ...(job.status === 'failed' ? { error: job.error } : {}),
+    },
+  });
+}
+
+function replayDone<T>(job: DurableJob, opts: RunAgentOptions<T>): AgentRunResult<T> {
+  return {
+    ok: job.ok ?? true,
+    data: job.data as T,
+    fromFallback: job.fromFallback ?? false,
+    meta: {
+      agent: opts.agent,
+      provider: job.provider,
+      model: job.model,
+      latencyMs: job.latencyMs ?? 0,
+      inputTokens: job.inputTokens,
+      outputTokens: job.outputTokens,
+      reasoningTokens: job.reasoningTokens || undefined,
+      costUsd: job.costUsd,
+      attempts: job.attempts,
+    },
+  };
+}
+
+/** Exactly what the inline path does with a spent call: the fallback, or throw. */
+function replayFailed<T>(job: DurableJob, opts: RunAgentOptions<T>): AgentRunResult<T> {
+  const error = job.error ?? 'failed';
+  if (opts.fallback) {
+    return fallbackResult(opts.agent, opts.fallback, job.latencyMs ?? 0, error, {
+      provider: job.provider,
+      model: job.model,
+      attempts: job.attempts,
+    });
+  }
+  throw new AgentError(opts.agent, error);
+}
+
+/** A non-OpenAI call inside a pass: run in this request, once, and remembered. */
+async function runInlineMemoised<T>(
+  opts: RunAgentOptions<T>,
+  resolved: ResolvedModel,
+  durable: DurableContext,
+  key: string,
+): Promise<AgentRunResult<T>> {
+  const started = Date.now();
+  try {
+    const result = await runInline(opts);
+    durable.state.jobs[key] = {
+      ...newJob(opts.agent, resolved, started),
+      status: 'done',
+      data: result.data,
+      ok: result.ok,
+      fromFallback: result.fromFallback,
+      latencyMs: result.meta.latencyMs,
+      inputTokens: result.meta.inputTokens,
+      outputTokens: result.meta.outputTokens,
+      reasoningTokens: result.meta.reasoningTokens,
+      costUsd: result.meta.costUsd,
+      attempts: result.meta.attempts,
+    };
+    return result;
+  } catch (err) {
+    if (err instanceof AgentError) {
+      durable.state.jobs[key] = {
+        ...newJob(opts.agent, resolved, started),
+        status: 'failed',
+        ok: false,
+        latencyMs: Date.now() - started,
+        // AgentError prefixes the agent id; replayFailed puts it back.
+        error: err.message.replace(/^\[[A-Z0-9]+\] /, ''),
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * The Responses API body for one background call — the same request
+ * @ai-sdk/openai builds for `generateObject`, plus the background flag.
+ */
+async function backgroundRequest<T>(
+  opts: RunAgentOptions<T>,
+  resolved: ResolvedModel,
+  policy: AgentPolicy,
+): Promise<Record<string, unknown>> {
+  const schema = await asSchema(opts.schema).jsonSchema;
+  const effort = resolved.spec.supportsReasoningEffort
+    ? resolveReasoningEffort(resolved.spec, policy.reasoningEffort)
+    : undefined;
+
+  return {
+    model: resolved.modelId,
+    instructions: opts.system,
+    input: opts.prompt,
+    max_output_tokens: effectiveMaxOutputTokens(resolved, policy),
+    ...(resolved.spec.supportsTemperature && policy.temperature !== undefined
+      ? { temperature: policy.temperature }
+      : {}),
+    ...(effort ? { reasoning: { effort } } : {}),
+    text: {
+      // `name` and `strict` exactly as @ai-sdk/openai sends them, so the
+      // strict-mode rules schemas.ts is written to still apply.
+      format: { type: 'json_schema', name: 'response', strict: true, schema },
+      ...(policy.textVerbosity ? { verbosity: policy.textVerbosity } : {}),
+    },
+    metadata: { agent: opts.agent },
+  };
 }

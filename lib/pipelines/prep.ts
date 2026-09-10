@@ -13,6 +13,13 @@
  * research fails the project is still fully usable and lands in `ready` with an
  * empty Company tab. If P2, P3, P4 or P5 fails the project goes to `failed` with
  * a named stage and a retry.
+ *
+ * ── How it runs ──────────────────────────────────────────────────────────────
+ * As a durable pipeline (lib/ai/durable.ts), one short pass per request from
+ * POST /api/projects/[id]/prep. Every pass executes this function from the top:
+ * finished calls replay from the run's state and the first unfinished one ends
+ * the pass. So nothing is written until the pass that has every result in hand
+ * — that is what the `checkpoint()` and the Persist block at the end are for.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -26,6 +33,7 @@ import { runGapAnalysis } from '../agents/p4-gap';
 import { runStrategy } from '../agents/p5-strategy';
 import { DIFFICULTY_BANDS } from '../credits';
 import type { CompanyProfile } from '../agents/schemas';
+import { checkpoint, memo, reportProgress, rethrowIfPending } from '../ai/durable';
 import { AgentError } from '../ai/run';
 
 export type PrepStage = 'parsing' | 'company' | 'gap' | 'strategy' | 'done';
@@ -66,8 +74,9 @@ export async function runProjectPrep(
     .single();
 
   const resumeText = (resume?.parsed as { raw_text?: string } | null)?.raw_text;
+  const jdText = project.jd_raw as string | null;
 
-  if (!resumeText || !project.jd_raw) {
+  if (!resumeText || !jdText) {
     return await fail(supabase, projectId, 'parsing', 'Resume text or job description is missing.');
   }
 
@@ -76,37 +85,50 @@ export async function runProjectPrep(
   let companyResearchSkipped = false;
 
   try {
-    // ── P1 · P2 · P3 in parallel ─────────────────────────────────────────────
+    reportProgress('parsing');
+
+    // ── P1 · P2 · P3 · ATS in parallel ───────────────────────────────────────
+    //
+    // `allSettled` rather than `all`: under a durable run any of these may still
+    // be running, and the pass has to start or check every one of them before it
+    // stops (durable.ts, rule 3).
+    //
+    // ATS rides along in the same group. It reads the same two inputs and
+    // nothing downstream waits on it, so in parallel it costs no wall clock.
     const domain = project.company_domain ?? null;
 
-    const [resumeProfile, jdProfile, companyProfile] = await Promise.all([
+    const [resumeOutcome, jdOutcome, companyOutcome, atsOutcome] = await Promise.allSettled([
       runResumeParser({ resumeText }, context),
-      runJdParser({ jdText: project.jd_raw }, context),
-      loadOrResearchCompany(supabase, {
-        companyName: project.company_name,
-        domain,
-        context,
-      }),
+      runJdParser({ jdText }, context),
+      // Memoised so the cache read and the cache write happen once per run,
+      // rather than again on every pass while P4 and P5 are still running.
+      memo('company_profile', () =>
+        loadOrResearchCompany(supabase, {
+          companyName: project.company_name,
+          domain,
+          context,
+        }),
+      ),
+      runAtsScore({ resumeText, jdText }, context),
     ]);
+    checkpoint();
+
+    if (resumeOutcome.status === 'rejected') throw resumeOutcome.reason;
+    if (jdOutcome.status === 'rejected') throw jdOutcome.reason;
+
+    const resumeProfile = resumeOutcome.value;
+    const jdProfile = jdOutcome.value;
+    // P1 is optional (see header): anything short of a profile means "no
+    // company research", never a failed project.
+    const companyProfile = companyOutcome.status === 'fulfilled' ? companyOutcome.value : null;
+    // Best-effort, as it always was.
+    const ats = atsOutcome.status === 'fulfilled' ? atsOutcome.value : null;
 
     companyResearchSkipped = companyProfile === null;
 
-    // ATS is scored off the same two inputs and nothing downstream waits on it,
-    // so it rides along here rather than blocking the pipeline.
-    const ats = await runAtsScore({ resumeText, jdText: project.jd_raw }, context).catch(() => null);
-
-    if (resume?.id) {
-      await supabase
-        .from('resumes')
-        .update({
-          parsed: { ...(resume.parsed as object), raw_text: resumeText, profile: resumeProfile },
-          ats,
-        })
-        .eq('id', resume.id);
-    }
-
     // ── P4 ───────────────────────────────────────────────────────────────────
     stage = 'gap';
+    reportProgress('gap');
     const gapReport = await runGapAnalysis(
       { resume: resumeProfile, jd: jdProfile, company: companyProfile },
       context,
@@ -118,6 +140,7 @@ export async function runProjectPrep(
     // and credit-capped ceiling are actually known. This exists so the Overview
     // page has something to show before the first interview.
     stage = 'strategy';
+    reportProgress('strategy');
     const strategy = await runStrategy(
       {
         gap: gapReport,
@@ -134,7 +157,20 @@ export async function runProjectPrep(
     );
 
     // ── Persist ──────────────────────────────────────────────────────────────
+    // Only reached on the pass that has every result in hand, so each write
+    // below happens once.
     stage = 'done';
+
+    if (resume?.id) {
+      await supabase
+        .from('resumes')
+        .update({
+          parsed: { ...(resume.parsed as object), raw_text: resumeText, profile: resumeProfile },
+          ats,
+        })
+        .eq('id', resume.id);
+    }
+
     await supabase
       .from('projects')
       .update({
@@ -158,6 +194,9 @@ export async function runProjectPrep(
 
     return { status: 'ready', stage: 'done', companyResearchSkipped };
   } catch (err) {
+    // Unfinished work is not a failure — the next pass picks it up.
+    rethrowIfPending(err);
+
     const message =
       err instanceof AgentError ? err.message : err instanceof Error ? err.message : 'Preparation failed.';
     return await fail(supabase, projectId, stage, message);

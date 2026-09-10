@@ -3,8 +3,12 @@
  *
  * Everything important about this project on one screen. When `status` is
  * `preparing` the page renders its skeleton with a named stage strip and fills
- * in over realtime — the user is never held on a blocking spinner, and if they
- * close the tab prep continues regardless.
+ * in over realtime — the user is never held on a blocking spinner.
+ *
+ * Prep advances one short request at a time while this page is open (see
+ * lib/api/drive-pipeline.ts). Closing the tab pauses it rather than losing it:
+ * the model calls already started keep running, and reopening the page picks up
+ * where it stopped.
  */
 
 'use client';
@@ -30,6 +34,7 @@ import {
   StageList,
   StatTile,
 } from '@/components/app/ui';
+import { drivePipeline } from '@/lib/api/drive-pipeline';
 import { supabase } from '@/lib/supabase/client';
 
 const PREP_STAGES = [
@@ -38,6 +43,19 @@ const PREP_STAGES = [
   'Comparing your resume to the role',
   'Planning the interview',
 ];
+
+/**
+ * Which strip entry each pipeline stage lights. The resume, the posting and the
+ * company site are read in parallel, so `parsing` covers the first two.
+ */
+const PREP_STAGE_INDEX: Record<string, number> = { parsing: 1, gap: 2, strategy: 3 };
+
+interface PrepResponse {
+  pending?: boolean;
+  status?: string;
+  error?: string;
+  progress?: { stage: string; detail: string | null } | null;
+}
 
 interface ProjectRow {
   id: string;
@@ -72,10 +90,14 @@ export default function ProjectOverviewPage() {
 
   const [project, setProject] = useState<ProjectRow | null>(null);
   const [skills, setSkills] = useState<SkillRow[]>([]);
+  /** The resume's ATS score against this job, 0-100. Null until prep has scored it. */
+  const [resumeMatch, setResumeMatch] = useState<number | null>(null);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [retrying, setRetrying] = useState(false);
+  const [prepStage, setPrepStage] = useState(1);
   const prepTriggered = useRef(false);
+  const prepAbort = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
     // Only the columns this screen reads — the four AI artifact columns stay in
@@ -90,7 +112,7 @@ export default function ProjectOverviewPage() {
     setLoading(false);
 
     if (data) {
-      const [{ data: skillRows }, { data: sessionRows }] = await Promise.all([
+      const [{ data: skillRows }, { data: sessionRows }, { data: resumeRow }] = await Promise.all([
         supabase
           .from('skill_progress')
           .select('skill, status, score, jd_importance, sessions_seen')
@@ -103,10 +125,26 @@ export default function ProjectOverviewPage() {
           .eq('project_id', projectId)
           .order('seq', { ascending: false })
           .limit(3),
+        /*
+         * Resume match is read from the resume itself, not from the readiness
+         * snapshot. It is known the moment prep finishes — before any interview
+         * — and reading the source means every existing project shows the real
+         * number, not the 0 the snapshot has always carried.
+         */
+        supabase
+          .from('resumes')
+          .select('ats')
+          .eq('project_id', projectId)
+          .order('version', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
       ]);
 
       setSkills((skillRows as SkillRow[]) ?? []);
       setSessions((sessionRows as SessionRow[]) ?? []);
+
+      const atsScore = (resumeRow?.ats as { score?: unknown } | null)?.score;
+      setResumeMatch(typeof atsScore === 'number' && Number.isFinite(atsScore) ? Math.round(atsScore) : null);
     }
   }, [projectId]);
 
@@ -133,17 +171,35 @@ export default function ProjectOverviewPage() {
     };
   }, [projectId, load]);
 
-  // Kick the prep pipeline once. There is no job queue yet, so the page that
-  // lands first is what starts the work.
+  // Drive the prep pipeline until it settles. There is no job queue, so the
+  // open page is what moves the work forward — one short request at a time,
+  // because the host ends any request at 30 seconds.
   const runPrep = useCallback(async () => {
     setRetrying(true);
+    prepAbort.current?.abort();
+    const controller = new AbortController();
+    prepAbort.current = controller;
+
     try {
-      await fetch(`/api/projects/${projectId}/prep`, { method: 'POST' });
+      await drivePipeline<PrepResponse>(
+        () => fetch(`/api/projects/${projectId}/prep`, { method: 'POST' }),
+        {
+          signal: controller.signal,
+          onUpdate: (body) => {
+            const index = body.progress ? PREP_STAGE_INDEX[body.progress.stage] : undefined;
+            if (index !== undefined) setPrepStage(index);
+          },
+        },
+      );
     } finally {
       setRetrying(false);
       void load();
     }
   }, [projectId, load]);
+
+  // Stop driving prep when the page goes away. The run is not lost — it waits
+  // for the next time this page is opened.
+  useEffect(() => () => prepAbort.current?.abort(), []);
 
   useEffect(() => {
     if (!project || prepTriggered.current) return;
@@ -211,9 +267,10 @@ export default function ProjectOverviewPage() {
           <h2 className="font-[family-name:var(--font-display)] text-xl font-extrabold mt-1 mb-4">
             Building your interview plan
           </h2>
-          <StageList stages={PREP_STAGES} current={1} />
+          <StageList stages={PREP_STAGES} current={prepStage} />
           <p className="mt-4 font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/60">
-            About a minute. You can close this page — it keeps running.
+            About a minute. Keep this page open while it runs — if you leave, it picks up where it
+            stopped when you come back.
           </p>
         </Card>
       )}
@@ -241,14 +298,24 @@ export default function ProjectOverviewPage() {
           {!hasSessions ? (
             // Never show a 0% ring here: a zero that means "no data" reads as a
             // zero that means "you're bad at this" (§6).
-            <div className="flex items-center gap-5">
-              <Target className="w-10 h-10 text-[#1B1F3B]/30 shrink-0" />
+            <div className="space-y-5">
+              <div className="flex items-center gap-5">
+                <Target className="w-10 h-10 text-[#1B1F3B]/30 shrink-0" />
+                <div>
+                  <p className="font-[family-name:var(--font-display)] font-bold text-[#1B1F3B]">
+                    Run your first interview to see where you stand.
+                  </p>
+                  <p className="text-sm text-[#1B1F3B]/70 mt-1">
+                    Readiness is built from what your interviews actually establish, not from your resume.
+                  </p>
+                </div>
+              </div>
+              {/* The one dimension that needs no interview: how the resume reads
+                  against this job's requirements. */}
               <div>
-                <p className="font-[family-name:var(--font-display)] font-bold text-[#1B1F3B]">
-                  Run your first interview to see where you stand.
-                </p>
-                <p className="text-sm text-[#1B1F3B]/70 mt-1">
-                  Readiness is built from what your interviews actually establish, not from your resume.
+                <ScoreBar label="Resume match" score={pct(resumeMatch ?? undefined)} />
+                <p className="text-xs text-[#1B1F3B]/60 mt-1.5">
+                  How well your resume covers this job&apos;s requirements, from the ATS check.
                 </p>
               </div>
             </div>
@@ -256,7 +323,7 @@ export default function ProjectOverviewPage() {
             <div className="flex flex-col md:flex-row gap-6 items-start">
               <ReadinessRing value={readiness.overall ?? null} size={120} />
               <div className="flex-1 w-full space-y-3">
-                <ScoreBar label="Resume match" score={pct(readiness.resume_match)} />
+                <ScoreBar label="Resume match" score={pct(resumeMatch ?? readiness.resume_match)} />
                 <ScoreBar label="Technical" score={pct(readiness.technical)} />
                 <ScoreBar label="Behavioral" score={pct(readiness.behavioral)} />
                 <ScoreBar label="Coding" score={pct(readiness.coding)} />

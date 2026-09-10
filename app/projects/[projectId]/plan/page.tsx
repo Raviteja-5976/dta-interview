@@ -47,6 +47,7 @@ import {
   Skeleton,
   StatTile,
 } from '@/components/app/ui';
+import { drivePipeline } from '@/lib/api/drive-pipeline';
 import { supabase } from '@/lib/supabase/client';
 import type { PrepPlan } from '@/lib/pipelines/prep-plan';
 import { evaluatePreconditions, todayIso, type TargetReadiness } from '@/lib/engine/prep-window';
@@ -70,6 +71,24 @@ interface ProjectShell {
   active_resume_id: string | null;
 }
 
+/** What the plan route answers, while a build runs and once it settles. */
+interface PlanResponse {
+  pending?: boolean;
+  status?: string;
+  plan?: PrepPlan;
+  interviewDate?: string;
+  progress?: { stage: string; detail: string | null } | null;
+  error?: string;
+}
+
+function postPlan(projectId: string, body: Record<string, unknown>): Promise<Response> {
+  return fetch(`/api/projects/${projectId}/plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 const KIND_ACCENT: Record<string, 'sky' | 'mint' | 'yellow' | 'coral' | 'orange'> = {
   study: 'sky',
   build: 'orange',
@@ -87,6 +106,7 @@ export default function PrepPlanPage() {
   const [date, setDate] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [stage, setStage] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -116,31 +136,63 @@ export default function PrepPlanPage() {
     })();
   }, [projectId]);
 
+  const applyPlan = useCallback((body: PlanResponse) => {
+    if (!body.plan) return;
+    setProject((p) =>
+      p
+        ? { ...p, prep_plan: body.plan as PrepPlan, interview_date: body.interviewDate ?? p.interview_date }
+        : p,
+    );
+  }, []);
+
   const generate = useCallback(async () => {
     setBusy(true);
     setError(null);
+    setStage(null);
     try {
-      const res = await fetch(`/api/projects/${projectId}/plan`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ interviewDate: date }),
-      });
-      const data = await res.json();
+      const outcome = await drivePipeline<PlanResponse>(
+        // The first request starts the build; every one after it advances it.
+        (answered) => postPlan(projectId, answered === 0 ? { interviewDate: date } : { continue: true }),
+        { onUpdate: (body) => setStage(body.progress?.stage ?? null) },
+      );
 
-      if (!res.ok) {
-        setError(data.error ?? 'Could not build the plan.');
+      if (!outcome.ok) {
+        setError(outcome.error);
         return;
       }
-
-      setProject((p) =>
-        p ? { ...p, prep_plan: data.plan as PrepPlan, interview_date: data.interviewDate } : p,
-      );
-    } catch {
-      setError('Could not reach the server. Nothing was lost — try again.');
+      applyPlan(outcome.body);
     } finally {
       setBusy(false);
     }
-  }, [projectId, date]);
+  }, [projectId, date, applyPlan]);
+
+  /*
+   * Picks up a build that was still running when this page was last closed or
+   * reloaded. A build only advances while a page is asking for it, so without
+   * this it would sit half-finished until someone pressed Rebuild.
+   */
+  useEffect(() => {
+    const controller = new AbortController();
+    let following = false;
+
+    void drivePipeline<PlanResponse>(() => postPlan(projectId, { continue: true }), {
+      signal: controller.signal,
+      onUpdate: (body) => {
+        if (!body.pending) return;
+        following = true;
+        setBusy(true);
+        setStage(body.progress?.stage ?? null);
+      },
+    }).then((outcome) => {
+      // Nothing was running, or the page has gone: leave it exactly as loaded.
+      if (!following || controller.signal.aborted) return;
+      setBusy(false);
+      if (outcome.ok) applyPlan(outcome.body);
+      else setError(outcome.error);
+    });
+
+    return () => controller.abort();
+  }, [projectId, applyPlan]);
 
   const plan = project?.prep_plan ?? null;
 
@@ -229,8 +281,10 @@ export default function PrepPlanPage() {
 
         {busy && (
           <p className="mt-3 font-[family-name:var(--font-mono)] text-xs text-[#1B1F3B]/60">
-            Rewriting your resume, projecting it forward, and scheduling the days. This runs in two
-            passes and takes up to a minute.
+            {stage === 'target'
+              ? 'Projecting your resume forward to where the plan leads.'
+              : 'Rewriting your resume and scheduling the days.'}{' '}
+            This runs in two passes and takes a minute or two — keep this page open while it builds.
           </p>
         )}
 

@@ -4,6 +4,11 @@
  * A route, not a modal, because evaluation takes 1-3 minutes and people close
  * the tab. Reachable at any time; if the session is already complete it
  * redirects straight to the report.
+ *
+ * Evaluation advances one short request at a time while this page is open (see
+ * lib/api/drive-pipeline.ts). Closing the tab pauses it rather than losing it:
+ * the grading calls already started keep running, and reopening this page
+ * picks up where it stopped.
  */
 
 'use client';
@@ -12,6 +17,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 
 import { Button, Card, ErrorCard, Eyebrow, StageList } from '@/components/app/ui';
+import { drivePipeline } from '@/lib/api/drive-pipeline';
 import { supabase } from '@/lib/supabase/client';
 
 const STAGES = [
@@ -21,6 +27,22 @@ const STAGES = [
   'Writing your report',
 ];
 
+/** Which entry in STAGES each pipeline stage lights. */
+const STAGE_INDEX: Record<string, number> = {
+  transcript: 0,
+  speech: 1,
+  grading: 2,
+  report: 3,
+};
+
+interface EvaluateResponse {
+  pending?: boolean;
+  status?: string;
+  error?: string;
+  refunded?: number;
+  progress?: { stage: string; detail: string | null } | null;
+}
+
 export default function ProcessingPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const router = useRouter();
@@ -29,6 +51,7 @@ export default function ProcessingPage() {
   const [error, setError] = useState<string | null>(null);
   const [refunded, setRefunded] = useState(0);
   const evaluateFired = useRef(false);
+  const abort = useRef<AbortController | null>(null);
 
   const check = useCallback(async () => {
     const { data } = await supabase
@@ -55,19 +78,29 @@ export default function ProcessingPage() {
 
     if (!evaluateFired.current && data.status === 'processing') {
       evaluateFired.current = true;
-      // Advance the stage list optimistically so the page reads as alive; the
-      // realtime subscription below is what actually moves it on.
-      const ticker = setInterval(() => setStage((s) => Math.min(STAGES.length - 1, s + 1)), 25_000);
+      abort.current = new AbortController();
 
-      const res = await fetch(`/api/sessions/${sessionId}/evaluate`, { method: 'POST' });
-      const body = await res.json().catch(() => ({}));
-      clearInterval(ticker);
+      const outcome = await drivePipeline<EvaluateResponse>(
+        () => fetch(`/api/sessions/${sessionId}/evaluate`, { method: 'POST' }),
+        {
+          signal: abort.current.signal,
+          onUpdate: (body) => {
+            const index = body.progress ? STAGE_INDEX[body.progress.stage] : undefined;
+            if (index !== undefined) setStage(index);
+          },
+        },
+      );
 
-      if (body.status === 'complete') {
+      if (abort.current.signal.aborted) return;
+
+      if (outcome.ok && outcome.body.status === 'complete') {
         router.replace(`/sessions/${sessionId}/report`);
       } else {
-        setError(body.error ?? 'Something went wrong while writing your report.');
-        setRefunded(body.refunded ?? 0);
+        setError(
+          (outcome.ok ? outcome.body.error : outcome.error) ??
+            'Something went wrong while writing your report.',
+        );
+        setRefunded(outcome.body?.refunded ?? 0);
       }
     }
   }, [sessionId, router]);
@@ -79,6 +112,10 @@ export default function ProcessingPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void check();
   }, [check]);
+
+  // Stop driving the pipeline when the page goes away. The run is not lost —
+  // it waits for the next time this page is opened.
+  useEffect(() => () => abort.current?.abort(), []);
 
   // Realtime on the session row — the Processing screen should not poll (§8).
   useEffect(() => {
@@ -131,7 +168,8 @@ export default function ProcessingPage() {
             <div className="mt-8 pt-6 border-t-2 border-[#1B1F3B]/15">
               <p className="font-[family-name:var(--font-display)] font-bold text-sm">About two minutes.</p>
               <p className="text-sm text-[#1B1F3B]/70 mt-1">
-                We&apos;ll email you when it&apos;s ready — you can close this page.
+                Keep this page open while it runs. If you close it, your report picks up where it
+                stopped the next time you open this interview.
               </p>
             </div>
           </Card>

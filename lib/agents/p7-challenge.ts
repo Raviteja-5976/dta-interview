@@ -27,10 +27,13 @@
  * way, and the number is computed from it by S1 rather than asked for.
  */
 
+import { throwIfAnyPending } from '../ai/durable';
 import { runAgent } from '../ai/run';
 import type { RunContext } from '../ai/types';
+import { finaliseCodingChallenge } from '../execution/harness';
+import { fallbackCodingChallenge, fallbackSkillChallenge } from './p7-fallback';
 import {
-  codingChallengeSchema,
+  codingChallengeDraftSchema,
   skillChallengeSchema,
   type CodingChallenge,
   type DsaTopic,
@@ -44,7 +47,7 @@ const CODING_SYSTEM = `You write ONE data-structures-and-algorithms problem for 
 
 ## What this round is
 
-A LeetCode problem. Self-contained, algorithmic, and judged by a program that compares stdout to an expected string. The candidate is being measured on data structures, algorithmic reasoning and complexity analysis — not on domain knowledge, not on their resume, not on library familiarity.
+A LeetCode problem. Self-contained, algorithmic, and judged by running the candidate's method against tests and comparing what it returns. The candidate is being measured on data structures, algorithmic reasoning and complexity analysis — not on domain knowledge, not on their resume, not on library familiarity.
 
 Write in the register of the real thing: a short scenario-free statement, explicit constraints, two or three worked examples, and a function signature. If it would not look out of place on LeetCode, it is right.
 
@@ -70,8 +73,22 @@ Solvable AND explainable in 12-18 minutes. A problem nobody finishes produces no
 - visible_tests are shown to the candidate and mirror the examples.
 - hidden_tests are the edge cases the naive solution misses: empty input, a single element, all-duplicates, the minimum and maximum of every bound, and the case where the answer is zero or does not exist.
 - EVERY hidden test's "expected" value must be correct for your reference_solution. Trace the solution by hand on each one before writing it down. A wrong expected value fails a candidate whose code was right, and it is the single worst defect this agent can ship.
-- Input and output format must be exact and mechanical. State how input arrives on stdin and precisely what to print — the grader is a string comparison, so "print the list" is not a specification and "print the elements space-separated on one line" is.
-- starter_code is the signature and the I/O scaffolding, in every language asked for. No partial implementation, no hints in comments.
+
+## The signature and the test format
+
+This runs exactly like LeetCode: the candidate writes ONE method, and a harness feeds it the test inputs and reads what it returns. You never write input/output code or starter code — starter code for Python, JavaScript, Java, C++ and C is generated from your signature.
+
+- signature.function_name is a camelCase method name, e.g. twoSum.
+- signature.params are 1-4 parameters in order, each a camelCase name and a type.
+- signature.return_type is what the method returns. There is always a return value — never an in-place change with nothing returned.
+- The types are exactly: int, long, bool, string, int[], long[], string[], int[][]. Nothing else. No floating point. No characters (use a one-letter string). No linked lists, trees or maps as objects — if a problem needs a tree, give it as a level-order int[].
+- Every test input is one JSON value per line, one line per parameter, in parameter order. For twoSum(nums: int[], target: int) the input is two lines: [2,7,11,15] on the first and 9 on the second. A string parameter is written as a JSON string with its double quotes, "abcabcbb". A grid is an int[][] such as [[1,1,0],[0,1,1]].
+- Every test expected is the JSON of the return value: [0,1], 3, true, "bab".
+- The answer must be unique. If the problem naturally has several valid answers, the statement pins one down — "return the indices in increasing order", "return the lexicographically smallest" — and every expected value follows that rule. The grader compares values exactly.
+- examples show the same cases for a person to read: the input as nums = [2,7,11,15], target = 9 and the output as [0,1].
+- input_format describes the parameters in words; output_format describes the return value.
+- Keep test inputs small enough to write out by hand — a few dozen elements at most. The real bounds go in constraints; the tests do not have to reach them.
+- reference_solution is Python 3.8: a class Solution with the method named exactly as in signature, taking self first. Use typing's List, not list[int].
 - brute_force_note names the naive approach and its complexity, and why the constraints rule it out.
 - hints escalate: the first nudges toward the right question, the last names the approach. Never give code in a hint.
 - follow_up_question is what the interviewer asks out loud after submission — the "can you do better, and what does it cost you" question. One sentence, speakable.`;
@@ -153,6 +170,8 @@ export interface ChallengeInput {
   domainKnowledge?: string[];
   difficulty: 'easy' | 'medium' | 'hard';
   strategy?: Strategy;
+  /** What the candidate asked to be interviewed on. Usually empty. */
+  focusSkills?: string[];
 }
 
 // ── Coding · DSA topic rotation ──────────────────────────────────────────────
@@ -191,7 +210,7 @@ export async function runCodingChallenge(
 
   const result = await runAgent({
     agent: 'P7',
-    schema: codingChallengeSchema,
+    schema: codingChallengeDraftSchema,
     system: CODING_SYSTEM,
     prompt: [
       `Role: ${input.roleTitle} (${input.seniority})`,
@@ -204,12 +223,18 @@ export async function runCodingChallenge(
        * not — see CODING_SYSTEM.
        */
       'The role is here so you pitch the difficulty right. It must NOT influence the subject matter: this is a pure DSA problem, not a problem about their domain.',
-      'Provide starter code in Python, JavaScript, and Java.',
+      'Write reference_solution in Python 3.8 as class Solution with the method named in signature. Do not write starter code — it is generated from the signature for every language.',
     ].join('\n'),
     context,
     meta: { kind: 'coding', difficulty: input.difficulty, topic, slot },
   });
-  return result.data;
+  /*
+   * Starter code for all five languages comes from the signature, never from
+   * the model, and any test that does not match the signature is dropped here
+   * rather than failing every candidate who runs it. A problem left with no
+   * usable tests throws, and the set fills the slot from the built-in bank.
+   */
+  return finaliseCodingChallenge(result.data);
 }
 
 // ── Skill challenge · choosing what to ask ───────────────────────────────────
@@ -376,8 +401,21 @@ export function chooseSkillTargets(input: ChallengeInput, count: number): SkillT
   // Required skills lead — this round is about the job. Priority skills (what
   // the interview wanted to investigate) fill in behind them, and de-duplicate
   // case-insensitively so "React" and "react" are not two slots.
+  //
+  // Ahead of both: focus skills the candidate asked for, but only ones a task
+  // can actually be set in — a requirement of this job, or a technology the
+  // routing table knows. "Communication" is a fine focus skill and a useless
+  // editor task, so it is left to the conversation.
+  const focusFirst = (input.focusSkills ?? []).flatMap((skill) => {
+    const key = skill.trim().toLowerCase();
+    const requirement = (input.requirements ?? []).find((r) => r.skill.trim().toLowerCase() === key);
+    if (requirement) return [requirement];
+    return classify(skill) ? [{ skill: skill.trim(), derivedFrom: undefined }] : [];
+  });
+
   const seen = new Set<string>();
   const ranked = [
+    ...focusFirst,
     ...(input.requirements ?? []),
     ...input.prioritySkills.map((skill) => ({ skill, derivedFrom: undefined })),
   ].filter((r) => {
@@ -549,9 +587,12 @@ export interface ChallengeSet<T> {
 /**
  * A round of 1-3 challenges, generated in parallel.
  *
- * `allSettled` rather than `all`: if the third problem fails to generate, a
- * two-problem round is still a perfectly good interview. Failing the whole
- * session because one of three came back empty would be absurd.
+ * `allSettled` rather than `all`, and a failed slot is FILLED, never dropped.
+ * The candidate paid a flat fee for this round, and a round that came back
+ * empty used to be removed from the interview altogether — coding problems in
+ * particular, whose high reasoning budget is the likeliest thing in preparation
+ * to run out of time. A failed slot now takes a built-in problem with verified
+ * tests (p7-fallback.ts), so the round always has everything it was sized for.
  */
 export async function runCodingChallengeSet(
   input: ChallengeInput,
@@ -562,13 +603,21 @@ export async function runCodingChallengeSet(
     Array.from({ length: count }, (_, i) => runCodingChallenge(input, context, i)),
   );
 
-  for (const r of results) {
-    if (r.status === 'rejected') console.warn('[P7] coding challenge failed:', r.reason);
-  }
+  // Still being written is not failed. See lib/ai/durable.ts.
+  throwIfAnyPending(results);
 
-  const challenges = results
-    .filter((r): r is PromiseFulfilledResult<CodingChallenge> => r.status === 'fulfilled')
-    .map((r) => r.value);
+  const used = new Set(
+    results.flatMap((r) => (r.status === 'fulfilled' ? [r.value.title.toLowerCase()] : [])),
+  );
+
+  const challenges = results.map((r, slot) => {
+    if (r.status === 'fulfilled') return r.value;
+
+    const fallback = fallbackCodingChallenge(input.difficulty, used);
+    used.add(fallback.title.toLowerCase());
+    console.warn(`[P7] coding slot ${slot} failed — using built-in "${fallback.title}":`, r.reason);
+    return fallback;
+  });
 
   return { v: 3, count: challenges.length, challenges };
 }
@@ -584,13 +633,16 @@ export async function runSkillChallengeSet(
     targets.map((target, i) => runSkillChallenge(input, target, context, i)),
   );
 
-  for (const r of results) {
-    if (r.status === 'rejected') console.warn('[P7] skill challenge failed:', r.reason);
-  }
+  throwIfAnyPending(results);
 
-  const challenges = results
-    .filter((r): r is PromiseFulfilledResult<SkillChallenge> => r.status === 'fulfilled')
-    .map((r) => r.value);
+  // Filled rather than dropped, for the same reason as the coding round — with
+  // a task templated on the skill this slot was meant to test.
+  const challenges = results.map((r, slot) => {
+    if (r.status === 'fulfilled') return r.value;
+
+    console.warn(`[P7] skill slot ${slot} (${targets[slot].skill}) failed — using a built-in task:`, r.reason);
+    return fallbackSkillChallenge(input, targets[slot]);
+  });
 
   return { v: 3, count: challenges.length, challenges };
 }

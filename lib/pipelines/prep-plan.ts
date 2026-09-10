@@ -18,10 +18,18 @@
  * themselves stored, and yesterday's plan against a date that has moved is not
  * history, it is wrong. So this overwrites, and records which resume and which
  * date it was built from so the page can say when it has gone stale.
+ *
+ * ── How it runs ──────────────────────────────────────────────────────────────
+ * As a durable pipeline (lib/ai/durable.ts), one short pass per request from
+ * POST /api/projects/[id]/plan. RI and TR are long outputs that can each take
+ * longer than a whole 30-second request, so they run as background calls and
+ * this function is replayed until both stages have landed. Nothing is written
+ * before that pass.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
+import { checkpoint, memo, reportProgress, rethrowIfPending } from '../ai/durable';
 import { runResumeImprovement } from '../agents/ri-resume';
 import { runStudyPlan } from '../agents/sp-studyplan';
 import { runTargetResume } from '../agents/tr-target-resume';
@@ -124,11 +132,17 @@ export async function runPrepPlan(
 
   // What the interviews have actually established, where any have happened. A
   // plan that ignores this sends someone back over ground they already proved.
-  const { data: progress } = await supabase
-    .from('skill_progress')
-    .select('skill, score, depth')
-    .eq('project_id', projectId)
-    .limit(30);
+  //
+  // Read once per run: an interview finishing mid-build would otherwise change
+  // SP's prompt between passes, and a changed prompt is a new call.
+  const progress = await memo('verified_skills', async () => {
+    const { data } = await supabase
+      .from('skill_progress')
+      .select('skill, score, depth')
+      .eq('project_id', projectId)
+      .limit(30);
+    return data ?? [];
+  });
 
   const context = { userId: project.user_id, projectId };
   const unevidenced = skillsWithoutProjectEvidence(gap);
@@ -141,7 +155,11 @@ export async function runPrepPlan(
    * timetable still tells someone what to do tomorrow. Failing both because one
    * model call timed out would throw away work the user is watching a spinner
    * for.
+   *
+   * The checkpoint after it matters for the same reason: `allSettled` would
+   * otherwise report a half that is merely still running as a half that failed.
    */
+  reportProgress('drafting');
   const [resumeResult, planResult] = await Promise.allSettled([
     runResumeImprovement(
       { resumeText, jd, ats: (resume?.ats as AtsReport | null) ?? null },
@@ -156,11 +174,12 @@ export async function runPrepPlan(
         companyName: project.company_name,
         seniority: project.seniority ?? jd.seniority ?? 'mid',
         unevidenced,
-        verifiedSkills: (progress ?? []) as Array<{ skill: string; score: number | null; depth: string | null }>,
+        verifiedSkills: progress as Array<{ skill: string; score: number | null; depth: string | null }>,
       },
       context,
     ),
   ]);
+  checkpoint();
 
   const idealResume = resumeResult.status === 'fulfilled' ? resumeResult.value : null;
   const studyPlan = planResult.status === 'fulfilled' ? planResult.value : null;
@@ -187,11 +206,15 @@ export async function runPrepPlan(
    */
   const needsTarget = (idealResume?.cannot_claim_yet.length ?? 0) > 0 || unevidenced.length > 0;
 
+  if (needsTarget) reportProgress('target');
+
   const targetResume = needsTarget
     ? await runTargetResume(
         { resumeText, jd, gap, current: idealResume, plan: studyPlan },
         context,
-      ).catch((err) => {
+      ).catch((err: unknown) => {
+        // Still running is not failed — the next pass collects it.
+        rethrowIfPending(err);
         // Non-fatal. The sendable resume and the schedule are the load-bearing
         // half of this feature; the target is the motivating extra.
         console.error('[prep-plan] TR failed', err);

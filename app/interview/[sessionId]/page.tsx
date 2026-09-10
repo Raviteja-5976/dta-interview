@@ -31,6 +31,7 @@ import SkillMode, {
   type SkillSummary,
 } from '@/components/app/SkillMode';
 import { SESSION_PREP_STAGES } from '@/lib/pipelines/prep-stages';
+import { drivePipeline } from '@/lib/api/drive-pipeline';
 import { openLiveStt, type LiveSttResult, type LiveSttSession } from '@/lib/speech/deepgram-live';
 import { supabase } from '@/lib/supabase/client';
 
@@ -102,6 +103,31 @@ const WAIT_FOR_SPEECH_MS = 12_000;
  * something the interviewer should paper over by re-asking the question.
  */
 const MIN_LIVE_AUDIO_BYTES = 2_048;
+
+/**
+ * An audio element for one clip, already loading.
+ *
+ * Separate from playback so a whole turn's clips can be requested at once.
+ */
+function prepareClip(url: string): HTMLAudioElement {
+  const audio = new Audio();
+  /*
+   * MUST be set before `src`, and only for the cross-origin case.
+   *
+   * Cached clips come from Supabase Storage — a different origin. Feeding a
+   * cross-origin media element into `createMediaElementSource` without this
+   * taints the audio graph, and the browser responds by routing SILENCE
+   * through it. No exception, no console warning, no failed request: the
+   * waveform animates, the turn advances, and nothing is audible.
+   *
+   * Live segments stream from our own /speak route, where setting it would
+   * instead suppress the session cookie the route authenticates with.
+   */
+  if (!url.startsWith('/')) audio.crossOrigin = 'anonymous';
+  audio.preload = 'auto';
+  audio.src = url;
+  return audio;
+}
 
 /**
  * The container to record in, preferred rather than left to the browser.
@@ -389,10 +415,28 @@ export default function LiveInterviewPage() {
     setPhase('preparing');
     if (!prepFired.current) {
       prepFired.current = true;
-      const res = await fetch(`/api/sessions/${sessionId}/prep`, { method: 'POST' });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok || body.status === 'failed') {
-        setError(body.error ?? 'We could not build your interview. Your credits have been returned.');
+
+      // One short pass per request until the session is built — the host ends
+      // any single request at 30 seconds (lib/api/drive-pipeline.ts).
+      const outcome = await drivePipeline<{
+        pending?: boolean;
+        status?: string;
+        error?: string;
+        progress?: { stage: string; detail: string | null } | null;
+      }>(() => fetch(`/api/sessions/${sessionId}/prep`, { method: 'POST' }), {
+        onUpdate: (body) => {
+          if (!body.progress) return;
+          const index = SESSION_PREP_STAGES.findIndex((s) => s.key === body.progress?.stage);
+          if (index >= 0) setPrepStage(index);
+          setPrepDetail(body.progress.detail ?? null);
+        },
+      });
+
+      if (!outcome.ok || outcome.body.status === 'failed') {
+        setError(
+          (outcome.ok ? outcome.body.error : outcome.error) ??
+            'We could not build your interview. Your credits have been returned.',
+        );
         setPhase('failed');
         return;
       }
@@ -410,9 +454,10 @@ export default function LiveInterviewPage() {
   /**
    * Follows prep progress while the session is being built.
    *
-   * The prep request is a single long-lived POST, so it reports nothing until it
-   * finishes. This subscription is what makes the wait legible — the pipeline
-   * writes each stage to `sessions.progress` as it reaches it.
+   * Prep advances one short request at a time, and each response carries the
+   * stage it reached. This subscription is the second channel for the same
+   * thing — the prep route writes each new stage to `sessions.progress` — so the
+   * bar still moves if a response is slow to arrive.
    */
   useEffect(() => {
     if (phase !== 'preparing') return;
@@ -945,27 +990,11 @@ export default function LiveInterviewPage() {
   /**
    * Plays one clip, driving the waveform from its real amplitude.
    *
-   * A turn arrives as an ordered list of clips — acknowledgement, transition,
-   * question — because P8 caches each separately and resolving them separately
-   * is what lets most of them come from cache.
+   * A turn arrives as an ordered list of clips — usually just one, since the
+   * turn route joins everything uncached into a single stream. The element is
+   * prepared by `prepareClip` before playback starts, so it is already loading.
    */
-  const playClip = useCallback(async (url: string, fallbackDurationSec: number) => {
-    const audio = new Audio();
-    /*
-     * MUST be set before `src`, and only for the cross-origin case.
-     *
-     * Cached clips come from Supabase Storage — a different origin. Feeding a
-     * cross-origin media element into `createMediaElementSource` without this
-     * taints the audio graph, and the browser responds by routing SILENCE
-     * through it. No exception, no console warning, no failed request: the
-     * waveform animates, the turn advances, and nothing is audible.
-     *
-     * Live segments stream from our own /speak route, where setting it would
-     * instead suppress the session cookie the route authenticates with.
-     */
-    if (!url.startsWith('/')) audio.crossOrigin = 'anonymous';
-    audio.preload = 'auto';
-    audio.src = url;
+  const playClip = useCallback(async (audio: HTMLAudioElement, fallbackDurationSec: number) => {
     audioElRef.current = audio;
 
     /*
@@ -1089,11 +1118,28 @@ export default function LiveInterviewPage() {
         return;
       }
 
-      for (const segment of segments) {
-        // Checked between clips as well as inside them: a turn is several
+      /*
+       * Every clip starts loading NOW, not when the one before it ends.
+       *
+       * Loading them one at a time put a full request — and, for a streamed
+       * clip, the synthesiser's first byte — into the silence between two parts
+       * of the same turn. Prepared up front, the next clip is already buffered
+       * by the time the current one finishes.
+       */
+      const clips = segments.map((segment) => prepareClip(segment.url));
+
+      for (const [i, clip] of clips.entries()) {
+        // Checked between clips as well as inside them: a turn can be several
         // separate files, and aborting one must not let the next one start.
-        if (aborted.current) return;
-        await playClip(segment.url, fallbackDurationSec);
+        if (aborted.current) {
+          // Stop the ones that were loading ahead, or they keep downloading.
+          for (const rest of clips.slice(i)) {
+            rest.removeAttribute('src');
+            rest.load();
+          }
+          return;
+        }
+        await playClip(clip, fallbackDurationSec);
       }
       setAmplitude(0);
     },
