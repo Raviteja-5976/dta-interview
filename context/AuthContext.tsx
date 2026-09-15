@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 import { User, Session } from '@supabase/supabase-js';
 import { supabase } from '@/lib/supabase/client';
+import { clearLocalUserCache } from '@/lib/supabase/db';
 
 type AuthTab = 'login' | 'signup';
 
@@ -74,7 +75,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     // 2. Listen to auth state changes for seamless session persistence
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
+      (event, session) => {
+        // Whoever was here before does not get to leave their name, credits and
+        // project list behind in this browser for the next person to load.
+        if (event === 'SIGNED_OUT') clearLocalUserCache();
+
         setSession(session);
         setUser(session?.user ?? null);
         setLoading(false);
@@ -182,10 +187,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = async () => {
     const { error } = await supabase.auth.signOut();
-    if (!error) {
-      setUser(null);
-      setSession(null);
-    }
+
+    // Cleared whether or not the call succeeded. A sign-out that fails against
+    // the auth server — an expired token, a dropped connection — must still
+    // leave this browser signed out, because the alternative is a shared machine
+    // that stays logged in as someone who asked to leave. supabase-js has
+    // already dropped the local session by this point either way; the error is
+    // still returned so the caller can say what happened.
+    clearLocalUserCache();
+    setUser(null);
+    setSession(null);
+
     return { error };
   };
 

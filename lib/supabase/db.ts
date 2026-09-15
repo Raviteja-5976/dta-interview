@@ -138,6 +138,60 @@ export const MOCK_LEDGER: CreditLedgerItem[] = [];
 // --- DB API Functions ---
 
 /**
+ * ── The offline fallback cache is per user, and only ever read for that user ──
+ *
+ * These caches used to live under two fixed keys, `dta_user_profile` and
+ * `dta_user_projects`. On a shared browser that is an identity leak: whoever
+ * signed in last left their name, credits and project list behind, and the next
+ * person to open the app — signed out, or signed in as somebody else whose query
+ * happened to fail — was shown that stale identity as if it were their own.
+ *
+ * Scoping the key to the user id means a cache can only ever be read back by the
+ * user who wrote it. A signed-out visitor has no id, so there is nothing to read
+ * and they get the empty defaults, which is the honest answer.
+ */
+const CACHE_PREFIX = 'dta_user_';
+
+const profileKey = (userId: string) => `${CACHE_PREFIX}profile:${userId}`;
+const projectsKey = (userId: string) => `${CACHE_PREFIX}projects:${userId}`;
+
+function readCache<T>(key: string | null): T | null {
+  if (!key || typeof window === 'undefined') return null;
+  try {
+    const saved = window.localStorage.getItem(key);
+    return saved ? (JSON.parse(saved) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(key: string | null, value: unknown): void {
+  if (!key || typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Private mode, or the quota is full. A cache that cannot be written is not
+    // a reason to fail the operation that produced the data.
+  }
+}
+
+/**
+ * Drop every cached identity in this browser. Called on sign-out, including a
+ * sign-out that happened in another tab, so nothing of the previous session is
+ * left behind for the next person to find.
+ */
+export function clearLocalUserCache(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    Object.keys(window.localStorage)
+      .filter((key) => key.startsWith(CACHE_PREFIX))
+      .forEach((key) => window.localStorage.removeItem(key));
+  } catch {
+    // Nothing readable means nothing to clear.
+  }
+}
+
+/**
  * The dashboard tile projection. Must stay a single string literal — supabase-js
  * parses it at the type level, and concatenation degrades the result to `string`.
  */
@@ -160,14 +214,8 @@ export async function fetchUserProfile(userId?: string): Promise<Profile> {
     }
   }
   
-  // Return local storage or default fallback
-  if (typeof window !== 'undefined') {
-    const saved = localStorage.getItem('dta_user_profile');
-    if (saved) {
-      try { return JSON.parse(saved); } catch {}
-    }
-  }
-  return MOCK_PROFILE;
+  // This user's own cached copy, or the empty defaults. Never another user's.
+  return readCache<Profile>(userId ? profileKey(userId) : null) ?? MOCK_PROFILE;
 }
 
 export async function updateUserProfile(userId: string, updates: Partial<Profile>): Promise<Profile> {
@@ -194,9 +242,7 @@ export async function updateUserProfile(userId: string, updates: Partial<Profile
   // Fallback update local storage
   const current = await fetchUserProfile(userId);
   const updated = { ...current, ...updates, updated_at: new Date().toISOString() };
-  if (typeof window !== 'undefined') {
-    localStorage.setItem('dta_user_profile', JSON.stringify(updated));
-  }
+  writeCache(userId ? profileKey(userId) : null, updated);
   return updated;
 }
 
@@ -224,13 +270,7 @@ export async function fetchUserProjects(userId?: string): Promise<Project[]> {
     }
   }
 
-  if (typeof window !== 'undefined') {
-    const saved = localStorage.getItem('dta_user_projects');
-    if (saved) {
-      try { return JSON.parse(saved); } catch {}
-    }
-  }
-  return MOCK_PROJECTS;
+  return readCache<Project[]>(userId ? projectsKey(userId) : null) ?? MOCK_PROJECTS;
 }
 
 export async function createProject(userId: string, newProj: Partial<Project>): Promise<Project> {
@@ -275,9 +315,7 @@ export async function createProject(userId: string, newProj: Partial<Project>): 
 
   const existing = await fetchUserProjects(userId);
   const updatedProjects = [created, ...existing];
-  if (typeof window !== 'undefined') {
-    localStorage.setItem('dta_user_projects', JSON.stringify(updatedProjects));
-  }
+  writeCache(userId ? projectsKey(userId) : null, updatedProjects);
   return created;
 }
 
@@ -298,9 +336,7 @@ export async function deleteProject(userId: string, projectId: string): Promise<
 
   const existing = await fetchUserProjects(userId);
   const filtered = existing.filter((p) => p.id !== projectId);
-  if (typeof window !== 'undefined') {
-    localStorage.setItem('dta_user_projects', JSON.stringify(filtered));
-  }
+  writeCache(userId ? projectsKey(userId) : null, filtered);
   return true;
 }
 
