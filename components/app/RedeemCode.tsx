@@ -1,5 +1,5 @@
 /**
- * "I have a promo code" — the student half of the coupon system.
+ * "I have a coupon" — the student half of the coupon system.
  *
  * Calls `redeem_promo_code()` directly (migration 020). No route handler in
  * between, because the RPC *is* the security boundary: it reads auth.uid()
@@ -12,9 +12,9 @@
  * error string to parse.
  *
  * Two shells, same innards: `card` for a page that is a stack of cards
- * (/credits), `inline` for somewhere already inside a bordered panel (the
- * profile page's Credits tab), where a second 4px border would read as a box
- * inside a box.
+ * (/credits, /dashboard), `inline` for somewhere already inside a bordered
+ * panel (the profile page's Credits tab), where a second 4px border would read
+ * as a box inside a box.
  */
 
 'use client';
@@ -37,9 +37,12 @@ interface RedeemResult {
 export default function RedeemCode({
   onRedeemed,
   variant = 'card',
+  className = 'p-5 mb-8',
 }: {
   onRedeemed: () => void;
   variant?: 'card' | 'inline';
+  /** Card shell only — the parent owns padding and spacing. */
+  className?: string;
 }) {
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
@@ -91,7 +94,7 @@ export default function RedeemCode({
         <div className="flex items-center gap-2 shrink-0">
           <Ticket className="w-5 h-5 text-[#FF6B35]" />
           <span className="font-[family-name:var(--font-display)] font-bold text-sm text-[#1B1F3B]">
-            I have a promo code
+            I have a coupon
           </span>
         </div>
 
@@ -138,7 +141,7 @@ export default function RedeemCode({
   }
 
   return (
-    <Card className="p-5 mb-8" accent={granted != null ? 'mint' : undefined}>
+    <Card className={className} accent={granted != null ? 'mint' : undefined}>
       {granted != null ? success : form}
     </Card>
   );

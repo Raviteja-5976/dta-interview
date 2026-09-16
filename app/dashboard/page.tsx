@@ -15,8 +15,10 @@ import {
   Sparkles,
   RotateCw,
   X,
+  CreditCard,
 } from 'lucide-react';
 import AppHeader from '@/components/layout/AppHeader';
+import RedeemCode from '@/components/app/RedeemCode';
 import { useAuth } from '@/context/AuthContext';
 import {
   fetchUserProfile,
@@ -122,7 +124,7 @@ export default function DashboardPage() {
               </div>
             </div>
             <Link
-              href="/profile"
+              href="/credits"
               className="px-5 py-2.5 bg-[#1B1F3B] text-white font-[family-name:var(--font-display)] font-bold text-xs md:text-sm rounded-xl border-2 border-[#1B1F3B] shadow-[3px_3px_0_#FFFFFF] hover:-translate-y-0.5 transition-all whitespace-nowrap"
             >
               Get More Credits
@@ -205,6 +207,10 @@ export default function DashboardPage() {
           </div>
         </section>
 
+        {/* Coupon redemption — same component as /credits and the profile
+            ledger, so a code behaves identically wherever it is entered. */}
+        <RedeemCode className="p-5" onRedeemed={() => void loadData()} />
+
         {/* Action & Filter Bar Header */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b-4 border-[#1B1F3B]/10 pb-6">
           <div>
@@ -218,13 +224,23 @@ export default function DashboardPage() {
 
           {/* The real creation path: the wizard collects the resume and job
               description that Phase 1 preparation cannot run without. */}
-          <Link
-            href="/projects/new"
-            className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-sm rounded-xl border-4 border-[#1B1F3B] shadow-[4px_4px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all cursor-pointer"
-          >
-            <Plus className="w-5 h-5 stroke-[3]" />
-            <span>New Interview Project</span>
-          </Link>
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+            <Link
+              href="/credits"
+              className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-white text-[#1B1F3B] font-[family-name:var(--font-display)] font-extrabold text-sm rounded-xl border-4 border-[#1B1F3B] shadow-[4px_4px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all cursor-pointer"
+            >
+              <CreditCard className="w-5 h-5 stroke-[2.5]" />
+              <span>Buy Credits</span>
+            </Link>
+
+            <Link
+              href="/projects/new"
+              className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-sm rounded-xl border-4 border-[#1B1F3B] shadow-[4px_4px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all cursor-pointer"
+            >
+              <Plus className="w-5 h-5 stroke-[3]" />
+              <span>New Interview Project</span>
+            </Link>
+          </div>
         </div>
 
         {/* Search & Filter Controls */}

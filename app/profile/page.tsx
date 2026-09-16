@@ -246,18 +246,28 @@ export default function ProfilePage() {
           </div>
 
           {/* Right Stats & Credits */}
-          <div className="flex items-center gap-4 bg-[#FFF8F0] border-2 border-[#1B1F3B] rounded-2xl p-4 shadow-[3px_3px_0_#1B1F3B] w-full md:w-auto">
-            <div className="p-3 bg-[#FF6B35]/10 rounded-xl border border-[#1B1F3B] text-[#FF6B35]">
-              <Zap className="w-6 h-6 fill-current" />
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 w-full md:w-auto">
+            <div className="flex items-center gap-4 bg-[#FFF8F0] border-2 border-[#1B1F3B] rounded-2xl p-4 shadow-[3px_3px_0_#1B1F3B]">
+              <div className="p-3 bg-[#FF6B35]/10 rounded-xl border border-[#1B1F3B] text-[#FF6B35]">
+                <Zap className="w-6 h-6 fill-current" />
+              </div>
+              <div>
+                <span className="text-[11px] font-[family-name:var(--font-mono)] font-bold text-[#1B1F3B]/60 uppercase tracking-wider block">
+                  Credits Balance
+                </span>
+                <span className="font-[family-name:var(--font-display)] text-2xl font-extrabold text-[#1B1F3B] tabular-nums">
+                  {profile?.credits_balance ?? 4} Available
+                </span>
+              </div>
             </div>
-            <div>
-              <span className="text-[11px] font-[family-name:var(--font-mono)] font-bold text-[#1B1F3B]/60 uppercase tracking-wider block">
-                Credits Balance
-              </span>
-              <span className="font-[family-name:var(--font-display)] text-2xl font-extrabold text-[#1B1F3B] tabular-nums">
-                {profile?.credits_balance ?? 4} Available
-              </span>
-            </div>
+
+            <Link
+              href="/credits"
+              className="inline-flex items-center justify-center gap-2 px-5 py-3 bg-[#FF6B35] text-white font-[family-name:var(--font-display)] font-extrabold text-sm rounded-2xl border-4 border-[#1B1F3B] shadow-[4px_4px_0_#1B1F3B] hover:-translate-y-0.5 active:translate-y-0.5 transition-all whitespace-nowrap"
+            >
+              <CreditCard className="w-5 h-5 stroke-[2.5]" />
+              <span>Buy Credits</span>
+            </Link>
           </div>
         </div>
 
