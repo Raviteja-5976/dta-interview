@@ -5,7 +5,7 @@
  * convenient default, and the note is right there. A grant is money, and this is
  * the one screen in the app that creates it out of nothing.
  *
- * The quick amounts are the credit packs, so "give them what the ₹249 plan
+ * The quick amounts are the credit packs, so "give them what the ₹299 plan
  * would have given them" is one click rather than a number remembered wrong.
  */
 
